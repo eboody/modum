@@ -1,0 +1,5 @@
+error: #[modum] supports only named items: struct, enum, trait, type, union, fn, const, static
+ --> tests/ui/fail_unsupported_mod.rs:4:1
+  |
+4 | mod foo {}
+  | ^^^^^^^^^^
