@@ -229,7 +229,8 @@ pub mod pascal {
 Rules:
 - No macro arguments are accepted (`#[modum(...)]` is invalid).
 - Item attributes (other than `#[modum]`) are preserved.
-- Visibility is preserved on both generated module and inner item.
+- Module visibility follows the original item visibility.
+- Inner generated items are always `pub` so `module::Item` is usable from the parent scope.
 
 ## Limitations
 

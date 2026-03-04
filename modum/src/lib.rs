@@ -3,7 +3,7 @@ use proc_macro2::Ident;
 use quote::quote;
 use syn::{
     Attribute, Error, Item, ItemConst, ItemEnum, ItemFn, ItemStatic, ItemStruct, ItemTrait,
-    ItemType, ItemUnion, parse_macro_input, spanned::Spanned,
+    ItemType, ItemUnion, Visibility, parse_macro_input, spanned::Spanned,
 };
 
 #[derive(Clone, Copy)]
@@ -53,6 +53,7 @@ fn expand_struct(mut item: ItemStruct) -> Result<proc_macro2::TokenStream, Error
     let old_ident = item.ident.clone();
     let (module_ident, tail_ident) = split_idents(&old_ident, TailStyle::Pascal)?;
     let vis = item.vis.clone();
+    make_public(&mut item.vis);
     item.ident = tail_ident;
     Ok(quote! {
         #vis mod #module_ident {
@@ -66,6 +67,7 @@ fn expand_enum(mut item: ItemEnum) -> Result<proc_macro2::TokenStream, Error> {
     let old_ident = item.ident.clone();
     let (module_ident, tail_ident) = split_idents(&old_ident, TailStyle::Pascal)?;
     let vis = item.vis.clone();
+    make_public(&mut item.vis);
     item.ident = tail_ident;
     Ok(quote! {
         #vis mod #module_ident {
@@ -79,6 +81,7 @@ fn expand_trait(mut item: ItemTrait) -> Result<proc_macro2::TokenStream, Error> 
     let old_ident = item.ident.clone();
     let (module_ident, tail_ident) = split_idents(&old_ident, TailStyle::Pascal)?;
     let vis = item.vis.clone();
+    make_public(&mut item.vis);
     item.ident = tail_ident;
     Ok(quote! {
         #vis mod #module_ident {
@@ -92,6 +95,7 @@ fn expand_type(mut item: ItemType) -> Result<proc_macro2::TokenStream, Error> {
     let old_ident = item.ident.clone();
     let (module_ident, tail_ident) = split_idents(&old_ident, TailStyle::Pascal)?;
     let vis = item.vis.clone();
+    make_public(&mut item.vis);
     item.ident = tail_ident;
     Ok(quote! {
         #vis mod #module_ident {
@@ -105,6 +109,7 @@ fn expand_union(mut item: ItemUnion) -> Result<proc_macro2::TokenStream, Error> 
     let old_ident = item.ident.clone();
     let (module_ident, tail_ident) = split_idents(&old_ident, TailStyle::Pascal)?;
     let vis = item.vis.clone();
+    make_public(&mut item.vis);
     item.ident = tail_ident;
     Ok(quote! {
         #vis mod #module_ident {
@@ -118,6 +123,7 @@ fn expand_fn(mut item: ItemFn) -> Result<proc_macro2::TokenStream, Error> {
     let old_ident = item.sig.ident.clone();
     let (module_ident, tail_ident) = split_idents(&old_ident, TailStyle::Snake)?;
     let vis = item.vis.clone();
+    make_public(&mut item.vis);
     item.sig.ident = tail_ident;
     Ok(quote! {
         #vis mod #module_ident {
@@ -131,6 +137,7 @@ fn expand_const(mut item: ItemConst) -> Result<proc_macro2::TokenStream, Error> 
     let old_ident = item.ident.clone();
     let (module_ident, tail_ident) = split_idents(&old_ident, TailStyle::ScreamingSnake)?;
     let vis = item.vis.clone();
+    make_public(&mut item.vis);
     item.ident = tail_ident;
     Ok(quote! {
         #vis mod #module_ident {
@@ -144,6 +151,7 @@ fn expand_static(mut item: ItemStatic) -> Result<proc_macro2::TokenStream, Error
     let old_ident = item.ident.clone();
     let (module_ident, tail_ident) = split_idents(&old_ident, TailStyle::ScreamingSnake)?;
     let vis = item.vis.clone();
+    make_public(&mut item.vis);
     item.ident = tail_ident;
     Ok(quote! {
         #vis mod #module_ident {
@@ -154,6 +162,10 @@ fn expand_static(mut item: ItemStatic) -> Result<proc_macro2::TokenStream, Error
 
 fn strip_modum_attr(attrs: &mut Vec<Attribute>) {
     attrs.retain(|attr| !attr.path().is_ident("modum"));
+}
+
+fn make_public(vis: &mut Visibility) {
+    *vis = Visibility::Public(syn::token::Pub::default());
 }
 
 fn split_idents(source_ident: &Ident, tail_style: TailStyle) -> Result<(Ident, Ident), Error> {

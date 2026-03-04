@@ -1,6 +1,6 @@
 [package]
 name = "modum"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Attribute macro that rewrites named items into module::item paths"
 license = "MIT"

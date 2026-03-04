@@ -260,3 +260,22 @@ mod attrs_preserved {
         let _ = format!("{item:?}");
     }
 }
+
+mod private_inputs_become_public_inner_items {
+    use modum::modum;
+
+    #[modum]
+    struct HiddenThing;
+
+    #[allow(non_snake_case)]
+    #[modum]
+    fn secretFunc() -> u8 {
+        31
+    }
+
+    #[test]
+    fn private_inputs_are_accessible_via_generated_path() {
+        let _ = hidden::Thing;
+        assert_eq!(secret::func(), 31);
+    }
+}
