@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["modum"]
+members = [
+    "examples/high-coverage",
+    "modum",
+    "modum-core",
+]

@@ -1,0 +1,18 @@
+[package]
+name = "modum-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Shared lint analysis core for modum"
+license = "MIT"
+repository = "https://github.com/eboody/modum"
+documentation = "https://docs.rs/modum-core"
+readme = "../README.md"
+
+[dependencies]
+glob = "0.3"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde = { version = "1", features = ["derive"] }
+syn = { version = "2", features = ["full"] }
+toml = "1"
+walkdir = "2"

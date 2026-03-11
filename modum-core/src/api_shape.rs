@@ -1,0 +1,613 @@
+use std::{fs, path::{Path, PathBuf}};
+
+use syn::{
+    File, Item, ItemConst, ItemEnum, ItemFn, ItemMod, ItemStatic, ItemStruct, ItemTrait,
+    ItemTraitAlias, ItemType, ItemUnion, ItemUse, UseTree,
+    spanned::Spanned,
+};
+
+use super::{
+    Diagnostic, DiagnosticLevel, NamespaceSettings, is_public, normalize_segment, split_segments,
+    unraw_ident,
+};
+
+pub(super) struct ApiShapeAnalysis {
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone)]
+struct PublicUseLeaf {
+    binding_name: String,
+}
+
+#[derive(Clone, Copy)]
+enum NameStyle {
+    Pascal,
+    Snake,
+    ScreamingSnake,
+}
+
+pub(super) fn analyze_api_shape_rules(
+    path: &Path,
+    parsed: &File,
+    settings: &NamespaceSettings,
+) -> ApiShapeAnalysis {
+    let inferred_module_path = inferred_file_module_path(path);
+    let inferred_is_public =
+        inferred_module_path.is_empty() || inferred_module_is_public(path, &inferred_module_path);
+    let mut diagnostics = Vec::new();
+
+    if inferred_is_public
+        && inferred_module_path.len() >= 2
+        && let Some(module_name) = inferred_module_path.last()
+        && settings
+            .organizational_modules
+            .contains(&normalize_segment(module_name))
+        && let Some(flatten_leaf) = organizational_flatten_candidate(Some(&parsed.items), settings)
+    {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Error,
+            file: Some(path.to_path_buf()),
+            line: Some(1),
+            code: Some("api_organizational_submodule_flatten".to_string()),
+            policy: true,
+            message: format!(
+                "public path `{}` exposes an organizational submodule; prefer `{}` and keep the submodule private",
+                render_public_path(
+                    &inferred_module_path,
+                    &flatten_leaf
+                ),
+                render_public_path(
+                    &inferred_module_path[..inferred_module_path.len() - 1],
+                    &flatten_leaf
+                )
+            ),
+        });
+    }
+
+    analyze_scope(
+        path,
+        &parsed.items,
+        &inferred_module_path,
+        inferred_is_public,
+        settings,
+        &mut diagnostics,
+    );
+
+    ApiShapeAnalysis { diagnostics }
+}
+
+fn analyze_scope(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+    path_is_public: bool,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for item in items {
+        match item {
+            Item::Mod(item_mod) => analyze_module_item(
+                path,
+                item_mod,
+                module_path,
+                path_is_public,
+                settings,
+                diagnostics,
+            ),
+            Item::Use(item_use) => analyze_public_use_item(
+                path,
+                item_use,
+                module_path,
+                path_is_public,
+                settings,
+                diagnostics,
+            ),
+            _ => analyze_public_item(path, item, module_path, path_is_public, settings, diagnostics),
+        }
+    }
+}
+
+fn analyze_module_item(
+    path: &Path,
+    item_mod: &ItemMod,
+    module_path: &[String],
+    path_is_public: bool,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let module_name = item_mod.ident.to_string();
+    let normalized = normalize_segment(&module_name);
+    let line = item_mod.span().start().line;
+    let module_is_public = path_is_public && is_public(&item_mod.vis);
+
+    if module_is_public {
+        if settings.catch_all_modules.contains(&normalized) {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                file: Some(path.to_path_buf()),
+                line: Some(line),
+                code: Some("api_catch_all_module".to_string()),
+                policy: true,
+                message: format!(
+                    "module `{module_name}` is a catch-all API boundary; prefer a stable domain or facet name"
+                ),
+            });
+        }
+
+        if !module_path.is_empty()
+            && settings.organizational_modules.contains(&normalized)
+            && let Some(flatten_leaf) =
+                organizational_flatten_candidate(
+                    item_mod.content.as_ref().map(|(_, nested)| nested),
+                    settings,
+                )
+        {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                file: Some(path.to_path_buf()),
+                line: Some(line),
+                code: Some("api_organizational_submodule_flatten".to_string()),
+                policy: true,
+                message: format!(
+                    "public path `{}` exposes an organizational submodule; prefer `{}` and keep the submodule private",
+                    render_public_path_with_module(module_path, &module_name, &flatten_leaf),
+                    render_public_path(module_path, &flatten_leaf)
+                ),
+            });
+        }
+
+        if module_path
+            .last()
+            .is_some_and(|parent| normalize_segment(parent) == normalized)
+        {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                file: Some(path.to_path_buf()),
+                line: Some(line),
+                code: Some("api_repeated_module_segment".to_string()),
+                policy: true,
+                message: format!(
+                    "nested module path repeats `{module_name}`; flatten or rename the redundant segment"
+                ),
+            });
+        }
+    }
+
+    if let Some((_, nested)) = &item_mod.content {
+        let mut next_path = module_path.to_vec();
+        next_path.push(module_name);
+        analyze_scope(
+            path,
+            nested,
+            &next_path,
+            module_is_public,
+            settings,
+            diagnostics,
+        );
+    }
+}
+
+fn organizational_flatten_candidate(
+    nested: Option<&Vec<Item>>,
+    settings: &NamespaceSettings,
+) -> Option<String> {
+    let nested = nested?;
+    let mut public_leaf = None;
+
+    for item in nested {
+        if public_item_leaf(item)
+            .is_some_and(|(_, _, is_item_public)| is_item_public)
+        {
+            let (_, leaf_name, _) = public_item_leaf(item)?;
+            if public_leaf.replace(leaf_name).is_some() {
+                return None;
+            }
+            continue;
+        }
+
+        match item {
+            Item::Mod(item_mod) if is_public(&item_mod.vis) => return None,
+            Item::Use(item_use) if is_public(&item_use.vis) => return None,
+            _ => {}
+        }
+    }
+
+    let leaf_name = public_leaf?;
+    if split_segments(&leaf_name).len() == 1 && settings.generic_nouns.contains(&leaf_name) {
+        Some(leaf_name)
+    } else {
+        None
+    }
+}
+
+fn analyze_public_use_item(
+    path: &Path,
+    item_use: &ItemUse,
+    module_path: &[String],
+    path_is_public: bool,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !(path_is_public && is_public(&item_use.vis)) {
+        return;
+    }
+
+    let mut leaves = Vec::new();
+    flatten_public_use_tree(&item_use.tree, &mut leaves);
+    let line = item_use.span().start().line;
+
+    for leaf in leaves {
+        analyze_public_leaf(
+            path,
+            line,
+            module_path,
+            &leaf.binding_name,
+            settings,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_public_item(
+    path: &Path,
+    item: &Item,
+    module_path: &[String],
+    path_is_public: bool,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some((line, leaf_name, is_item_public)) = public_item_leaf(item) else {
+        return;
+    };
+    if !(path_is_public && is_item_public) {
+        return;
+    }
+
+    analyze_public_leaf(path, line, module_path, &leaf_name, settings, diagnostics);
+}
+
+fn analyze_public_leaf(
+    path: &Path,
+    line: usize,
+    module_path: &[String],
+    leaf_name: &str,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(parent_module) = module_path.last() else {
+        return;
+    };
+    let parent_normalized = normalize_segment(parent_module);
+
+    if settings.weak_modules.contains(&parent_normalized)
+        && settings.generic_nouns.contains(leaf_name)
+    {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            file: Some(path.to_path_buf()),
+            line: Some(line),
+            code: Some("api_weak_module_generic_leaf".to_string()),
+            policy: true,
+            message: format!(
+                "generic public leaf `{leaf_name}` under weak module `{parent_module}` hides the domain; keep the domain in the leaf or move it under a stronger module"
+            ),
+        });
+        return;
+    }
+
+    if let Some(shorter_leaf) = redundant_category_suffix_leaf(parent_module, leaf_name, settings) {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            file: Some(path.to_path_buf()),
+            line: Some(line),
+            code: Some("api_redundant_category_suffix".to_string()),
+            policy: true,
+            message: format!(
+                "public leaf `{leaf_name}` repeats category `{parent_module}` from the parent module; prefer `{}`",
+                render_public_path(module_path, &shorter_leaf)
+            ),
+        });
+        return;
+    }
+
+    if settings.weak_modules.contains(&parent_normalized)
+        || settings.catch_all_modules.contains(&parent_normalized)
+    {
+        return;
+    }
+
+    if let Some(shorter_leaf) = redundant_leaf_context_candidate(parent_module, leaf_name) {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            file: Some(path.to_path_buf()),
+            line: Some(line),
+            code: Some("api_redundant_leaf_context".to_string()),
+            policy: true,
+            message: format!(
+                "public leaf `{leaf_name}` repeats module context from `{parent_module}`; prefer `{}`",
+                render_public_path(module_path, &shorter_leaf)
+            ),
+        });
+    }
+}
+
+fn public_item_leaf(item: &Item) -> Option<(usize, String, bool)> {
+    match item {
+        Item::Struct(ItemStruct { ident, vis, .. }) => {
+            Some((item.span().start().line, unraw_ident(ident), is_public(vis)))
+        }
+        Item::Enum(ItemEnum { ident, vis, .. }) => {
+            Some((item.span().start().line, unraw_ident(ident), is_public(vis)))
+        }
+        Item::Trait(ItemTrait { ident, vis, .. }) => {
+            Some((item.span().start().line, unraw_ident(ident), is_public(vis)))
+        }
+        Item::TraitAlias(ItemTraitAlias { ident, vis, .. }) => {
+            Some((item.span().start().line, unraw_ident(ident), is_public(vis)))
+        }
+        Item::Type(ItemType { ident, vis, .. }) => {
+            Some((item.span().start().line, unraw_ident(ident), is_public(vis)))
+        }
+        Item::Union(ItemUnion { ident, vis, .. }) => {
+            Some((item.span().start().line, unraw_ident(ident), is_public(vis)))
+        }
+        Item::Fn(ItemFn { sig, vis, .. }) => Some((
+            item.span().start().line,
+            unraw_ident(&sig.ident),
+            is_public(vis),
+        )),
+        Item::Const(ItemConst { ident, vis, .. }) => {
+            Some((item.span().start().line, unraw_ident(ident), is_public(vis)))
+        }
+        Item::Static(ItemStatic { ident, vis, .. }) => {
+            Some((item.span().start().line, unraw_ident(ident), is_public(vis)))
+        }
+        _ => None,
+    }
+}
+
+fn redundant_category_suffix_leaf(
+    parent_module: &str,
+    leaf_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<String> {
+    let leaf_segments = split_segments(leaf_name);
+    if leaf_segments.len() < 2 {
+        return None;
+    }
+
+    let parent_normalized = normalize_segment(parent_module);
+    let style = detect_name_style(leaf_name);
+    let last_segment = leaf_segments.last().map(|segment| segment.to_string())?;
+
+    for noun in &settings.generic_nouns {
+        if normalize_segment(noun) != parent_normalized {
+            continue;
+        }
+        if normalize_segment(&last_segment) != normalize_segment(noun) {
+            continue;
+        }
+
+        let shorter_segments = &leaf_segments[..leaf_segments.len() - 1];
+        if shorter_segments.is_empty() {
+            return None;
+        }
+
+        return Some(render_segments(shorter_segments, style));
+    }
+
+    None
+}
+
+fn redundant_leaf_context_candidate(parent_module: &str, leaf_name: &str) -> Option<String> {
+    let module_segments = split_segments(parent_module)
+        .into_iter()
+        .map(|segment| normalize_segment(&segment))
+        .collect::<Vec<_>>();
+    let leaf_segments = split_segments(leaf_name);
+    if module_segments.is_empty() || leaf_segments.len() <= module_segments.len() {
+        return None;
+    }
+
+    let leaf_normalized = leaf_segments
+        .iter()
+        .map(|segment| normalize_segment(segment))
+        .collect::<Vec<_>>();
+    let style = detect_name_style(leaf_name);
+
+    if leaf_normalized.starts_with(&module_segments) {
+        let shorter_segments = &leaf_segments[module_segments.len()..];
+        if !shorter_segments.is_empty() {
+            return Some(render_segments(shorter_segments, style));
+        }
+    }
+
+    if leaf_normalized.ends_with(&module_segments) {
+        let shorter_segments = &leaf_segments[..leaf_segments.len() - module_segments.len()];
+        if !shorter_segments.is_empty() {
+            return Some(render_segments(shorter_segments, style));
+        }
+    }
+
+    None
+}
+
+fn detect_name_style(name: &str) -> NameStyle {
+    if name.contains('_') {
+        if name
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic())
+            .all(|ch| ch.is_ascii_uppercase())
+        {
+            NameStyle::ScreamingSnake
+        } else {
+            NameStyle::Snake
+        }
+    } else {
+        NameStyle::Pascal
+    }
+}
+
+fn render_segments(segments: &[String], style: NameStyle) -> String {
+    match style {
+        NameStyle::Pascal => segments
+            .iter()
+            .map(|segment| {
+                let lower = segment.to_ascii_lowercase();
+                let mut chars = lower.chars();
+                let Some(first) = chars.next() else {
+                    return String::new();
+                };
+                let mut rendered = String::new();
+                rendered.push(first.to_ascii_uppercase());
+                rendered.extend(chars);
+                rendered
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        NameStyle::Snake => segments
+            .iter()
+            .map(|segment| segment.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("_"),
+        NameStyle::ScreamingSnake => segments
+            .iter()
+            .map(|segment| segment.to_ascii_uppercase())
+            .collect::<Vec<_>>()
+            .join("_"),
+    }
+}
+
+fn render_public_path(module_path: &[String], leaf_name: &str) -> String {
+    if module_path.is_empty() {
+        leaf_name.to_string()
+    } else {
+        format!("{}::{leaf_name}", module_path.join("::"))
+    }
+}
+
+fn render_public_path_with_module(module_path: &[String], module_name: &str, leaf_name: &str) -> String {
+    let mut full = module_path.to_vec();
+    full.push(module_name.to_string());
+    render_public_path(&full, leaf_name)
+}
+
+fn flatten_public_use_tree(tree: &UseTree, leaves: &mut Vec<PublicUseLeaf>) {
+    match tree {
+        UseTree::Path(path) => flatten_public_use_tree(&path.tree, leaves),
+        UseTree::Name(name) => {
+            let binding_name = name.ident.to_string();
+            if binding_name != "self" {
+                leaves.push(PublicUseLeaf { binding_name });
+            }
+        }
+        UseTree::Rename(rename) => leaves.push(PublicUseLeaf {
+            binding_name: rename.rename.to_string(),
+        }),
+        UseTree::Group(group) => {
+            for item in &group.items {
+                flatten_public_use_tree(item, leaves);
+            }
+        }
+        UseTree::Glob(_) => {}
+    }
+}
+
+fn inferred_file_module_path(path: &Path) -> Vec<String> {
+    let components = path
+        .iter()
+        .map(|component| component.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let rel = if let Some(src_idx) = components.iter().rposition(|component| component == "src") {
+        &components[src_idx + 1..]
+    } else {
+        &components[..]
+    };
+
+    if rel.is_empty() || rel.first().is_some_and(|component| component == "bin") {
+        return Vec::new();
+    }
+
+    let mut module_path = Vec::new();
+    for (idx, component) in rel.iter().enumerate() {
+        let is_last = idx + 1 == rel.len();
+        if is_last {
+            match component.as_str() {
+                "lib.rs" | "main.rs" | "mod.rs" => {}
+                other => {
+                    if let Some(stem) = other.strip_suffix(".rs") {
+                        module_path.push(stem.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+
+        module_path.push(component.to_string());
+    }
+
+    module_path
+}
+
+fn inferred_module_is_public(path: &Path, module_path: &[String]) -> bool {
+    let Some(src_root) = source_root(path) else {
+        return false;
+    };
+
+    let mut prefix = Vec::<String>::new();
+    for segment in module_path {
+        let candidates = parent_module_files(&src_root, &prefix);
+        let mut found_public = None;
+
+        for candidate in candidates {
+            let Some(is_public) = module_decl_visibility(&candidate, segment) else {
+                continue;
+            };
+            found_public = Some(is_public);
+            if is_public {
+                break;
+            }
+        }
+
+        match found_public {
+            Some(true) => prefix.push(segment.clone()),
+            _ => return false,
+        }
+    }
+
+    true
+}
+
+fn source_root(path: &Path) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        root.push(component.as_os_str());
+        if component.as_os_str() == "src" {
+            return Some(root);
+        }
+    }
+    None
+}
+
+fn parent_module_files(src_root: &Path, prefix: &[String]) -> Vec<PathBuf> {
+    if prefix.is_empty() {
+        return vec![src_root.join("lib.rs"), src_root.join("main.rs")];
+    }
+
+    let joined = prefix.join("/");
+    vec![
+        src_root.join(format!("{joined}.rs")),
+        src_root.join(joined).join("mod.rs"),
+    ]
+}
+
+fn module_decl_visibility(file: &Path, segment: &str) -> Option<bool> {
+    let src = fs::read_to_string(file).ok()?;
+    let parsed = syn::parse_file(&src).ok()?;
+
+    parsed.items.into_iter().find_map(|item| match item {
+        Item::Mod(item_mod) if item_mod.ident == segment => Some(is_public(&item_mod.vis)),
+        _ => None,
+    })
+}

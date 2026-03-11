@@ -1,243 +1,188 @@
 # modum
 
-**modum** is a proc-macro attribute that rewrites one named Rust item into a generated module path:
+`modum` enforces consistent module naming, import style, and public API paths across a Rust workspace.
 
-`NameLikeThis` -> `name::LikeThis` (or `name::like_this` / `name::LIKE_THIS` depending on item kind).
+It is a lint tool. It reports diagnostics. It does not rewrite code.
 
-## Why Use modum?
-- **Reduce top-level namespace noise** by grouping related items under lightweight modules.
-- **Keep call-sites readable** with stable `module::item` access patterns.
-- **Make naming conventions explicit** across types, functions, and constants.
-- **Stay compile-time only**: no runtime cost, just generated Rust.
+## Why It Exists
 
-## The Problem modum Solves
-
-In medium/large crates, top-level items pile up quickly:
-- similar prefixes repeated across many items (`UserCreate`, `UserDelete`, `UserList`, ...)
-- naming collisions between constants/functions/types
-- uneven style drift between Pascal/camel/snake naming sources
-
-`modum` turns the first semantic segment into a namespace module, so names become easier to scan and group:
-
-- `UserCreate` -> `user::Create`
-- `userCreate` -> `user::create` (for `fn`)
-- `USER_TOTAL` -> `user::TOTAL` (for `const`/`static`)
-
-## How modum Works
-
-`#[modum]`:
-1. Parses the item identifier into segments (`PascalCase`, `camelCase`, or `snake_case`).
-2. Uses the **first segment** as the generated module name (lowercase).
-3. Uses the **remaining segments** as the inner item name.
-4. Re-emits your item as:
+These API shapes are legal Rust, but they add noise:
 
 ```rust
-pub mod <head> {
-    pub <item renamed to tail>;
-}
+use http::Client;
+use user::UserRepository;
+
+pub use partials::error::Error;
 ```
 
-The original top-level item name is removed. The generated module path is the API.
-
-## Table of Contents
-- [Quick Start](#quick-start)
-- [Naming Model](#naming-model)
-- [Supported Items](#supported-items)
-- [Examples](#examples)
-- [Common Errors and Tips](#common-errors-and-tips)
-- [API Reference](#api-reference)
-- [Limitations](#limitations)
-
-## Quick Start
+These read more clearly:
 
 ```rust
-use modum::modum;
+use http;
+use user;
 
-#[modum]
-pub struct WhatEver;
-
-#[modum]
-pub fn myFunction() -> u32 {
-    7
-}
-
-#[modum]
-pub const STATE_TOTAL: usize = 22;
-
-fn demo() {
-    let _ = what::Ever;
-    let _ = my::function();
-    let _ = state::TOTAL;
-}
+pub use partials::Error;
 ```
 
-## Naming Model
+And these public paths usually read better:
 
-### Input Styles
-- `PascalCase`
-- `camelCase`
-- `snake_case`
-
-### Split Rule
-- First segment -> module name (lowercase)
-- Remaining segments -> tail item name
-
-### Tail Casing by Item Kind
-- `struct`, `enum`, `trait`, `type`, `union` -> `PascalCase`
-- `fn` -> `snake_case`
-- `const`, `static` -> `SCREAMING_SNAKE_CASE`
-
-### Examples
-- `HTTPServer` (`struct`) -> `http::Server`
-- `myHTTPServer` (`fn`) -> `my::http_server`
-- `state_total` (`const`) -> `state::TOTAL`
-- `STATE_TOTAL` (`const`) -> `state::TOTAL`
-
-## Supported Items
-
-`#[modum]` supports:
-- `struct`
-- `enum`
-- `trait`
-- `type`
-- `union`
-- `fn` (free function)
-- `const`
-- `static`
-
-Unsupported item kinds fail with a compile-time error.
-
-## Examples
-
-### Structs and Enums
-
-```rust
-use modum::modum;
-
-#[modum]
-pub struct ReviewState;
-
-#[modum]
-pub enum HTTPStatus {
-    Ok,
-    Err,
-}
-
-fn demo() {
-    let _ = review::State;
-    let _ = http::Status::Ok;
-}
+```text
+user::Repository
+user::error::InvalidEmail
+partials::Error
 ```
 
-### Functions
+instead of:
 
-```rust
-use modum::modum;
-
-#[modum]
-pub fn myFunction() -> u32 {
-    1
-}
-
-fn demo() {
-    let _ = my::function();
-}
+```text
+user::UserRepository
+user::error::InvalidEmailError
+partials::error::Error
 ```
 
-### Const and Static
+`modum` enforces that style across an entire workspace.
 
-```rust
-use modum::modum;
+## Mental Model
 
-#[modum]
-pub const STATE_TOTAL: usize = 22;
+`modum` follows three rules:
 
-#[modum]
-pub static METRIC_SUM: usize = 99;
+1. Keep namespace context visible at call sites.
+2. Keep public paths meaningful without redundancy.
+3. Use modules for domain boundaries, not file organization.
 
-fn demo() {
-    let _ = state::TOTAL;
-    let _ = metric::SUM;
-}
+## Quick Usage
+
+```bash
+cargo run -p modum -- check --root .
+cargo run -p modum -- check --root . --mode warn
+cargo run -p modum -- check --root . --format json
 ```
 
-### Traits and Type Aliases
+If you already built the binary:
 
-```rust
-use modum::modum;
-
-#[modum]
-pub trait RequestHandler {
-    fn handle(&self) -> u8;
-}
-
-#[modum]
-pub type AppList<T> = Vec<T>;
-
-struct Worker;
-
-impl request::Handler for Worker {
-    fn handle(&self) -> u8 {
-        3
-    }
-}
+```bash
+target/debug/modum check --root .
 ```
 
-## Common Errors and Tips
+Environment:
 
-- **Single-segment names are rejected**:
-  - `Foo` or `foo` do not have enough segments.
-  - Use at least two segments, like `FooBar`, `foo_bar`, `fooBar`.
-
-- **Macro ordering with derives/attr macros matters**:
-  - Prefer placing `#[modum]` above `#[derive(...)]` and similar attribute macros.
-  - Example:
-    ```rust
-    #[modum]
-    #[derive(Debug, Clone)]
-    pub struct MetaData;
-    ```
-
-- **Duplicate generated module names will conflict**:
-  - Two items whose first segment is the same in the same scope both generate the same module.
-  - Example: `app_value` and `app_state` both try to create `mod app`.
-
-- **Original top-level name no longer exists**:
-  - After rewrite, use `module::Item` only.
-
-## API Reference
-
-### `#[modum]`
-
-Apply to one supported named item.
-
-```rust
-use modum::modum;
-
-#[modum]
-pub struct PascalCase;
+```bash
+MODUM=off|warn|deny
 ```
 
-Generated shape:
+Default mode is `deny`.
 
-```rust
-pub mod pascal {
-    pub struct Case;
-}
+## Exit Behavior
+
+- `0`: clean, or warnings allowed via `--mode warn`
+- `2`: warning-level policy violations found in `deny` mode
+- `1`: hard errors, including parse/configuration failures and error-level policy violations such as `api_organizational_submodule_flatten`
+
+## Configuration
+
+Configure the lints in any workspace with Cargo metadata:
+
+```toml
+[workspace.metadata.modum]
+generic_nouns = ["Id", "Repository", "Service", "Error", "Command", "Request", "Response"]
+weak_modules = ["storage", "transport", "infra", "common", "misc", "helpers", "helper", "types", "util", "utils"]
+catch_all_modules = ["common", "misc", "helpers", "helper", "types", "util", "utils"]
+organizational_modules = ["error", "errors"]
+namespace_preserving_modules = ["auth", "command", "email", "error", "http", "page", "partials", "policy", "query", "repo", "store", "storage", "transport", "infra"]
 ```
 
-Rules:
-- No macro arguments are accepted (`#[modum(...)]` is invalid).
-- Item attributes (other than `#[modum]`) are preserved.
-- Module visibility follows the original item visibility.
-- Inner generated items are always `pub` so `module::Item` is usable from the parent scope.
+Use `[package.metadata.modum]` inside a member crate to override workspace defaults for that package.
 
-## Limitations
+Tuning guide:
 
-- Only supported on the item kinds listed above.
-- Does not currently merge multiple transformed items into one generated module.
-- Renaming/moving into a module can affect privacy and path resolution in edge cases.
+- `generic_nouns`: generic leaves like `Repository`, `Error`, or `Request`
+- `namespace_preserving_modules`: modules that should stay visible at call sites, such as `http`, `email`, or `query`
+- `organizational_modules`: modules that should not leak into the public API surface, such as `error`
 
-## License
+## Lint Categories
 
-MIT
+### Import Style
+
+These warn when imports or re-exports flatten a namespace that should stay visible.
+
+- `namespace_flat_use`
+- `namespace_flat_use_preserve_module`
+- `namespace_flat_use_redundant_leaf_context`
+- `namespace_flat_pub_use`
+- `namespace_flat_pub_use_preserve_module`
+- `namespace_flat_pub_use_redundant_leaf_context`
+
+Examples:
+
+- `use storage::Repository;`
+- `use http::Client;`
+- `use user::UserRepository;`
+
+### Public API Paths
+
+These warn when public leaves are too generic for a weak parent, or when the path repeats context it already has.
+
+- `api_weak_module_generic_leaf`
+- `api_redundant_leaf_context`
+- `api_redundant_category_suffix`
+
+Examples:
+
+- `storage::Repository`
+- `user::UserRepository`
+- `user::error::InvalidEmailError`
+
+### Module Boundaries
+
+These catch weak or redundant public module structure.
+
+- `api_catch_all_module`
+- `api_repeated_module_segment`
+
+Examples:
+
+- `helpers`
+- `error::error`
+
+### Structural Errors
+
+This is an error-level rule, not a warning.
+
+- `api_organizational_submodule_flatten`
+
+Example:
+
+- `partials::error::Error` should usually be `partials::Error`
+
+## What It Does Not Check
+
+Some naming-guide rules stay advisory because they are too semantic to lint reliably without compiler-grade context.
+
+Examples:
+
+- choosing the best public path among several plausible domain decompositions
+- deciding when an internal long name plus `pub use ... as ...` is the right tradeoff
+- deciding whether a new module level adds real meaning or only mirrors the file tree in edge cases
+
+## Scope
+
+Default discovery:
+
+- package root: scans `<root>/src`
+- workspace root: scans each member crate's `src`
+
+Override discovery with `--include`:
+
+```bash
+modum check --root . --include crates/api/src --include crates/domain/src
+```
+
+## False Positives And False Negatives
+
+The broader import-style lints only inspect module-scope `use` items. They do not scan local block imports inside functions or tight test scopes, because those scopes often benefit from flatter imports.
+
+To reduce false negatives:
+
+- extend `namespace_preserving_modules` for domain modules like `user`, `billing`, or `tenant`
+- keep `generic_nouns` aligned with the generic leaves your API actually uses
+- keep `organizational_modules` configured so `partials::error::Error`-style paths stay blocked

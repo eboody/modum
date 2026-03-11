@@ -1,0 +1,12 @@
+[package]
+name = "modum-example-high-coverage"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata.modum]
+generic_nouns = ["Id", "Repository", "Service", "Error", "Command", "Request", "Response"]
+weak_modules = ["storage", "transport", "infra", "common", "misc", "helpers", "helper", "types", "util", "utils"]
+catch_all_modules = ["common", "misc", "helpers", "helper", "types", "util", "utils"]
+organizational_modules = ["error", "errors"]
+namespace_preserving_modules = ["auth", "command", "email", "error", "http", "page", "partials", "policy", "query", "repo", "store", "storage", "transport", "infra"]

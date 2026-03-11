@@ -1,19 +1,21 @@
 [package]
 name = "modum"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
-description = "Attribute macro that rewrites named items into module::item paths"
+rust-version = "1.85"
+description = "Workspace lint tool for Rust naming and API-shape policy"
 license = "MIT"
 repository = "https://github.com/eboody/modum"
+documentation = "https://docs.rs/modum"
 readme = "../README.md"
 
-[lib]
-proc-macro = true
+[[bin]]
+name = "modum"
+path = "src/bin/modum.rs"
 
 [dependencies]
-proc-macro2 = "1"
-quote = "1"
-syn = { version = "2", features = ["full"] }
+modum-core = { version = "0.1.0", path = "../modum-core" }
+serde_json = "1"
 
 [dev-dependencies]
-trybuild = "1"
+tempfile = "3"

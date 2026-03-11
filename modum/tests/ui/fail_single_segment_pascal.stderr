@@ -1,5 +1,0 @@
-error: #[modum] requires at least two name segments (camelCase, PascalCase, or snake_case), for example PascalCase -> pascal::Case
- --> tests/ui/fail_single_segment_pascal.rs:4:12
-  |
-4 | pub struct Foo;
-  |            ^^^
