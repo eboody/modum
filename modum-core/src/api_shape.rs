@@ -1,9 +1,11 @@
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use syn::{
     File, Item, ItemConst, ItemEnum, ItemFn, ItemMod, ItemStatic, ItemStruct, ItemTrait,
-    ItemTraitAlias, ItemType, ItemUnion, ItemUse, UseTree,
-    spanned::Spanned,
+    ItemTraitAlias, ItemType, ItemUnion, ItemUse, UseTree, spanned::Spanned,
 };
 
 use super::{
@@ -103,7 +105,14 @@ fn analyze_scope(
                 settings,
                 diagnostics,
             ),
-            _ => analyze_public_item(path, item, module_path, path_is_public, settings, diagnostics),
+            _ => analyze_public_item(
+                path,
+                item,
+                module_path,
+                path_is_public,
+                settings,
+                diagnostics,
+            ),
         }
     }
 }
@@ -137,11 +146,10 @@ fn analyze_module_item(
 
         if !module_path.is_empty()
             && settings.organizational_modules.contains(&normalized)
-            && let Some(flatten_leaf) =
-                organizational_flatten_candidate(
-                    item_mod.content.as_ref().map(|(_, nested)| nested),
-                    settings,
-                )
+            && let Some(flatten_leaf) = organizational_flatten_candidate(
+                item_mod.content.as_ref().map(|(_, nested)| nested),
+                settings,
+            )
         {
             diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Error,
@@ -196,9 +204,7 @@ fn organizational_flatten_candidate(
     let mut public_leaf = None;
 
     for item in nested {
-        if public_item_leaf(item)
-            .is_some_and(|(_, _, is_item_public)| is_item_public)
-        {
+        if public_item_leaf(item).is_some_and(|(_, _, is_item_public)| is_item_public) {
             let (_, leaf_name, _) = public_item_leaf(item)?;
             if public_leaf.replace(leaf_name).is_some() {
                 return None;
@@ -487,7 +493,11 @@ fn render_public_path(module_path: &[String], leaf_name: &str) -> String {
     }
 }
 
-fn render_public_path_with_module(module_path: &[String], module_name: &str, leaf_name: &str) -> String {
+fn render_public_path_with_module(
+    module_path: &[String],
+    module_name: &str,
+    leaf_name: &str,
+) -> String {
     let mut full = module_path.to_vec();
     full.push(module_name.to_string());
     render_public_path(&full, leaf_name)

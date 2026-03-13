@@ -108,6 +108,7 @@ These warn when imports or re-exports flatten a namespace that should stay visib
 - `namespace_flat_use`
 - `namespace_flat_use_preserve_module`
 - `namespace_flat_use_redundant_leaf_context`
+- `namespace_parent_surface`
 - `namespace_flat_pub_use`
 - `namespace_flat_pub_use_preserve_module`
 - `namespace_flat_pub_use_redundant_leaf_context`
@@ -117,6 +118,10 @@ Examples:
 - `use storage::Repository;`
 - `use http::Client;`
 - `use user::UserRepository;`
+- `use crate::error::Error;` inside a crate whose root surface already exposes `Error`
+- `pub use auth::{login, logout};`
+
+Canonical parent-surface re-exports are allowed. `pub use error::{Error, Result};` is valid when that is how a module intentionally exposes `module::Error` and `module::Result`.
 
 ### Public API Paths
 

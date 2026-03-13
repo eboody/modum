@@ -29,8 +29,11 @@ fn run_check_warn_allows_policy_violations_but_deny_blocks() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
     fs::create_dir_all(root.join("src")).expect("create src");
-    fs::write(root.join("Cargo.toml"), "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n")
-        .expect("write manifest");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+    )
+    .expect("write manifest");
     fs::write(root.join("src/lib.rs"), "pub mod storage;\n").expect("write lib");
     fs::write(root.join("src/storage.rs"), "pub struct Repository;\n").expect("write module");
 
@@ -52,8 +55,11 @@ fn run_check_errors_override_warn_and_deny() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
     fs::create_dir_all(root.join("src")).expect("create src");
-    fs::write(root.join("Cargo.toml"), "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n")
-        .expect("write manifest");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+    )
+    .expect("write manifest");
     fs::write(root.join("src/lib.rs"), "pub struct Broken {\n").expect("write invalid file");
 
     let warn = run_check(root, &[], CheckMode::Warn);

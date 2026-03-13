@@ -36,13 +36,7 @@ const DEFAULT_WEAK_MODULES: &[&str] = &[
 ];
 
 const DEFAULT_CATCH_ALL_MODULES: &[&str] = &[
-    "common",
-    "misc",
-    "helpers",
-    "helper",
-    "types",
-    "util",
-    "utils",
+    "common", "misc", "helpers", "helper", "types", "util", "utils",
 ];
 
 const DEFAULT_ORGANIZATIONAL_MODULES: &[&str] = &["error", "errors"];
@@ -400,10 +394,12 @@ fn parse_settings_from_manifest(
     let table = value?.as_table()?;
     let mut settings = NamespaceSettings::default();
 
-    if let Some(values) = parse_string_set_field(table, "generic_nouns", manifest_path, diagnostics) {
+    if let Some(values) = parse_string_set_field(table, "generic_nouns", manifest_path, diagnostics)
+    {
         settings.generic_nouns = values;
     }
-    if let Some(values) = parse_string_set_field(table, "weak_modules", manifest_path, diagnostics) {
+    if let Some(values) = parse_string_set_field(table, "weak_modules", manifest_path, diagnostics)
+    {
         settings.weak_modules = values;
     }
     if let Some(values) =
@@ -411,12 +407,9 @@ fn parse_settings_from_manifest(
     {
         settings.catch_all_modules = values;
     }
-    if let Some(values) = parse_string_set_field(
-        table,
-        "organizational_modules",
-        manifest_path,
-        diagnostics,
-    ) {
+    if let Some(values) =
+        parse_string_set_field(table, "organizational_modules", manifest_path, diagnostics)
+    {
         settings.organizational_modules = values;
     }
     if let Some(values) = parse_string_set_field(
@@ -614,7 +607,9 @@ fn resolve_workspace_member_pattern(root: &Path, pattern: &str) -> io::Result<Ve
         if candidate.is_dir() {
             return Ok(vec![candidate]);
         }
-        if candidate.file_name().is_some_and(|name| name == "Cargo.toml")
+        if candidate
+            .file_name()
+            .is_some_and(|name| name == "Cargo.toml")
             && let Some(parent) = candidate.parent()
         {
             return Ok(vec![parent.to_path_buf()]);

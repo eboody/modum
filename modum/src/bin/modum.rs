@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
-use modum::{parse_check_mode, render_pretty_report, run_check, CheckMode};
+use modum::{CheckMode, parse_check_mode, render_pretty_report, run_check};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {

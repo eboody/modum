@@ -144,11 +144,13 @@ Codex should default to these behaviors:
 - `namespace_flat_use_preserve_module`
   Warning. Flags flattened imports from configured namespace-preserving modules such as `email`, `http`, `query`, or `storage`.
 - `namespace_flat_use_redundant_leaf_context`
-  Warning. Flags flattened imports such as `use user::UserRepository;` where the leaf itself repeats the parent module context.
+  Warning. Flags flattened imports or rename-heavy aliases such as `use user::UserRepository;` or `use playwright::api::page::Event as PageEvent;` where the child module already supplies the missing context.
+- `namespace_parent_surface`
+  Warning. Flags imports that reach into an internal child module even though the containing parent surface already exposes the same readable item, such as preferring `http::Error` over `error::Error`.
 - `namespace_flat_pub_use`
-  Warning. Flags flattened public re-exports of those generic nouns.
+  Warning. Flags flattened public re-exports of those generic nouns when they bypass a meaningful child facet. It does not flag module-root re-exports that intentionally create the canonical parent surface, such as `pub use error::Error;` for `user::Error`.
 - `namespace_flat_pub_use_preserve_module`
-  Warning. Flags flattened public re-exports from configured namespace-preserving modules.
+  Warning. Flags flattened public re-exports from configured namespace-preserving modules when the child facet should stay visible.
 - `namespace_flat_pub_use_redundant_leaf_context`
   Warning. Flags flattened public re-exports whose leaf still repeats the parent context.
 - `api_weak_module_generic_leaf`

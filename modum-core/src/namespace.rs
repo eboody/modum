@@ -1,8 +1,12 @@
-use std::path::Path;
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use syn::{
-    File, Item, ItemMod, ItemUse, UseTree, Visibility,
-    spanned::Spanned,
+    File, Item, ItemConst, ItemEnum, ItemFn, ItemMod, ItemStatic, ItemStruct, ItemTrait,
+    ItemTraitAlias, ItemType, ItemUnion, ItemUse, UseTree, Visibility, spanned::Spanned,
 };
 
 use super::{Diagnostic, DiagnosticLevel, NamespaceSettings};
@@ -73,16 +77,46 @@ fn analyze_use_item(
             continue;
         };
         let binding_name = leaf.binding_name.as_deref().unwrap_or(source_name);
-        let Some(parent_module) = leaf.full_path.iter().rev().nth(1).cloned() else {
+        if is_nonbinding_import(source_name) || is_nonbinding_import(binding_name) {
+            continue;
+        }
+
+        let analysis_path = trim_relative_prefix(&leaf.full_path);
+        let Some(parent_module) = analysis_path.iter().rev().nth(1).cloned() else {
             continue;
         };
         let parent_normalized = parent_module.to_ascii_lowercase();
+        let current_module_path = inferred_file_module_path(path);
+        let redundant_leaf =
+            redundant_leaf_context_candidate(analysis_path, binding_name, leaf.kind, settings);
 
-        let (code, message) = if settings.generic_nouns.contains(binding_name) {
-            generic_noun_message(is_reexport, &parent_module, source_name)
-        } else if let Some(shorter_leaf) = redundant_leaf_context_candidate(&parent_module, binding_name)
-        {
+        let (code, message) = if !is_reexport
+            && let Some(canonical_parent_surface) = canonical_parent_surface_candidate(
+                path,
+                &current_module_path,
+                analysis_path,
+                binding_name,
+                settings,
+            ) {
+            canonical_parent_surface_message(
+                binding_name,
+                source_name,
+                &parent_module,
+                &canonical_parent_surface,
+            )
+        } else if let Some(shorter_leaf) = redundant_leaf {
             redundant_context_message(is_reexport, &parent_module, binding_name, &shorter_leaf)
+        } else if is_reexport
+            && canonical_parent_surface_reexport(
+                &current_module_path,
+                analysis_path,
+                binding_name,
+                settings,
+            )
+        {
+            continue;
+        } else if settings.generic_nouns.contains(binding_name) {
+            generic_noun_message(is_reexport, &parent_module, source_name)
         } else if settings
             .namespace_preserving_modules
             .contains(&parent_normalized)
@@ -101,6 +135,39 @@ fn analyze_use_item(
             message,
         });
     }
+}
+
+fn canonical_parent_surface_reexport(
+    current_module_path: &[String],
+    import_path: &[String],
+    binding_name: &str,
+    settings: &NamespaceSettings,
+) -> bool {
+    if import_path.len() < 2 {
+        return false;
+    }
+
+    let import_modules = &import_path[..import_path.len() - 1];
+    let Some(imported_parent) = import_modules.last() else {
+        return false;
+    };
+    let imported_parent_normalized = imported_parent.to_ascii_lowercase();
+    let binding_normalized = binding_name.to_ascii_lowercase();
+
+    if settings
+        .organizational_modules
+        .contains(&imported_parent_normalized)
+    {
+        return true;
+    }
+
+    if imported_parent_normalized == binding_normalized {
+        return true;
+    }
+
+    !current_module_path.is_empty()
+        && import_modules.ends_with(current_module_path)
+        && settings.generic_nouns.contains(binding_name)
 }
 
 fn flatten_use_tree(prefix: Vec<String>, tree: &UseTree, leaves: &mut Vec<UseLeaf>) {
@@ -213,7 +280,15 @@ fn preserve_module_message(
     }
 }
 
-fn redundant_leaf_context_candidate(parent_module: &str, leaf_name: &str) -> Option<String> {
+fn redundant_leaf_context_candidate(
+    full_path: &[String],
+    leaf_name: &str,
+    kind: UseLeafKind,
+    settings: &NamespaceSettings,
+) -> Option<String> {
+    let Some(parent_module) = full_path.iter().rev().nth(1) else {
+        return None;
+    };
     let module_segments = split_segments(parent_module)
         .into_iter()
         .map(|segment| segment.to_ascii_lowercase())
@@ -232,18 +307,335 @@ fn redundant_leaf_context_candidate(parent_module: &str, leaf_name: &str) -> Opt
     if leaf_normalized.starts_with(&module_segments) {
         let shorter_segments = &leaf_segments[module_segments.len()..];
         if !shorter_segments.is_empty() {
-            return Some(render_segments(shorter_segments, style));
+            let shorter_leaf = render_segments(shorter_segments, style);
+            if prefix_overlap_is_actionable(full_path, kind, &shorter_leaf) {
+                return Some(shorter_leaf);
+            }
         }
     }
 
-    if leaf_normalized.ends_with(&module_segments) {
+    if leaf_normalized.ends_with(&module_segments)
+        && suffix_overlap_is_actionable(parent_module, full_path)
+    {
         let shorter_segments = &leaf_segments[..leaf_segments.len() - module_segments.len()];
         if !shorter_segments.is_empty() {
             return Some(render_segments(shorter_segments, style));
         }
     }
 
+    // Keep the older generic-noun backstop for shapes like `user::UserRepository`.
+    if settings
+        .namespace_preserving_modules
+        .contains(&parent_module.to_ascii_lowercase())
+        || split_segments(leaf_name)
+            .iter()
+            .any(|segment| matches_generic_noun(segment, settings))
+    {
+        if leaf_normalized.starts_with(&module_segments) {
+            let shorter_segments = &leaf_segments[module_segments.len()..];
+            if !shorter_segments.is_empty() {
+                return Some(render_segments(shorter_segments, style));
+            }
+        }
+    }
+
     None
+}
+
+fn prefix_overlap_is_actionable(
+    full_path: &[String],
+    kind: UseLeafKind,
+    shorter_leaf: &str,
+) -> bool {
+    if is_unreadable_short_leaf(shorter_leaf) {
+        return false;
+    }
+
+    matches!(kind, UseLeafKind::Rename) || full_path.len() <= 3
+}
+
+fn suffix_overlap_is_actionable(parent_module: &str, full_path: &[String]) -> bool {
+    if full_path.len() > 3 {
+        return false;
+    }
+
+    split_segments(parent_module)
+        .last()
+        .is_some_and(|segment| is_suffix_category(segment))
+}
+
+fn is_suffix_category(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "config" | "state" | "content" | "kind" | "attr"
+    )
+}
+
+fn is_unreadable_short_leaf(shorter_leaf: &str) -> bool {
+    matches!(
+        shorter_leaf.to_ascii_lowercase().as_str(),
+        "buf" | "ref" | "into" | "from" | "system"
+    )
+}
+
+fn matches_generic_noun(segment: &str, settings: &NamespaceSettings) -> bool {
+    settings
+        .generic_nouns
+        .iter()
+        .any(|noun| noun.eq_ignore_ascii_case(segment))
+}
+
+fn trim_relative_prefix(full_path: &[String]) -> &[String] {
+    let start = full_path
+        .iter()
+        .take_while(|segment| is_relative_keyword(segment))
+        .count();
+    &full_path[start..]
+}
+
+fn is_nonbinding_import(name: &str) -> bool {
+    name == "_" || is_relative_keyword(name)
+}
+
+fn is_relative_keyword(segment: &str) -> bool {
+    matches!(segment, "crate" | "self" | "super")
+}
+
+fn canonical_parent_surface_candidate(
+    path: &Path,
+    current_module_path: &[String],
+    import_path: &[String],
+    binding_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<String> {
+    if import_path.len() < 2 || current_module_path.is_empty() {
+        return None;
+    }
+
+    let imported_parent = import_path.iter().rev().nth(1)?;
+    let imported_parent_normalized = imported_parent.to_ascii_lowercase();
+    if !settings
+        .organizational_modules
+        .contains(&imported_parent_normalized)
+        && !settings.generic_nouns.contains(binding_name)
+    {
+        return None;
+    }
+
+    let parent_surface_path = &current_module_path[..current_module_path.len() - 1];
+    if import_path.len() == parent_surface_path.len() + 1
+        && import_path[..import_path.len() - 1] == *parent_surface_path
+    {
+        return None;
+    }
+
+    let public_bindings = public_bindings_for_module(path, parent_surface_path);
+    if !public_bindings.contains(binding_name) {
+        return None;
+    }
+
+    Some(render_canonical_parent_surface(
+        path,
+        parent_surface_path,
+        binding_name,
+    ))
+}
+
+fn canonical_parent_surface_message(
+    binding_name: &str,
+    source_name: &str,
+    parent_module: &str,
+    canonical_parent_surface: &str,
+) -> (&'static str, String) {
+    (
+        "namespace_parent_surface",
+        format!(
+            "import bypasses the canonical parent surface for `{binding_name}` via `{parent_module}::{source_name}`; prefer `{canonical_parent_surface}`"
+        ),
+    )
+}
+
+fn public_bindings_for_module(path: &Path, module_path: &[String]) -> BTreeSet<String> {
+    let Some(src_root) = source_root(path) else {
+        return BTreeSet::new();
+    };
+
+    for candidate in parent_module_files(&src_root, module_path) {
+        let Ok(src) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = syn::parse_file(&src) else {
+            continue;
+        };
+        return collect_public_bindings(&parsed.items);
+    }
+
+    BTreeSet::new()
+}
+
+fn collect_public_bindings(items: &[Item]) -> BTreeSet<String> {
+    let mut bindings = BTreeSet::new();
+
+    for item in items {
+        match item {
+            Item::Use(item_use) if !matches!(item_use.vis, Visibility::Inherited) => {
+                let mut leaves = Vec::new();
+                flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+                for leaf in leaves {
+                    if matches!(leaf.kind, UseLeafKind::Glob) {
+                        continue;
+                    }
+                    if let Some(binding_name) = leaf.binding_name
+                        && !is_nonbinding_import(&binding_name)
+                    {
+                        bindings.insert(binding_name);
+                    }
+                }
+            }
+            _ => {
+                if let Some((binding_name, is_public)) = public_item_binding(item)
+                    && is_public
+                {
+                    bindings.insert(binding_name);
+                }
+            }
+        }
+    }
+
+    bindings
+}
+
+fn public_item_binding(item: &Item) -> Option<(String, bool)> {
+    match item {
+        Item::Struct(ItemStruct { ident, vis, .. }) => {
+            Some((ident.to_string(), !matches!(vis, Visibility::Inherited)))
+        }
+        Item::Enum(ItemEnum { ident, vis, .. }) => {
+            Some((ident.to_string(), !matches!(vis, Visibility::Inherited)))
+        }
+        Item::Trait(ItemTrait { ident, vis, .. }) => {
+            Some((ident.to_string(), !matches!(vis, Visibility::Inherited)))
+        }
+        Item::TraitAlias(ItemTraitAlias { ident, vis, .. }) => {
+            Some((ident.to_string(), !matches!(vis, Visibility::Inherited)))
+        }
+        Item::Type(ItemType { ident, vis, .. }) => {
+            Some((ident.to_string(), !matches!(vis, Visibility::Inherited)))
+        }
+        Item::Union(ItemUnion { ident, vis, .. }) => {
+            Some((ident.to_string(), !matches!(vis, Visibility::Inherited)))
+        }
+        Item::Fn(ItemFn { sig, vis, .. }) => {
+            Some((sig.ident.to_string(), !matches!(vis, Visibility::Inherited)))
+        }
+        Item::Const(ItemConst { ident, vis, .. }) => {
+            Some((ident.to_string(), !matches!(vis, Visibility::Inherited)))
+        }
+        Item::Static(ItemStatic { ident, vis, .. }) => {
+            Some((ident.to_string(), !matches!(vis, Visibility::Inherited)))
+        }
+        _ => None,
+    }
+}
+
+fn render_canonical_parent_surface(
+    path: &Path,
+    module_path: &[String],
+    binding_name: &str,
+) -> String {
+    if module_path.is_empty() {
+        if let Some(package_name) = package_name_for_file(path) {
+            return format!("{package_name}::{binding_name}");
+        }
+        return format!("crate::{binding_name}");
+    }
+
+    format!("{}::{binding_name}", module_path.join("::"))
+}
+
+fn package_name_for_file(path: &Path) -> Option<String> {
+    let package_root = find_package_root(path)?;
+    let manifest = fs::read_to_string(package_root.join("Cargo.toml")).ok()?;
+    let manifest = toml::from_str::<toml::Value>(&manifest).ok()?;
+    let package_name = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("name"))
+        .and_then(toml::Value::as_str)?;
+    Some(package_name.replace('-', "_"))
+}
+
+fn find_package_root(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors().skip(1) {
+        let manifest_path = ancestor.join("Cargo.toml");
+        if manifest_path.is_file()
+            && let Ok(manifest_src) = fs::read_to_string(&manifest_path)
+            && let Ok(manifest) = toml::from_str::<toml::Value>(&manifest_src)
+            && manifest.get("package").is_some_and(toml::Value::is_table)
+        {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn inferred_file_module_path(path: &Path) -> Vec<String> {
+    let components = path
+        .iter()
+        .map(|component| component.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let rel = if let Some(src_idx) = components.iter().rposition(|component| component == "src") {
+        &components[src_idx + 1..]
+    } else {
+        &components[..]
+    };
+
+    if rel.is_empty() || rel.first().is_some_and(|component| component == "bin") {
+        return Vec::new();
+    }
+
+    let mut module_path = Vec::new();
+    for (idx, component) in rel.iter().enumerate() {
+        let is_last = idx + 1 == rel.len();
+        if is_last {
+            match component.as_str() {
+                "lib.rs" | "main.rs" | "mod.rs" => {}
+                other => {
+                    if let Some(stem) = other.strip_suffix(".rs") {
+                        module_path.push(stem.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+
+        module_path.push(component.to_string());
+    }
+
+    module_path
+}
+
+fn source_root(path: &Path) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        root.push(component.as_os_str());
+        if component.as_os_str() == "src" {
+            return Some(root);
+        }
+    }
+    None
+}
+
+fn parent_module_files(src_root: &Path, prefix: &[String]) -> Vec<PathBuf> {
+    if prefix.is_empty() {
+        return vec![src_root.join("lib.rs"), src_root.join("main.rs")];
+    }
+
+    let joined = prefix.join("/");
+    vec![
+        src_root.join(format!("{joined}.rs")),
+        src_root.join(joined).join("mod.rs"),
+    ]
 }
 
 #[derive(Clone, Copy)]
