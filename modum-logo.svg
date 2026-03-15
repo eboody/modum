@@ -1,18 +1,18 @@
 <svg width="520" height="120" viewBox="0 0 520 120" xmlns="http://www.w3.org/2000/svg">
-  <rect width="500" height="120" fill="black"/>
+  <rect width="520" height="120" fill="black"/>
 
-  <text x="40" y="78"
+  <text x="113" y="78"
         font-family="JetBrains Mono, monospace"
         font-size="56"
         fill="white">mod</text>
 
-  <circle cx="200" cy="46" r="8" fill="white"/>
-  <circle cx="200" cy="74" r="8" fill="white"/>
+  <circle cx="262" cy="46" r="8" fill="white"/>
+  <circle cx="262" cy="74" r="8" fill="white"/>
 
-  <circle cx="230" cy="46" r="8" fill="white"/>
-  <circle cx="230" cy="74" r="8" fill="white"/>
+  <circle cx="292" cy="46" r="8" fill="white"/>
+  <circle cx="292" cy="74" r="8" fill="white"/>
 
-  <text x="270" y="78"
+  <text x="340" y="78"
         font-family="JetBrains Mono, monospace"
         font-size="56"
         fill="white">um</text>
