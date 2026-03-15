@@ -89,6 +89,28 @@ fn analyze_use_item(
         let current_module_path = inferred_file_module_path(path);
         let redundant_leaf =
             redundant_leaf_context_candidate(analysis_path, binding_name, leaf.kind, settings);
+        let skip_reexport = is_reexport
+            && ((redundant_leaf.is_some() && direct_child_module_is_private(path, analysis_path))
+                || canonical_parent_surface_reexport(
+                    &current_module_path,
+                    analysis_path,
+                    binding_name,
+                    settings,
+                )
+                || parent_surface_reexports_current_binding(
+                    path,
+                    &current_module_path,
+                    binding_name,
+                )
+                || preserved_parent_surface_reexport(
+                    &current_module_path,
+                    analysis_path,
+                    settings,
+                ));
+
+        if skip_reexport {
+            continue;
+        }
 
         let (code, message) = if !is_reexport
             && let Some(canonical_parent_surface) = canonical_parent_surface_candidate(
@@ -106,20 +128,12 @@ fn analyze_use_item(
             )
         } else if let Some(shorter_leaf) = redundant_leaf {
             redundant_context_message(is_reexport, &parent_module, binding_name, &shorter_leaf)
-        } else if is_reexport
-            && canonical_parent_surface_reexport(
-                &current_module_path,
-                analysis_path,
-                binding_name,
-                settings,
-            )
-        {
-            continue;
         } else if settings.generic_nouns.contains(binding_name) {
             generic_noun_message(is_reexport, &parent_module, source_name)
         } else if settings
             .namespace_preserving_modules
             .contains(&parent_normalized)
+            && !module_path_contains_namespace(&current_module_path, &parent_normalized)
         {
             preserve_module_message(is_reexport, &parent_module, source_name, binding_name)
         } else {
@@ -168,6 +182,44 @@ fn canonical_parent_surface_reexport(
     !current_module_path.is_empty()
         && import_modules.ends_with(current_module_path)
         && settings.generic_nouns.contains(binding_name)
+}
+
+fn parent_surface_reexports_current_binding(
+    path: &Path,
+    current_module_path: &[String],
+    binding_name: &str,
+) -> bool {
+    if current_module_path.is_empty() {
+        return false;
+    }
+
+    let parent_surface_path = &current_module_path[..current_module_path.len() - 1];
+    let public_bindings = public_bindings_for_module(path, parent_surface_path);
+    public_bindings.contains(binding_name)
+}
+
+fn preserved_parent_surface_reexport(
+    current_module_path: &[String],
+    import_path: &[String],
+    settings: &NamespaceSettings,
+) -> bool {
+    if current_module_path.is_empty() || import_path.len() != 2 {
+        return false;
+    }
+
+    let Some(current_module) = current_module_path.last() else {
+        return false;
+    };
+    let Some(imported_parent) = import_path.first() else {
+        return false;
+    };
+
+    settings
+        .namespace_preserving_modules
+        .contains(&current_module.to_ascii_lowercase())
+        && settings
+            .namespace_preserving_modules
+            .contains(&imported_parent.to_ascii_lowercase())
 }
 
 fn flatten_use_tree(prefix: Vec<String>, tree: &UseTree, leaves: &mut Vec<UseLeaf>) {
@@ -286,9 +338,7 @@ fn redundant_leaf_context_candidate(
     kind: UseLeafKind,
     settings: &NamespaceSettings,
 ) -> Option<String> {
-    let Some(parent_module) = full_path.iter().rev().nth(1) else {
-        return None;
-    };
+    let parent_module = full_path.iter().rev().nth(1)?;
     let module_segments = split_segments(parent_module)
         .into_iter()
         .map(|segment| segment.to_ascii_lowercase())
@@ -324,18 +374,17 @@ fn redundant_leaf_context_candidate(
     }
 
     // Keep the older generic-noun backstop for shapes like `user::UserRepository`.
-    if settings
+    let preserve_or_generic = settings
         .namespace_preserving_modules
         .contains(&parent_module.to_ascii_lowercase())
         || split_segments(leaf_name)
             .iter()
-            .any(|segment| matches_generic_noun(segment, settings))
-    {
-        if leaf_normalized.starts_with(&module_segments) {
-            let shorter_segments = &leaf_segments[module_segments.len()..];
-            if !shorter_segments.is_empty() {
-                return Some(render_segments(shorter_segments, style));
-            }
+            .any(|segment| matches_generic_noun(segment, settings));
+
+    if preserve_or_generic && leaf_normalized.starts_with(&module_segments) {
+        let shorter_segments = &leaf_segments[module_segments.len()..];
+        if !shorter_segments.is_empty() {
+            return Some(render_segments(shorter_segments, style));
         }
     }
 
@@ -689,6 +738,36 @@ fn render_segments(segments: &[String], style: NameStyle) -> String {
             .collect::<Vec<_>>()
             .join("_"),
     }
+}
+
+fn module_path_contains_namespace(module_path: &[String], namespace: &str) -> bool {
+    module_path
+        .iter()
+        .any(|segment| segment.eq_ignore_ascii_case(namespace))
+}
+
+fn direct_child_module_is_private(path: &Path, analysis_path: &[String]) -> bool {
+    if analysis_path.len() != 2 {
+        return false;
+    }
+
+    let Some(child_name) = analysis_path.first() else {
+        return false;
+    };
+
+    child_module_visibility_in_file(path, child_name) == Some(false)
+}
+
+fn child_module_visibility_in_file(path: &Path, child_name: &str) -> Option<bool> {
+    let src = fs::read_to_string(path).ok()?;
+    let parsed = syn::parse_file(&src).ok()?;
+
+    parsed.items.into_iter().find_map(|item| match item {
+        Item::Mod(item_mod) if item_mod.ident == child_name => {
+            Some(!matches!(item_mod.vis, Visibility::Inherited))
+        }
+        _ => None,
+    })
 }
 
 fn split_segments(name: &str) -> Vec<String> {

@@ -150,9 +150,11 @@ Codex should default to these behaviors:
 - `namespace_flat_pub_use`
   Warning. Flags flattened public re-exports of those generic nouns when they bypass a meaningful child facet. It does not flag module-root re-exports that intentionally create the canonical parent surface, such as `pub use error::Error;` for `user::Error`.
 - `namespace_flat_pub_use_preserve_module`
-  Warning. Flags flattened public re-exports from configured namespace-preserving modules when the child facet should stay visible.
+  Warning. Flags flattened public re-exports from configured namespace-preserving modules when the child facet should stay visible. It does not flag broader parent-surface exports such as exposing both `components::Button` and `partials::Button`, and it skips private alias modules that only exist to feed a parent surface.
 - `namespace_flat_pub_use_redundant_leaf_context`
-  Warning. Flags flattened public re-exports whose leaf still repeats the parent context.
+  Warning. Flags flattened public re-exports whose leaf still repeats the parent context. It does not flag family re-exports from private organizational child modules when flattening them is how the parent surface is intentionally shaped.
+- `api_missing_parent_surface_export`
+  Warning. Flags public child modules that expose a same-name main item such as `button::Button` without also re-exporting that item at the parent surface when that would produce the readable call-site path. It does not treat the crate root as automatically readable enough for domain items like `domain::User`.
 - `api_weak_module_generic_leaf`
   Warning. Flags paths such as `storage::Repository` where a weak technical module exposes a generic leaf.
 - `api_redundant_leaf_context`
@@ -181,4 +183,4 @@ The rest of the guide remains advisory. `modum` does not try to prove:
 - heuristic coverage for obviously redundant leaves such as `user::UserRepository`
 - configurable coverage for module boundaries that should stay visible via `namespace_preserving_modules`
 
-That second list should be extended per workspace for domain modules the defaults cannot infer, such as `user`, `billing`, or `tenant`.
+That second list should be extended per workspace for domain modules the defaults cannot infer, such as `user`, `billing`, or `tenant`. The defaults intentionally favor semantic surfaces like `partials`, `page`, and `components` over broader container namespaces like `views`.

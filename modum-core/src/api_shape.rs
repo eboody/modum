@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -20,6 +21,7 @@ pub(super) struct ApiShapeAnalysis {
 #[derive(Clone)]
 struct PublicUseLeaf {
     binding_name: String,
+    full_path: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +89,8 @@ fn analyze_scope(
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let public_bindings = collect_scope_public_bindings(items);
+
     for item in items {
         match item {
             Item::Mod(item_mod) => analyze_module_item(
@@ -94,6 +98,7 @@ fn analyze_scope(
                 item_mod,
                 module_path,
                 path_is_public,
+                &public_bindings,
                 settings,
                 diagnostics,
             ),
@@ -102,6 +107,7 @@ fn analyze_scope(
                 item_use,
                 module_path,
                 path_is_public,
+                &public_bindings,
                 settings,
                 diagnostics,
             ),
@@ -122,6 +128,7 @@ fn analyze_module_item(
     item_mod: &ItemMod,
     module_path: &[String],
     path_is_public: bool,
+    public_bindings: &BTreeSet<String>,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -182,6 +189,34 @@ fn analyze_module_item(
         }
     }
 
+    if is_surface_export_candidate(module_path, path_is_public, settings)
+        && is_public(&item_mod.vis)
+        && let Some(main_leaf) = child_module_surface_leaf(
+            path,
+            module_path,
+            &module_name,
+            item_mod
+                .content
+                .as_ref()
+                .map(|(_, nested)| nested.as_slice()),
+            settings,
+        )
+        && !public_bindings.contains(&main_leaf)
+    {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            file: Some(path.to_path_buf()),
+            line: Some(line),
+            code: Some("api_missing_parent_surface_export".to_string()),
+            policy: true,
+            message: format!(
+                "child module `{module_name}` exposes main item `{main_leaf}` but the parent surface does not; consider re-exporting `{}` so call sites do not need `{}`",
+                render_public_path(module_path, &main_leaf),
+                render_public_path_with_module(module_path, &module_name, &main_leaf)
+            ),
+        });
+    }
+
     if let Some((_, nested)) = &item_mod.content {
         let mut next_path = module_path.to_vec();
         next_path.push(module_name);
@@ -232,18 +267,43 @@ fn analyze_public_use_item(
     item_use: &ItemUse,
     module_path: &[String],
     path_is_public: bool,
+    public_bindings: &BTreeSet<String>,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if !(path_is_public && is_public(&item_use.vis)) {
+    if !is_public(&item_use.vis) {
         return;
     }
 
     let mut leaves = Vec::new();
-    flatten_public_use_tree(&item_use.tree, &mut leaves);
+    flatten_public_use_tree(Vec::new(), &item_use.tree, &mut leaves);
     let line = item_use.span().start().line;
 
     for leaf in leaves {
+        if is_surface_export_candidate(module_path, path_is_public, settings)
+            && let Some(module_binding) =
+                public_use_module_binding(path, module_path, &leaf, public_bindings, settings)
+        {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                file: Some(path.to_path_buf()),
+                line: Some(line),
+                code: Some("api_missing_parent_surface_export".to_string()),
+                policy: true,
+                message: format!(
+                    "child module `{}` exposes main item `{}` but the parent surface does not; consider re-exporting `{}` so call sites do not need `{}`",
+                    leaf.binding_name,
+                    module_binding,
+                    render_public_path(module_path, &module_binding),
+                    render_public_path_with_module(module_path, &leaf.binding_name, &module_binding)
+                ),
+            });
+        }
+
+        if !path_is_public {
+            continue;
+        }
+
         analyze_public_leaf(
             path,
             line,
@@ -253,6 +313,219 @@ fn analyze_public_use_item(
             diagnostics,
         );
     }
+}
+
+fn is_surface_export_candidate(
+    module_path: &[String],
+    path_is_public: bool,
+    settings: &NamespaceSettings,
+) -> bool {
+    (!module_path.is_empty() && path_is_public)
+        || module_path.last().is_some_and(|segment| {
+            settings
+                .namespace_preserving_modules
+                .contains(&normalize_segment(segment))
+        })
+}
+
+fn collect_scope_public_bindings(items: &[Item]) -> BTreeSet<String> {
+    let mut bindings = BTreeSet::new();
+
+    for item in items {
+        match item {
+            Item::Use(item_use) if is_public(&item_use.vis) => {
+                let mut leaves = Vec::new();
+                flatten_public_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+                for leaf in leaves {
+                    bindings.insert(leaf.binding_name);
+                }
+            }
+            _ => {
+                if let Some((_, leaf_name, is_item_public)) = public_item_leaf(item)
+                    && is_item_public
+                {
+                    bindings.insert(leaf_name);
+                }
+            }
+        }
+    }
+
+    bindings
+}
+
+fn public_use_module_binding(
+    path: &Path,
+    module_path: &[String],
+    leaf: &PublicUseLeaf,
+    public_bindings: &BTreeSet<String>,
+    settings: &NamespaceSettings,
+) -> Option<String> {
+    let resolved_module_path = resolve_local_module_path(module_path, &leaf.full_path)?;
+    let module_name = resolved_module_path.last()?;
+    if normalize_segment(module_name) != normalize_segment(&leaf.binding_name) {
+        return None;
+    }
+
+    let main_leaf = child_module_surface_leaf(
+        path,
+        &resolved_module_path[..resolved_module_path.len() - 1],
+        module_name,
+        None,
+        settings,
+    )?;
+    (!public_bindings.contains(&main_leaf)).then_some(main_leaf)
+}
+
+fn child_module_surface_leaf(
+    path: &Path,
+    module_path: &[String],
+    module_name: &str,
+    inline_items: Option<&[Item]>,
+    settings: &NamespaceSettings,
+) -> Option<String> {
+    if settings
+        .organizational_modules
+        .contains(&normalize_segment(module_name))
+    {
+        return None;
+    }
+
+    let matching_leaf = if let Some(items) = inline_items {
+        matching_child_module_leaf(items, module_name)
+    } else {
+        let src_root = source_root(path)?;
+        let mut full_module_path = module_path.to_vec();
+        full_module_path.push(module_name.to_string());
+        matching_child_module_leaf_from_files(path, &src_root, &full_module_path, module_name)
+    }?;
+
+    (matching_leaf != module_name).then_some(matching_leaf)
+}
+
+fn matching_child_module_leaf_from_files(
+    current_file: &Path,
+    src_root: &Path,
+    module_path: &[String],
+    module_name: &str,
+) -> Option<String> {
+    for candidate in parent_module_files(src_root, module_path) {
+        let Ok(src) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = syn::parse_file(&src) else {
+            continue;
+        };
+        if let Some(matching) = matching_child_module_leaf(&parsed.items, module_name) {
+            return Some(matching);
+        }
+    }
+
+    let parent_module_path = &module_path[..module_path.len().checked_sub(1)?];
+    let parent_items = load_module_items(current_file, parent_module_path)?;
+    for item in parent_items {
+        let Item::Use(item_use) = item else {
+            continue;
+        };
+        if !is_public(&item_use.vis) {
+            continue;
+        }
+
+        let mut leaves = Vec::new();
+        flatten_public_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+        for leaf in leaves {
+            if leaf.binding_name != module_name {
+                continue;
+            }
+            let resolved = resolve_local_module_path(parent_module_path, &leaf.full_path)?;
+            if resolved == module_path {
+                continue;
+            }
+            if let Some(matching) = matching_child_module_leaf_from_files(
+                current_file,
+                src_root,
+                &resolved,
+                resolved.last()?,
+            ) {
+                return Some(matching);
+            }
+        }
+    }
+
+    None
+}
+
+fn load_module_items(current_file: &Path, module_path: &[String]) -> Option<Vec<Item>> {
+    let src_root = source_root(current_file)?;
+    for candidate in parent_module_files(&src_root, module_path) {
+        let Ok(src) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = syn::parse_file(&src) else {
+            continue;
+        };
+        return Some(parsed.items);
+    }
+
+    None
+}
+
+fn matching_child_module_leaf(items: &[Item], module_name: &str) -> Option<String> {
+    let mut matching = BTreeSet::new();
+    let normalized_module = normalize_segment(module_name);
+
+    for item in items {
+        if let Some((_, leaf_name, is_item_public)) = public_item_leaf(item)
+            && is_item_public
+            && normalize_segment(&leaf_name) == normalized_module
+        {
+            matching.insert(leaf_name);
+        }
+
+        if let Item::Use(item_use) = item
+            && is_public(&item_use.vis)
+        {
+            let mut leaves = Vec::new();
+            flatten_public_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+            for leaf in leaves {
+                if normalize_segment(&leaf.binding_name) == normalized_module {
+                    matching.insert(leaf.binding_name);
+                }
+            }
+        }
+    }
+
+    (matching.len() == 1).then(|| matching.into_iter().next().expect("one binding"))
+}
+
+fn resolve_local_module_path(module_path: &[String], use_path: &[String]) -> Option<Vec<String>> {
+    if use_path.is_empty() {
+        return None;
+    }
+
+    let mut base = module_path.to_vec();
+    let mut iter = use_path.iter();
+    let mut saw_root = false;
+
+    while let Some(segment) = iter.next() {
+        match segment.as_str() {
+            "crate" => {
+                base.clear();
+                saw_root = true;
+            }
+            "self" => {}
+            "super" => {
+                base.pop()?;
+            }
+            other => {
+                let mut resolved = if saw_root { Vec::new() } else { base };
+                resolved.push(other.to_string());
+                resolved.extend(iter.cloned());
+                return Some(resolved);
+            }
+        }
+    }
+
+    None
 }
 
 fn analyze_public_item(
@@ -503,21 +776,35 @@ fn render_public_path_with_module(
     render_public_path(&full, leaf_name)
 }
 
-fn flatten_public_use_tree(tree: &UseTree, leaves: &mut Vec<PublicUseLeaf>) {
+fn flatten_public_use_tree(prefix: Vec<String>, tree: &UseTree, leaves: &mut Vec<PublicUseLeaf>) {
     match tree {
-        UseTree::Path(path) => flatten_public_use_tree(&path.tree, leaves),
+        UseTree::Path(path) => {
+            let mut next = prefix;
+            next.push(path.ident.to_string());
+            flatten_public_use_tree(next, &path.tree, leaves);
+        }
         UseTree::Name(name) => {
             let binding_name = name.ident.to_string();
             if binding_name != "self" {
-                leaves.push(PublicUseLeaf { binding_name });
+                let mut full_path = prefix;
+                full_path.push(binding_name.clone());
+                leaves.push(PublicUseLeaf {
+                    binding_name,
+                    full_path,
+                });
             }
         }
-        UseTree::Rename(rename) => leaves.push(PublicUseLeaf {
-            binding_name: rename.rename.to_string(),
-        }),
+        UseTree::Rename(rename) => {
+            let mut full_path = prefix;
+            full_path.push(rename.ident.to_string());
+            leaves.push(PublicUseLeaf {
+                binding_name: rename.rename.to_string(),
+                full_path,
+            });
+        }
         UseTree::Group(group) => {
             for item in &group.items {
-                flatten_public_use_tree(item, leaves);
+                flatten_public_use_tree(prefix.clone(), item, leaves);
             }
         }
         UseTree::Glob(_) => {}

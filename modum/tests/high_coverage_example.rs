@@ -19,6 +19,7 @@ fn high_coverage_example_emits_expected_lints() {
         codes,
         BTreeSet::from([
             "api_catch_all_module".to_string(),
+            "api_missing_parent_surface_export".to_string(),
             "api_organizational_submodule_flatten".to_string(),
             "api_redundant_category_suffix".to_string(),
             "api_redundant_leaf_context".to_string(),

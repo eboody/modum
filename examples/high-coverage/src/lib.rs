@@ -1,5 +1,10 @@
 pub mod error;
 pub mod helpers;
+pub mod components {
+    pub mod button {
+        pub struct Button;
+    }
+}
 pub mod http;
 pub mod partials;
 pub mod storage;

@@ -1,6 +1,14 @@
-# modum
+<div align="center">
+  <img alt="modum logo" src="https://raw.githubusercontent.com/eboody/modum/main/modum-logo.svg" width="360">
+  <p>Modum enforces consistent module naming, import style, and public API paths across a Rust workspace.</p>
+  <p>
+    <a href="https://github.com/eboody/modum/actions/workflows/ci.yml"><img src="https://github.com/eboody/modum/actions/workflows/ci.yml/badge.svg?branch=main&event=push" alt="build status" /></a>
+    <a href="https://crates.io/crates/modum"><img src="https://img.shields.io/crates/v/modum.svg?logo=rust" alt="crates.io" /></a>
+    <a href="https://docs.rs/modum"><img src="https://docs.rs/modum/badge.svg" alt="docs.rs" /></a>
+  </p>
+</div>
 
-`modum` enforces consistent module naming, import style, and public API paths across a Rust workspace.
+# modum
 
 It is a lint tool. It reports diagnostics. It does not rewrite code.
 
@@ -88,7 +96,7 @@ generic_nouns = ["Id", "Repository", "Service", "Error", "Command", "Request", "
 weak_modules = ["storage", "transport", "infra", "common", "misc", "helpers", "helper", "types", "util", "utils"]
 catch_all_modules = ["common", "misc", "helpers", "helper", "types", "util", "utils"]
 organizational_modules = ["error", "errors"]
-namespace_preserving_modules = ["auth", "command", "email", "error", "http", "page", "partials", "policy", "query", "repo", "store", "storage", "transport", "infra"]
+namespace_preserving_modules = ["auth", "command", "components", "email", "error", "http", "page", "partials", "policy", "query", "repo", "store", "storage", "transport", "infra"]
 ```
 
 Use `[package.metadata.modum]` inside a member crate to override workspace defaults for that package.
@@ -96,7 +104,7 @@ Use `[package.metadata.modum]` inside a member crate to override workspace defau
 Tuning guide:
 
 - `generic_nouns`: generic leaves like `Repository`, `Error`, or `Request`
-- `namespace_preserving_modules`: modules that should stay visible at call sites, such as `http`, `email`, or `query`
+- `namespace_preserving_modules`: modules that should stay visible at call sites, such as `http`, `email`, `partials`, or `components`
 - `organizational_modules`: modules that should not leak into the public API surface, such as `error`
 
 ## Lint Categories
@@ -121,21 +129,25 @@ Examples:
 - `use crate::error::Error;` inside a crate whose root surface already exposes `Error`
 - `pub use auth::{login, logout};`
 
-Canonical parent-surface re-exports are allowed. `pub use error::{Error, Result};` is valid when that is how a module intentionally exposes `module::Error` and `module::Result`.
+Canonical parent-surface re-exports are allowed. `pub use error::{Error, Result};` is valid when that is how a module intentionally exposes `module::Error` and `module::Result`. The same applies to broader UI surfaces such as exposing both `components::Button` and `partials::Button`.
 
 ### Public API Paths
 
 These warn when public leaves are too generic for a weak parent, or when the path repeats context it already has.
 
+- `api_missing_parent_surface_export`
 - `api_weak_module_generic_leaf`
 - `api_redundant_leaf_context`
 - `api_redundant_category_suffix`
 
 Examples:
 
+- `partials::button::Button` when the intended surface should also expose `partials::Button`
 - `storage::Repository`
 - `user::UserRepository`
 - `user::error::InvalidEmailError`
+
+Private organizational child modules are allowed to flatten their family items back to the parent surface. For example, `mod auth_shell; pub use auth_shell::{AuthShell, AuthShellVariant};` is treated as a valid parent-surface export shape.
 
 ### Module Boundaries
 

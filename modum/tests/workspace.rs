@@ -111,6 +111,37 @@ pub fn connect(client: Client) -> Client {
 }
 
 #[test]
+fn analyze_workspace_does_not_flag_preserve_module_imports_inside_same_namespace_subtree() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/components")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod components;\n").expect("write lib");
+    fs::write(
+        root.join("src/components.rs"),
+        "pub struct NavBar;\npub mod page;\n",
+    )
+    .expect("write components");
+    fs::write(
+        root.join("src/components/page.rs"),
+        r#"
+use crate::components::NavBar;
+
+pub fn render(nav: NavBar) -> NavBar {
+    nav
+}
+"#,
+    )
+    .expect("write page");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("namespace_flat_use_preserve_module")
+            && diag.message.contains("components::NavBar")
+    }));
+}
+
+#[test]
 fn analyze_workspace_allows_canonical_parent_surface_public_reexports() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -228,6 +259,168 @@ pub use message::MessageBody;
         diag.code.as_deref() == Some("namespace_flat_pub_use_redundant_leaf_context")
             && diag.message.contains("message::Body")
     }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_private_child_module_family_reexports() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/components")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod components;\n").expect("write lib");
+    fs::write(
+        root.join("src/components.rs"),
+        r#"
+mod auth_shell;
+
+pub use auth_shell::{AuthShell, AuthShellVariant};
+"#,
+    )
+    .expect("write components");
+    fs::write(
+        root.join("src/components/auth_shell.rs"),
+        "pub struct AuthShell;\npub struct AuthShellVariant;\n",
+    )
+    .expect("write auth_shell");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("namespace_flat_pub_use_redundant_leaf_context")
+            && diag.message.contains("auth_shell::Variant")
+    }));
+}
+
+#[test]
+fn analyze_workspace_allows_preserved_parent_surface_reexports() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/partials")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod partials;\n").expect("write lib");
+    fs::write(
+        root.join("src/partials.rs"),
+        r#"
+pub mod components;
+
+pub use components::{Button, SectionHeader};
+"#,
+    )
+    .expect("write partials");
+    fs::write(
+        root.join("src/partials/components.rs"),
+        "pub struct Button;\npub struct SectionHeader;\n",
+    )
+    .expect("write components");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("namespace_flat_pub_use_preserve_module")
+            && diag.message.contains("components::SectionHeader")
+    }));
+}
+
+#[test]
+fn analyze_workspace_allows_private_alias_module_that_feeds_parent_surface() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/layout")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod components;\npub mod layout;\n",
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/components.rs"),
+        "pub struct SectionHeader;\n",
+    )
+    .expect("write components");
+    fs::write(
+        root.join("src/layout.rs"),
+        r#"
+mod section_header;
+
+pub use section_header::SectionHeader;
+"#,
+    )
+    .expect("write layout");
+    fs::write(
+        root.join("src/layout/section_header.rs"),
+        "pub use crate::components::SectionHeader;\n",
+    )
+    .expect("write section_header");
+
+    let report = analyze_workspace(root, &[]);
+    let alias_file = root.join("src/layout/section_header.rs");
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("namespace_flat_pub_use_preserve_module")
+            && diag.file.as_deref() == Some(alias_file.as_path())
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_missing_parent_surface_export_for_public_child_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/components")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod components;\n").expect("write lib");
+    fs::write(root.join("src/components.rs"), "pub mod button;\n").expect("write components");
+    fs::write(
+        root.join("src/components/button.rs"),
+        "pub struct Button;\npub struct Variant;\n",
+    )
+    .expect("write button");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+            && diag.message.contains("components::Button")
+            && diag.message.contains("components::button::Button")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_missing_parent_surface_export_at_weak_crate_root() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod user;\n").expect("write lib");
+    fs::write(root.join("src/user.rs"), "pub struct User;\n").expect("write user");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+            && diag.message.contains("user::User")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_missing_parent_surface_export_when_parent_already_has_it() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/components")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod components;\n").expect("write lib");
+    fs::write(
+        root.join("src/components.rs"),
+        "pub mod button;\npub use button::Button;\n",
+    )
+    .expect("write components");
+    fs::write(
+        root.join("src/components/button.rs"),
+        "pub struct Button;\n",
+    )
+    .expect("write button");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code.as_deref() == Some("api_missing_parent_surface_export") })
+    );
 }
 
 #[test]

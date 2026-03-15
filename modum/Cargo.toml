@@ -1,6 +1,6 @@
 [package]
 name = "modum"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Workspace lint tool for Rust naming and API-shape policy"
@@ -14,7 +14,7 @@ name = "modum"
 path = "src/bin/modum.rs"
 
 [dependencies]
-modum-core = { version = "0.1.1", path = "../modum-core" }
+modum-core = { version = "0.2.0", path = "../modum-core" }
 serde_json = "1"
 
 [dev-dependencies]

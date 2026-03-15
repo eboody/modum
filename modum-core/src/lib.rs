@@ -44,6 +44,7 @@ const DEFAULT_ORGANIZATIONAL_MODULES: &[&str] = &["error", "errors"];
 const DEFAULT_NAMESPACE_PRESERVING_MODULES: &[&str] = &[
     "auth",
     "command",
+    "components",
     "email",
     "error",
     "http",
@@ -831,5 +832,9 @@ mod tests {
         assert!(settings.catch_all_modules.contains("helpers"));
         assert!(settings.organizational_modules.contains("error"));
         assert!(settings.namespace_preserving_modules.contains("email"));
+        assert!(settings.namespace_preserving_modules.contains("components"));
+        assert!(settings.namespace_preserving_modules.contains("partials"));
+        assert!(!settings.namespace_preserving_modules.contains("views"));
+        assert!(!settings.namespace_preserving_modules.contains("handlers"));
     }
 }
