@@ -475,6 +475,69 @@ mod tests {
 }
 
 #[test]
+fn analyze_workspace_does_not_flag_flattened_imports_when_only_visible_surface_is_redundant() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod response;
+mod handler;
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/response.rs"), "pub struct Response;\n").expect("write response");
+    fs::write(
+        root.join("src/handler.rs"),
+        r#"
+use crate::response::Response;
+
+pub fn keep(value: Response) -> Response {
+    value
+}
+"#,
+    )
+    .expect("write handler");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        matches!(
+            diag.code.as_deref(),
+            Some("namespace_flat_use") | Some("namespace_flat_use_preserve_module")
+        )
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_flattened_external_generic_imports_without_net_context() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use std::error::Error;
+
+pub fn source(error: &dyn Error) -> &(dyn Error + '_) {
+    error
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        matches!(
+            diag.code.as_deref(),
+            Some("namespace_flat_use") | Some("namespace_flat_use_preserve_module")
+        )
+    }));
+}
+
+#[test]
 fn analyze_workspace_flags_canonical_parent_surface_at_crate_root() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -730,6 +793,55 @@ pub fn keep(_input: ParseStream<'_>) {}
             diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
         })
     );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_non_actionable_external_renamed_imports() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use syn::Path as SynPath;
+
+pub fn keep(_path: SynPath) {}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report.diagnostics.iter().any(|diag| {
+            diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
+        })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_actionable_external_renamed_imports() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use http::StatusCode as HttpStatusCode;
+
+pub fn keep(code: HttpStatusCode) -> HttpStatusCode {
+    code
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
+            && diag.message.contains("http::StatusCode")
+    }));
 }
 
 #[test]

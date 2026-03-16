@@ -153,33 +153,49 @@ fn analyze_use_item(
             continue;
         }
 
-        let (code, message) = if !is_reexport
-            && let Some(canonical_parent_surface) = canonical_parent_surface_candidate(
+        let canonical_parent_surface = if is_reexport {
+            None
+        } else {
+            canonical_parent_surface_candidate(
                 path,
                 &current_module_path,
                 analysis_path,
                 binding_name,
                 settings,
-            ) {
-            canonical_parent_surface_message(
-                binding_name,
-                source_name,
-                &parent_module,
-                &canonical_parent_surface,
             )
-        } else if let Some(shorter_leaf) = redundant_leaf {
-            redundant_context_message(is_reexport, &parent_module, binding_name, &shorter_leaf)
-        } else if settings.generic_nouns.contains(binding_name) {
-            generic_noun_message(is_reexport, &parent_module, source_name)
-        } else if settings
-            .namespace_preserving_modules
-            .contains(&parent_normalized)
-            && !module_path_contains_namespace(&current_module_path, &parent_normalized)
-        {
-            preserve_module_message(is_reexport, &parent_module, source_name, binding_name)
-        } else {
-            continue;
         };
+        let visible_callsite_surface =
+            visible_callsite_surface_candidate(analysis_path, binding_name, settings);
+
+        let (code, message) =
+            if let Some(canonical_parent_surface) = canonical_parent_surface.as_deref() {
+                canonical_parent_surface_message(
+                    binding_name,
+                    source_name,
+                    &parent_module,
+                    canonical_parent_surface,
+                )
+            } else if let Some(shorter_leaf) = redundant_leaf {
+                redundant_context_message(is_reexport, &parent_module, binding_name, &shorter_leaf)
+            } else if settings.generic_nouns.contains(binding_name)
+                && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
+            {
+                generic_noun_message(is_reexport, source_name, visible_callsite_surface)
+            } else if settings
+                .namespace_preserving_modules
+                .contains(&parent_normalized)
+                && !module_path_contains_namespace(&current_module_path, &parent_normalized)
+                && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
+            {
+                preserve_module_message(
+                    is_reexport,
+                    source_name,
+                    binding_name,
+                    visible_callsite_surface,
+                )
+            } else {
+                continue;
+            };
 
         diagnostics.push(Diagnostic {
             level: DiagnosticLevel::Warning,
@@ -210,8 +226,7 @@ fn analyze_qualified_generic_path(
 
     let parent_module = &analysis_path[0];
     let leaf_name = &analysis_path[1];
-    if !parent_module.eq_ignore_ascii_case(leaf_name) || !matches_generic_noun(leaf_name, settings)
-    {
+    if !qualified_generic_context_is_redundant(parent_module, leaf_name, settings) {
         return;
     }
 
@@ -342,21 +357,21 @@ fn flatten_use_tree(prefix: Vec<String>, tree: &UseTree, leaves: &mut Vec<UseLea
 
 fn generic_noun_message(
     is_reexport: bool,
-    parent_module: &str,
     source_name: &str,
+    visible_callsite_surface: &str,
 ) -> (&'static str, String) {
     if is_reexport {
         (
             "namespace_flat_pub_use",
             format!(
-                "flattened re-export hides namespace for `{source_name}`; keep `{parent_module}::{source_name}` visible"
+                "flattened re-export hides namespace for `{source_name}`; keep `{visible_callsite_surface}` visible"
             ),
         )
     } else {
         (
             "namespace_flat_use",
             format!(
-                "flattened import hides namespace for `{source_name}`; prefer `{parent_module}::{source_name}` at call sites"
+                "flattened import hides namespace for `{source_name}`; prefer `{visible_callsite_surface}` at call sites"
             ),
         )
     }
@@ -387,25 +402,38 @@ fn redundant_context_message(
 
 fn preserve_module_message(
     is_reexport: bool,
-    parent_module: &str,
     source_name: &str,
     binding_name: &str,
+    visible_callsite_surface: &str,
 ) -> (&'static str, String) {
     if is_reexport {
         (
             "namespace_flat_pub_use_preserve_module",
             format!(
-                "flattened re-export hides configured namespace module `{parent_module}` for `{source_name}`; keep `{parent_module}::{source_name}` visible"
+                "flattened re-export hides a configured namespace module for `{source_name}`; keep `{visible_callsite_surface}` visible"
             ),
         )
     } else {
         (
             "namespace_flat_use_preserve_module",
             format!(
-                "flattened import hides configured namespace module `{parent_module}` for `{binding_name}`; prefer `{parent_module}::{source_name}` at call sites"
+                "flattened import hides a configured namespace module for `{binding_name}`; prefer `{visible_callsite_surface}` at call sites"
             ),
         )
     }
+}
+
+fn visible_callsite_surface_candidate(
+    import_path: &[String],
+    binding_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<String> {
+    let parent_module = import_path.iter().rev().nth(1)?;
+    if qualified_generic_context_is_redundant(parent_module, binding_name, settings) {
+        return None;
+    }
+
+    Some(format!("{parent_module}::{binding_name}"))
 }
 
 fn redundant_leaf_context_candidate(
@@ -480,7 +508,11 @@ fn prefix_overlap_is_actionable(
     }
 
     if matches!(kind, UseLeafKind::Rename) {
-        return true;
+        if is_reexport {
+            return true;
+        }
+
+        return rename_overlap_is_actionable(full_path, shorter_leaf, settings);
     }
 
     if is_reexport {
@@ -489,6 +521,27 @@ fn prefix_overlap_is_actionable(
 
     full_path.len() <= 3
         && split_segments(shorter_leaf)
+            .last()
+            .is_some_and(|segment| matches_generic_noun(segment, settings))
+}
+
+fn rename_overlap_is_actionable(
+    full_path: &[String],
+    shorter_leaf: &str,
+    settings: &NamespaceSettings,
+) -> bool {
+    if full_path.len() > 2 {
+        return true;
+    }
+
+    let Some(parent_module) = full_path.iter().rev().nth(1) else {
+        return false;
+    };
+
+    settings
+        .namespace_preserving_modules
+        .contains(&parent_module.to_ascii_lowercase())
+        || split_segments(shorter_leaf)
             .last()
             .is_some_and(|segment| matches_generic_noun(segment, settings))
 }
@@ -522,6 +575,14 @@ fn matches_generic_noun(segment: &str, settings: &NamespaceSettings) -> bool {
         .generic_nouns
         .iter()
         .any(|noun| noun.eq_ignore_ascii_case(segment))
+}
+
+fn qualified_generic_context_is_redundant(
+    parent_module: &str,
+    leaf_name: &str,
+    settings: &NamespaceSettings,
+) -> bool {
+    parent_module.eq_ignore_ascii_case(leaf_name) && matches_generic_noun(leaf_name, settings)
 }
 
 fn trim_relative_prefix(full_path: &[String]) -> &[String] {

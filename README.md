@@ -131,9 +131,11 @@ Tuning guide:
 These warn when imports or re-exports flatten a namespace that should stay visible.
 
 - `namespace_flat_use`
+  Warning for flattened imports of generic nouns when there is an actionable namespace-visible call-site form that adds net context, such as `storage::Repository` or `http::StatusCode`. It skips cases where the only preserved form would still be redundant, such as `error::Error` or `response::Response`.
 - `namespace_flat_use_preserve_module`
+  Warning for flattened imports from configured namespace-preserving modules when the preserved call-site form still adds net context.
 - `namespace_flat_use_redundant_leaf_context`
-  Warning for flattened imports or rename-heavy aliases whose leaf repeats parent context. For plain imports, this only fires when the shorter leaf would be an actionable generic noun such as `Repository`, `Error`, or `Id`.
+  Warning for flattened imports or actionable rename-heavy aliases whose leaf repeats parent context. For plain imports, this only fires when the shorter leaf would be an actionable generic noun such as `Repository`, `Error`, or `Id`. For rename aliases, this only fires when the qualified form would still preserve real context, such as `http::StatusCode` or `page::Event`.
 - `namespace_redundant_qualified_generic`
   Warning for qualified call-site paths whose module only repeats a generic category already named by the leaf, such as `response::Response` or `error::Error`.
 - `namespace_parent_surface`
