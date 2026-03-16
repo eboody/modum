@@ -114,6 +114,8 @@ use crate::domain::user::Repository;
 
 Direct leaf imports are still acceptable for traits, macros, tests, or tight local scopes where repeated qualification is just noise. They should be the exception when they erase a useful namespace.
 
+Apply a net-context test before preserving a qualifier. If the leaf already says the generic category clearly and the qualifier mostly repeats it, the qualified form is noise rather than clarity. Paths like `response::Response` or `error::Error` should usually be shortened at call sites.
+
 ## Decision Rules
 
 When adding or renaming an item, apply these checks:
@@ -132,6 +134,7 @@ Codex should default to these behaviors:
 - Do not mechanically turn every prefixed name into exactly one `head::Tail` split.
 - Consider whether `user::auth::Token`, `user::error::InvalidEmail`, or `user::http::Request` is the better public path.
 - Prefer the path that reads best at call sites.
+- Treat lint suggestions as candidates, not commands; if qualification adds no net meaning, prefer the shorter call-site shape and fix the lint.
 - Only shorten a leaf to `Repository`, `Error`, `Id`, or similar when the parent path already supplies the missing context.
 - If a longer source name is still useful, keep it internally and re-export the shorter public name.
 
@@ -144,7 +147,9 @@ Codex should default to these behaviors:
 - `namespace_flat_use_preserve_module`
   Warning. Flags flattened imports from configured namespace-preserving modules such as `email`, `http`, `query`, or `storage`.
 - `namespace_flat_use_redundant_leaf_context`
-  Warning. Flags flattened imports or rename-heavy aliases such as `use user::UserRepository;` or `use playwright::api::page::Event as PageEvent;` where the child module already supplies the missing context.
+  Warning. Flags flattened imports or rename-heavy aliases such as `use user::UserRepository;` or `use playwright::api::page::Event as PageEvent;` where the child module already supplies the missing context. For plain imports, this only applies when the shorter leaf would land on an actionable generic noun such as `Repository`, `Error`, or `Id`.
+- `namespace_redundant_qualified_generic`
+  Warning. Flags qualified call-site paths such as `response::Response` or `error::Error` when the qualifier only repeats a generic category that the leaf already names clearly.
 - `namespace_parent_surface`
   Warning. Flags imports that reach into an internal child module even though the containing parent surface already exposes the same readable item, such as preferring `http::Error` over `error::Error`.
 - `namespace_flat_pub_use`

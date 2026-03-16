@@ -4,5 +4,5 @@ use std::process::ExitCode;
 mod cli;
 
 fn main() -> ExitCode {
-    cli::run_main("modum", false)
+    cli::run_main("cargo modum", true)
 }

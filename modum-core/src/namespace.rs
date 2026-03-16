@@ -5,8 +5,10 @@ use std::{
 };
 
 use syn::{
-    File, Item, ItemConst, ItemEnum, ItemFn, ItemMod, ItemStatic, ItemStruct, ItemTrait,
-    ItemTraitAlias, ItemType, ItemUnion, ItemUse, UseTree, Visibility, spanned::Spanned,
+    ExprPath, File, Item, ItemConst, ItemEnum, ItemFn, ItemMod, ItemStatic, ItemStruct, ItemTrait,
+    ItemTraitAlias, ItemType, ItemUnion, ItemUse, Path as SynPath, TypePath, UseTree, Visibility,
+    spanned::Spanned,
+    visit::{self, Visit},
 };
 
 use super::{Diagnostic, DiagnosticLevel, NamespaceSettings};
@@ -53,8 +55,42 @@ fn analyze_scope(
                 content: Some((_, nested)),
                 ..
             }) => analyze_scope(path, nested, settings, diagnostics),
-            _ => {}
+            _ => analyze_qualified_callsite_paths(path, item, settings, diagnostics),
         }
+    }
+}
+
+fn analyze_qualified_callsite_paths(
+    path: &Path,
+    item: &Item,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut visitor = QualifiedCallsitePathVisitor {
+        file: path,
+        settings,
+        diagnostics,
+    };
+    visitor.visit_item(item);
+}
+
+struct QualifiedCallsitePathVisitor<'a> {
+    file: &'a Path,
+    settings: &'a NamespaceSettings,
+    diagnostics: &'a mut Vec<Diagnostic>,
+}
+
+impl<'ast> Visit<'ast> for QualifiedCallsitePathVisitor<'_> {
+    fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+        analyze_qualified_generic_path(self.file, &node.path, self.settings, self.diagnostics);
+        visit::visit_expr_path(self, node);
+    }
+
+    fn visit_type_path(&mut self, node: &'ast TypePath) {
+        if node.qself.is_none() {
+            analyze_qualified_generic_path(self.file, &node.path, self.settings, self.diagnostics);
+        }
+        visit::visit_type_path(self, node);
     }
 }
 
@@ -87,8 +123,13 @@ fn analyze_use_item(
         };
         let parent_normalized = parent_module.to_ascii_lowercase();
         let current_module_path = inferred_file_module_path(path);
-        let redundant_leaf =
-            redundant_leaf_context_candidate(analysis_path, binding_name, leaf.kind, settings);
+        let redundant_leaf = redundant_leaf_context_candidate(
+            analysis_path,
+            binding_name,
+            leaf.kind,
+            is_reexport,
+            settings,
+        );
         let skip_reexport = is_reexport
             && ((redundant_leaf.is_some() && direct_child_module_is_private(path, analysis_path))
                 || canonical_parent_surface_reexport(
@@ -149,6 +190,41 @@ fn analyze_use_item(
             message,
         });
     }
+}
+
+fn analyze_qualified_generic_path(
+    file: &Path,
+    path: &SynPath,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let full_path = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let analysis_path = trim_relative_prefix(&full_path);
+    if analysis_path.len() != 2 {
+        return;
+    }
+
+    let parent_module = &analysis_path[0];
+    let leaf_name = &analysis_path[1];
+    if !parent_module.eq_ignore_ascii_case(leaf_name) || !matches_generic_noun(leaf_name, settings)
+    {
+        return;
+    }
+
+    diagnostics.push(Diagnostic {
+        level: DiagnosticLevel::Warning,
+        file: Some(file.to_path_buf()),
+        line: Some(path.span().start().line),
+        code: Some("namespace_redundant_qualified_generic".to_string()),
+        policy: true,
+        message: format!(
+            "qualified path repeats generic context in `{parent_module}::{leaf_name}`; prefer `{leaf_name}` at call sites"
+        ),
+    });
 }
 
 fn canonical_parent_surface_reexport(
@@ -336,6 +412,7 @@ fn redundant_leaf_context_candidate(
     full_path: &[String],
     leaf_name: &str,
     kind: UseLeafKind,
+    is_reexport: bool,
     settings: &NamespaceSettings,
 ) -> Option<String> {
     let parent_module = full_path.iter().rev().nth(1)?;
@@ -358,7 +435,7 @@ fn redundant_leaf_context_candidate(
         let shorter_segments = &leaf_segments[module_segments.len()..];
         if !shorter_segments.is_empty() {
             let shorter_leaf = render_segments(shorter_segments, style);
-            if prefix_overlap_is_actionable(full_path, kind, &shorter_leaf) {
+            if prefix_overlap_is_actionable(full_path, kind, &shorter_leaf, is_reexport, settings) {
                 return Some(shorter_leaf);
             }
         }
@@ -395,12 +472,25 @@ fn prefix_overlap_is_actionable(
     full_path: &[String],
     kind: UseLeafKind,
     shorter_leaf: &str,
+    is_reexport: bool,
+    settings: &NamespaceSettings,
 ) -> bool {
     if is_unreadable_short_leaf(shorter_leaf) {
         return false;
     }
 
-    matches!(kind, UseLeafKind::Rename) || full_path.len() <= 3
+    if matches!(kind, UseLeafKind::Rename) {
+        return true;
+    }
+
+    if is_reexport {
+        return full_path.len() <= 3;
+    }
+
+    full_path.len() <= 3
+        && split_segments(shorter_leaf)
+            .last()
+            .is_some_and(|segment| matches_generic_noun(segment, settings))
 }
 
 fn suffix_overlap_is_actionable(parent_module: &str, full_path: &[String]) -> bool {

@@ -61,15 +61,23 @@ partials::error::Error
 ## Quick Usage
 
 ```bash
-cargo run -p modum -- check --root .
-cargo run -p modum -- check --root . --mode warn
-cargo run -p modum -- check --root . --format json
+cargo install modum
+cargo modum check --root .
+cargo modum check --root . --mode warn
+cargo modum check --root . --format json
 ```
 
-If you already built the binary:
+`cargo install modum` installs both `modum` and the Cargo subcommand `cargo-modum`, so either of these is valid:
 
 ```bash
-target/debug/modum check --root .
+modum check --root .
+cargo modum check --root .
+```
+
+If you are developing `modum` itself:
+
+```bash
+cargo run -p modum -- check --root .
 ```
 
 Environment:
@@ -79,6 +87,15 @@ MODUM=off|warn|deny
 ```
 
 Default mode is `deny`.
+
+## CI Usage
+
+Use `modum` the same way you would use `clippy` or `cargo-deny`: run it as a normal command in CI, not from `build.rs`.
+
+```yaml
+- run: cargo install modum
+- run: cargo modum check --root .
+```
 
 ## Exit Behavior
 
@@ -116,6 +133,9 @@ These warn when imports or re-exports flatten a namespace that should stay visib
 - `namespace_flat_use`
 - `namespace_flat_use_preserve_module`
 - `namespace_flat_use_redundant_leaf_context`
+  Warning for flattened imports or rename-heavy aliases whose leaf repeats parent context. For plain imports, this only fires when the shorter leaf would be an actionable generic noun such as `Repository`, `Error`, or `Id`.
+- `namespace_redundant_qualified_generic`
+  Warning for qualified call-site paths whose module only repeats a generic category already named by the leaf, such as `response::Response` or `error::Error`.
 - `namespace_parent_surface`
 - `namespace_flat_pub_use`
 - `namespace_flat_pub_use_preserve_module`
@@ -126,6 +146,7 @@ Examples:
 - `use storage::Repository;`
 - `use http::Client;`
 - `use user::UserRepository;`
+- `response::Response`
 - `use crate::error::Error;` inside a crate whose root surface already exposes `Error`
 - `pub use auth::{login, logout};`
 
@@ -163,7 +184,7 @@ Examples:
 
 ### Structural Errors
 
-This is an error-level rule, not a warning.
+This rule is an error, not a warning.
 
 - `api_organizational_submodule_flatten`
 

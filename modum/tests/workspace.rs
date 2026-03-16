@@ -649,6 +649,90 @@ pub fn sample() {
 }
 
 #[test]
+fn analyze_workspace_flags_redundant_qualified_generic_callsite_paths() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod response {
+    pub struct Response;
+}
+
+pub fn keep(value: response::Response) -> response::Response {
+    value
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("namespace_redundant_qualified_generic")
+            && diag.message.contains("response::Response")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_meaningful_qualified_callsite_paths() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod http {
+    pub struct StatusCode;
+}
+
+mod url {
+    pub struct Url;
+}
+
+pub fn keep(status: http::StatusCode, url: url::Url) -> (http::StatusCode, url::Url) {
+    (status, url)
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code.as_deref() == Some("namespace_redundant_qualified_generic") })
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_non_actionable_external_redundant_context_imports() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use syn::parse::ParseStream;
+
+pub fn keep(_input: ParseStream<'_>) {}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report.diagnostics.iter().any(|diag| {
+            diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
+        })
+    );
+}
+
+#[test]
 fn analyze_workspace_flags_redundant_context_imports_even_without_configured_module() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
