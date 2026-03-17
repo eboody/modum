@@ -237,7 +237,7 @@ fn analyze_qualified_generic_path(
         code: Some("namespace_redundant_qualified_generic".to_string()),
         policy: true,
         message: format!(
-            "qualified path repeats generic context in `{parent_module}::{leaf_name}`; prefer `{leaf_name}` at call sites"
+            "`{parent_module}::{leaf_name}` repeats a generic category; prefer `{leaf_name}`"
         ),
     });
 }
@@ -364,14 +364,14 @@ fn generic_noun_message(
         (
             "namespace_flat_pub_use",
             format!(
-                "flattened re-export hides namespace for `{source_name}`; keep `{visible_callsite_surface}` visible"
+                "flattened re-export hides namespace context for `{source_name}`; prefer `{visible_callsite_surface}`"
             ),
         )
     } else {
         (
             "namespace_flat_use",
             format!(
-                "flattened import hides namespace for `{source_name}`; prefer `{visible_callsite_surface}` at call sites"
+                "flattened import hides namespace context for `{source_name}`; prefer `{visible_callsite_surface}`"
             ),
         )
     }
@@ -387,14 +387,14 @@ fn redundant_context_message(
         (
             "namespace_flat_pub_use_redundant_leaf_context",
             format!(
-                "flattened re-export keeps redundant context in `{binding_name}`; prefer `{parent_module}::{shorter_leaf}`"
+                "flattened re-export keeps redundant `{parent_module}` context in `{binding_name}`; prefer `{parent_module}::{shorter_leaf}`"
             ),
         )
     } else {
         (
             "namespace_flat_use_redundant_leaf_context",
             format!(
-                "flattened import keeps redundant context in `{binding_name}`; prefer `{parent_module}::{shorter_leaf}` and keep `{parent_module}` visible at call sites"
+                "flattened import keeps redundant `{parent_module}` context in `{binding_name}`; prefer `{parent_module}::{shorter_leaf}`"
             ),
         )
     }
@@ -410,14 +410,14 @@ fn preserve_module_message(
         (
             "namespace_flat_pub_use_preserve_module",
             format!(
-                "flattened re-export hides a configured namespace module for `{source_name}`; keep `{visible_callsite_surface}` visible"
+                "flattened re-export hides configured namespace context for `{source_name}`; prefer `{visible_callsite_surface}`"
             ),
         )
     } else {
         (
             "namespace_flat_use_preserve_module",
             format!(
-                "flattened import hides a configured namespace module for `{binding_name}`; prefer `{visible_callsite_surface}` at call sites"
+                "flattened import hides configured namespace context for `{binding_name}`; prefer `{visible_callsite_surface}`"
             ),
         )
     }
@@ -650,7 +650,7 @@ fn canonical_parent_surface_message(
     (
         "namespace_parent_surface",
         format!(
-            "import bypasses the canonical parent surface for `{binding_name}` via `{parent_module}::{source_name}`; prefer `{canonical_parent_surface}`"
+            "`{parent_module}::{source_name}` bypasses the canonical parent surface for `{binding_name}`; prefer `{canonical_parent_surface}`"
         ),
     )
 }

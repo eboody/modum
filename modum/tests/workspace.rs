@@ -927,6 +927,194 @@ pub struct UserRepository;
 }
 
 #[test]
+fn analyze_workspace_flags_public_root_generic_response_module_as_error() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod response;\n").expect("write lib");
+    fs::write(root.join("src/response.rs"), "pub struct Response;\n").expect("write response");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_organizational_submodule_flatten")
+            && diag.message.contains("response::Response")
+            && diag.message.contains("prefer `Response`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_nested_generic_response_module_with_final_parent_surface() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/auth")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod auth;\n").expect("write lib");
+    fs::write(root.join("src/auth.rs"), "pub mod response;\n").expect("write auth");
+    fs::write(root.join("src/auth/response.rs"), "pub struct Response;\n").expect("write response");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_organizational_submodule_flatten")
+            && diag.message.contains("auth::response::Response")
+            && diag.message.contains("prefer `auth::Response`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_collapse_redundant_leaf_context_to_final_public_path() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod response;\n").expect("write lib");
+    fs::write(
+        root.join("src/response.rs"),
+        r#"
+pub struct ResponseResponse;
+"#,
+    )
+    .expect("write response");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_redundant_category_suffix")
+            && diag.message.contains("ResponseResponse")
+            && diag.message.contains("prefer `Response`")
+            && !diag.message.contains("prefer `response::Response`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_prefixed_public_root_item_when_semantic_module_surface_exists() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod user;
+
+pub struct UserRepository;
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/user.rs"),
+        r#"
+pub struct Repository;
+"#,
+    )
+    .expect("write user");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_redundant_leaf_context")
+            && diag.message.contains("user::Repository")
+            && diag.message.contains("UserRepository")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_prefixed_public_root_alias_when_semantic_module_surface_exists() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod generated;
+pub mod user;
+
+pub use generated::UserRepository;
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/generated.rs"),
+        "pub struct UserRepository;\n",
+    )
+    .expect("write gen");
+    fs::write(
+        root.join("src/user.rs"),
+        r#"
+pub struct Repository;
+"#,
+    )
+    .expect("write user");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_redundant_leaf_context")
+            && diag.message.contains("user::Repository")
+            && diag.message.contains("UserRepository")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_candidate_semantic_module_for_same_head_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_candidate_semantic_module")
+            && !diag.policy
+            && diag.message.contains("UserRepository")
+            && diag.message.contains("UserService")
+            && diag.message.contains("UserId")
+            && diag.message.contains("user::{Id, Repository, Service}")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_candidate_semantic_module_when_surface_already_exists() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod user;
+
+pub struct UserRepository;
+pub struct UserId;
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/user.rs"),
+        r#"
+pub struct Repository;
+pub struct Id;
+"#,
+    )
+    .expect("write user");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code.as_deref() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
 fn analyze_workspace_flags_weak_module_generic_leaf() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -992,7 +1180,7 @@ pub mod helpers {
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
         diag.code.as_deref() == Some("api_catch_all_module")
-            && diag.message.contains("catch-all API boundary")
+            && diag.message.contains("catch-all public module")
     }));
 }
 

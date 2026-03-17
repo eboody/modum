@@ -14,25 +14,28 @@ It is a lint tool. It reports diagnostics. It does not rewrite code.
 
 ## Why It Exists
 
-These API shapes are legal Rust, but they add noise:
+`modum` exists to catch two common Rust API-shape problems:
+
+- flattened imports that hide useful context at call sites
+- redundant leaf names that repeat context the module path already provides
+
+These call-site shapes are legal Rust, but they make signatures and public paths harder to scan:
 
 ```rust
-use http::Client;
-use user::UserRepository;
-
-pub use partials::error::Error;
+pub fn handle(repo: UserRepository) -> Result<StatusCode, Error> {
+    todo!()
+}
 ```
 
-These read more clearly:
+These usually read more clearly:
 
 ```rust
-use http;
-use user;
-
-pub use partials::Error;
+pub fn handle(repo: user::Repository) -> Result<http::StatusCode, partials::Error> {
+    todo!()
+}
 ```
 
-And these public paths usually read better:
+The same pattern shows up in public API paths:
 
 ```rust
 user::Repository
@@ -48,15 +51,40 @@ user::error::InvalidEmailError
 partials::error::Error
 ```
 
+The central comparison is often this:
+
+```rust
+user::Repository
+UserRepository
+```
+
+In the abstract, `user::Repository` is usually better than `UserRepository`.
+
+Why:
+
+- The domain lives in the path, which is where Rust already gives you structure.
+- The leaf can stay generic and composable: `user::Repository`, `user::Service`, `user::Id`.
+- It scales better across a crate than baking the domain into every type name.
+
+That is also why `user::Repository` is usually better than `user::UserRepository`: once the path is doing the domain work, the leaf does not need to repeat it.
+
+The main caveat is that this only holds when `user` is a real semantic module. If the parent path is weak or technical, then a longer leaf can still be better. `UserRepository` is often clearer than `storage::Repository`.
+
+So the rule is:
+
+- strong semantic parent: prefer `user::Repository`
+- weak or technical parent: prefer the more descriptive leaf
+
 `modum` enforces that style across an entire workspace.
 
 ## Mental Model
 
-`modum` follows three rules:
+`modum` follows four rules:
 
 1. Keep namespace context visible at call sites.
-2. Keep public paths meaningful without redundancy.
-3. Use modules for domain boundaries, not file organization.
+2. Prefer a strong semantic parent with a short leaf: `user::Repository` over `UserRepository`.
+3. Keep a more descriptive leaf when the parent path is weak or technical.
+4. Use modules for domain boundaries, not file organization.
 
 ## Quick Usage
 
@@ -158,7 +186,7 @@ Configure the lints in any workspace with Cargo metadata:
 generic_nouns = ["Id", "Repository", "Service", "Error", "Command", "Request", "Response"]
 weak_modules = ["storage", "transport", "infra", "common", "misc", "helpers", "helper", "types", "util", "utils"]
 catch_all_modules = ["common", "misc", "helpers", "helper", "types", "util", "utils"]
-organizational_modules = ["error", "errors"]
+organizational_modules = ["error", "errors", "request", "response"]
 namespace_preserving_modules = ["auth", "command", "components", "email", "error", "http", "page", "partials", "policy", "query", "repo", "store", "storage", "transport", "infra"]
 ```
 
@@ -168,7 +196,7 @@ Tuning guide:
 
 - `generic_nouns`: generic leaves like `Repository`, `Error`, or `Request`
 - `namespace_preserving_modules`: modules that should stay visible at call sites, such as `http`, `email`, `partials`, or `components`
-- `organizational_modules`: modules that should not leak into the public API surface, such as `error`
+- `organizational_modules`: modules that should not leak into the public API surface, such as `error`, `request`, or `response`
 
 ## Lint Categories
 
@@ -202,15 +230,20 @@ Canonical parent-surface re-exports are allowed. `pub use error::{Error, Result}
 
 ### Public API Paths
 
-These warn when public leaves are too generic for a weak parent, or when the path repeats context it already has.
+These warn when public leaves are too generic for a weak parent, when the path repeats context it already has, or when a flat family suggests a semantic module surface.
 
 - `api_missing_parent_surface_export`
 - `api_weak_module_generic_leaf`
 - `api_redundant_leaf_context`
+  Warning for public leaves that repeat semantic module context already carried by the path, such as `user::UserRepository`, or that bake a sibling semantic module into a flat public leaf when `user::Repository` already exists.
+- `api_candidate_semantic_module`
+  Advisory warning for public item families such as `UserRepository`, `UserService`, and `UserId` that share a semantic head under one parent and suggest a module surface like `user::{Repository, Service, Id}`.
 - `api_redundant_category_suffix`
 
 Examples:
 
+- `UserRepository`, `UserService`, `UserId`
+- `UserRepository` when `user::Repository` already exists
 - `partials::button::Button` when the intended surface should also expose `partials::Button`
 - `storage::Repository`
 - `user::UserRepository`
@@ -239,6 +272,7 @@ This rule is an error, not a warning.
 Example:
 
 - `partials::error::Error` should usually be `partials::Error`
+- `response::Response` should usually be `Response`
 
 ## What It Does Not Check
 

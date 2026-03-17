@@ -39,7 +39,7 @@ const DEFAULT_CATCH_ALL_MODULES: &[&str] = &[
     "common", "misc", "helpers", "helper", "types", "util", "utils",
 ];
 
-const DEFAULT_ORGANIZATIONAL_MODULES: &[&str] = &["error", "errors"];
+const DEFAULT_ORGANIZATIONAL_MODULES: &[&str] = &["error", "errors", "request", "response"];
 
 const DEFAULT_NAMESPACE_PRESERVING_MODULES: &[&str] = &[
     "auth",
@@ -831,6 +831,8 @@ mod tests {
         assert!(settings.weak_modules.contains("storage"));
         assert!(settings.catch_all_modules.contains("helpers"));
         assert!(settings.organizational_modules.contains("error"));
+        assert!(settings.organizational_modules.contains("request"));
+        assert!(settings.organizational_modules.contains("response"));
         assert!(settings.namespace_preserving_modules.contains("email"));
         assert!(settings.namespace_preserving_modules.contains("components"));
         assert!(settings.namespace_preserving_modules.contains("partials"));

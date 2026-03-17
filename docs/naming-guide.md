@@ -163,7 +163,9 @@ Codex should default to these behaviors:
 - `api_weak_module_generic_leaf`
   Warning. Flags paths such as `storage::Repository` where a weak technical module exposes a generic leaf.
 - `api_redundant_leaf_context`
-  Warning. Flags paths such as `user::UserRepository` or `page::ErrorPage` where the leaf repeats the parent context.
+  Warning. Flags paths such as `user::UserRepository` or `page::ErrorPage` where the leaf repeats the parent context, and also flags flat public leaves such as `UserRepository` when a sibling semantic module surface like `user::Repository` already exists.
+- `api_candidate_semantic_module`
+  Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when their shared head suggests a semantic module surface like `user::{Repository, Service, Id}`, but that module does not exist yet.
 - `api_redundant_category_suffix`
   Warning. Flags paths such as `user::error::InvalidEmailError` where the parent module already provides the category.
 - `api_catch_all_module`
@@ -171,7 +173,7 @@ Codex should default to these behaviors:
 - `api_repeated_module_segment`
   Warning. Flags repeated public nesting such as `error::error`.
 - `api_organizational_submodule_flatten`
-  Error. Flags public paths such as `partials::error::Error` when the nested `error` module is just organizational and the canonical path should be `partials::Error`.
+  Error. Flags public paths such as `partials::error::Error` or `response::Response` when the nested module is just organizational and the canonical path should drop that category layer.
 
 ## Advisory Rules
 
