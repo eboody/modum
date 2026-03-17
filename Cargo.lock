@@ -144,7 +144,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "modum"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "modum-core",
  "serde_json",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "modum-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "glob",
  "proc-macro2",

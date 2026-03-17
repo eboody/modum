@@ -34,7 +34,7 @@ pub use partials::Error;
 
 And these public paths usually read better:
 
-```text
+```rust
 user::Repository
 user::error::InvalidEmail
 partials::Error
@@ -42,7 +42,7 @@ partials::Error
 
 instead of:
 
-```text
+```rust
 user::UserRepository
 user::error::InvalidEmailError
 partials::error::Error
@@ -73,6 +73,52 @@ cargo modum check --root . --format json
 modum check --root .
 cargo modum check --root .
 ```
+
+### Neovim
+
+`modum` works well with `nvim-lint`. Use `--mode warn` so diagnostics do not fail the editor job, and use `--format json` for stable parsing.
+
+```lua
+local lint = require("lint")
+
+lint.linters.modum = {
+  cmd = "modum",
+  stdin = false,
+  stream = "stdout",
+  args = { "check", "--root", vim.fn.getcwd(), "--mode", "warn", "--format", "json" },
+  parser = function(output, bufnr)
+    if output == "" then
+      return {}
+    end
+
+    local decoded = vim.json.decode(output)
+    local current_file = vim.api.nvim_buf_get_name(bufnr)
+    local diagnostics = {}
+
+    for _, item in ipairs(((decoded or {}).report or {}).diagnostics or {}) do
+      if item.file == current_file then
+        diagnostics[#diagnostics + 1] = {
+          bufnr = bufnr,
+          lnum = math.max((item.line or 1) - 1, 0),
+          col = 0,
+          severity = item.level == "Error"
+            and vim.diagnostic.severity.ERROR
+            or vim.diagnostic.severity.WARN,
+          source = "modum",
+          code = item.code,
+          message = item.message,
+        }
+      end
+    end
+
+    return diagnostics
+  end,
+}
+
+lint.linters_by_ft.rust = { "modum" }
+```
+
+If you edit multiple crates from one Neovim session, replace `vim.fn.getcwd()` with your workspace root resolver. `modum` is workspace-oriented, so it is usually better to run it on save than on every `InsertLeave`.
 
 If you are developing `modum` itself:
 
