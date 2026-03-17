@@ -224,15 +224,27 @@ fn analyze_qualified_generic_path(
         .map(|segment| segment.ident.to_string())
         .collect::<Vec<_>>();
     let analysis_path = trim_relative_prefix(&full_path);
-    if analysis_path.len() != 2 {
+    if analysis_path.len() < 2 {
         return;
     }
 
-    let parent_module = &analysis_path[0];
-    let leaf_name = &analysis_path[1];
+    let parent_module = &analysis_path[analysis_path.len() - 2];
+    let leaf_name = &analysis_path[analysis_path.len() - 1];
     if !qualified_generic_context_is_redundant(parent_module, leaf_name, settings) {
         return;
     }
+    let current_module_path = inferred_file_module_path(file);
+    let preferred_path = qualified_generic_parent_surface_candidate(
+        file,
+        &current_module_path,
+        &full_path,
+        leaf_name,
+    );
+    if analysis_path.len() > 2 && preferred_path.is_none() {
+        return;
+    }
+    let preferred_path = preferred_path.unwrap_or_else(|| leaf_name.to_string());
+    let rendered_path = full_path.join("::");
 
     diagnostics.push(Diagnostic {
         level: DiagnosticLevel::Warning,
@@ -240,10 +252,81 @@ fn analyze_qualified_generic_path(
         line: Some(path.span().start().line),
         code: Some("namespace_redundant_qualified_generic".to_string()),
         policy: true,
-        message: format!(
-            "`{parent_module}::{leaf_name}` repeats a generic category; prefer `{leaf_name}`"
-        ),
+        message: format!("`{rendered_path}` repeats a generic category; prefer `{preferred_path}`"),
     });
+}
+
+fn qualified_generic_parent_surface_candidate(
+    path: &Path,
+    current_module_path: &[String],
+    full_path: &[String],
+    leaf_name: &str,
+) -> Option<String> {
+    if full_path.len() < 3 {
+        return None;
+    }
+
+    let parent_surface_prefix = &full_path[..full_path.len() - 2];
+    let resolved_parent_surface =
+        resolve_qualified_parent_surface_path(current_module_path, parent_surface_prefix)?;
+    let public_bindings = public_bindings_for_module(path, &resolved_parent_surface);
+    if !public_bindings.contains(leaf_name) {
+        return None;
+    }
+
+    Some(render_qualified_parent_surface(
+        parent_surface_prefix,
+        leaf_name,
+    ))
+}
+
+fn resolve_qualified_parent_surface_path(
+    current_module_path: &[String],
+    path_prefix: &[String],
+) -> Option<Vec<String>> {
+    if path_prefix.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut base = current_module_path.to_vec();
+    let mut iter = path_prefix.iter();
+    let mut used_relative_prefix = false;
+
+    while let Some(segment) = iter.next() {
+        match segment.as_str() {
+            "crate" => {
+                base.clear();
+                used_relative_prefix = true;
+            }
+            "self" => {
+                used_relative_prefix = true;
+            }
+            "super" => {
+                base.pop()?;
+                used_relative_prefix = true;
+            }
+            other => {
+                let mut resolved = if used_relative_prefix {
+                    base
+                } else {
+                    Vec::new()
+                };
+                resolved.push(other.to_string());
+                resolved.extend(iter.cloned());
+                return Some(resolved);
+            }
+        }
+    }
+
+    Some(base)
+}
+
+fn render_qualified_parent_surface(path_prefix: &[String], leaf_name: &str) -> String {
+    if path_prefix.is_empty() {
+        return leaf_name.to_string();
+    }
+
+    format!("{}::{leaf_name}", path_prefix.join("::"))
 }
 
 fn binding_is_used_as_namespace_in_scope(scope_items: &[Item], binding_name: &str) -> bool {
@@ -797,44 +880,15 @@ fn public_item_binding(item: &Item) -> Option<(String, bool)> {
 }
 
 fn render_canonical_parent_surface(
-    path: &Path,
+    _path: &Path,
     module_path: &[String],
     binding_name: &str,
 ) -> String {
     if module_path.is_empty() {
-        if let Some(package_name) = package_name_for_file(path) {
-            return format!("{package_name}::{binding_name}");
-        }
         return format!("crate::{binding_name}");
     }
 
     format!("{}::{binding_name}", module_path.join("::"))
-}
-
-fn package_name_for_file(path: &Path) -> Option<String> {
-    let package_root = find_package_root(path)?;
-    let manifest = fs::read_to_string(package_root.join("Cargo.toml")).ok()?;
-    let manifest = toml::from_str::<toml::Value>(&manifest).ok()?;
-    let package_name = manifest
-        .get("package")
-        .and_then(toml::Value::as_table)
-        .and_then(|table| table.get("name"))
-        .and_then(toml::Value::as_str)?;
-    Some(package_name.replace('-', "_"))
-}
-
-fn find_package_root(path: &Path) -> Option<PathBuf> {
-    for ancestor in path.ancestors().skip(1) {
-        let manifest_path = ancestor.join("Cargo.toml");
-        if manifest_path.is_file()
-            && let Ok(manifest_src) = fs::read_to_string(&manifest_path)
-            && let Ok(manifest) = toml::from_str::<toml::Value>(&manifest_src)
-            && manifest.get("package").is_some_and(toml::Value::is_table)
-        {
-            return Some(ancestor.to_path_buf());
-        }
-    }
-    None
 }
 
 fn inferred_file_module_path(path: &Path) -> Vec<String> {

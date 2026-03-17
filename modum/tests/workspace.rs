@@ -614,7 +614,7 @@ pub fn keep(error: Error) -> Error {
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
         diag.code.as_deref() == Some("namespace_parent_surface")
-            && diag.message.contains("fixture::Error")
+            && diag.message.contains("crate::Error")
     }));
 }
 
@@ -785,6 +785,35 @@ pub fn keep(value: response::Response) -> response::Response {
     assert!(report.diagnostics.iter().any(|diag| {
         diag.code.as_deref() == Some("namespace_redundant_qualified_generic")
             && diag.message.contains("response::Response")
+            && diag.message.contains("prefer `Response`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_prefers_canonical_crate_surface_for_qualified_generic_paths() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod error;
+pub use error::Error;
+
+pub fn keep(value: crate::error::Error) -> crate::error::Error {
+    value
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(root.join("src/error.rs"), "pub struct Error;\n").expect("write error");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("namespace_redundant_qualified_generic")
+            && diag.message.contains("crate::error::Error")
+            && diag.message.contains("prefer `crate::Error`")
     }));
 }
 
