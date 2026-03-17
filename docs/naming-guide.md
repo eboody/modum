@@ -156,6 +156,7 @@ Codex should default to these behaviors:
   Warning. Flags flattened public re-exports of those generic nouns when they bypass a meaningful child facet. It does not flag module-root re-exports that intentionally create the canonical parent surface, such as `pub use error::Error;` for `user::Error`.
 - `namespace_flat_pub_use_preserve_module`
   Warning. Flags flattened public re-exports from configured namespace-preserving modules when the child facet should stay visible. It does not flag broader parent-surface exports such as exposing both `components::Button` and `partials::Button`, and it skips private alias modules that only exist to feed a parent surface.
+- Semantic child module namespaces such as `tab_set::ContentProps` are already carrying context at call sites. Do not force a broader parent like `components::tab_set::ContentProps` unless that broader parent adds net meaning.
 - `namespace_flat_pub_use_redundant_leaf_context`
   Warning. Flags flattened public re-exports whose leaf still repeats the parent context. It does not flag family re-exports from private organizational child modules when flattening them is how the parent surface is intentionally shaped.
 - `api_missing_parent_surface_export`

@@ -228,6 +228,8 @@ Examples:
 
 Canonical parent-surface re-exports are allowed. `pub use error::{Error, Result};` is valid when that is how a module intentionally exposes `module::Error` and `module::Result`. The same applies to broader UI surfaces such as exposing both `components::Button` and `partials::Button`.
 
+A semantic child module namespace can also stay flat when it is already doing the call-site naming work. For example, `use components::tab_set;` with call sites like `tab_set::ContentProps` should not be forced into `components::tab_set::ContentProps`.
+
 ### Public API Paths
 
 These warn when public leaves are too generic for a weak parent, when the path repeats context it already has, or when a flat family suggests a semantic module surface.

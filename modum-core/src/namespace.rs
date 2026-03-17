@@ -50,7 +50,7 @@ fn analyze_scope(
 ) {
     for item in items {
         match item {
-            Item::Use(item_use) => analyze_use_item(path, item_use, settings, diagnostics),
+            Item::Use(item_use) => analyze_use_item(path, items, item_use, settings, diagnostics),
             Item::Mod(ItemMod {
                 content: Some((_, nested)),
                 ..
@@ -96,6 +96,7 @@ impl<'ast> Visit<'ast> for QualifiedCallsitePathVisitor<'_> {
 
 fn analyze_use_item(
     path: &Path,
+    scope_items: &[Item],
     item_use: &ItemUse,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
@@ -166,6 +167,8 @@ fn analyze_use_item(
         };
         let visible_callsite_surface =
             visible_callsite_surface_candidate(analysis_path, binding_name, settings);
+        let binding_used_as_namespace =
+            binding_is_used_as_namespace_in_scope(scope_items, binding_name);
 
         let (code, message) =
             if let Some(canonical_parent_surface) = canonical_parent_surface.as_deref() {
@@ -185,6 +188,7 @@ fn analyze_use_item(
                 .namespace_preserving_modules
                 .contains(&parent_normalized)
                 && !module_path_contains_namespace(&current_module_path, &parent_normalized)
+                && !binding_used_as_namespace
                 && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
             {
                 preserve_module_message(
@@ -240,6 +244,60 @@ fn analyze_qualified_generic_path(
             "`{parent_module}::{leaf_name}` repeats a generic category; prefer `{leaf_name}`"
         ),
     });
+}
+
+fn binding_is_used_as_namespace_in_scope(scope_items: &[Item], binding_name: &str) -> bool {
+    let mut visitor = BindingNamespaceUseVisitor {
+        binding_name,
+        used_as_namespace: false,
+    };
+
+    for item in scope_items {
+        match item {
+            Item::Use(_) | Item::Mod(_) => continue,
+            other => {
+                visitor.visit_item(other);
+                if visitor.used_as_namespace {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+struct BindingNamespaceUseVisitor<'a> {
+    binding_name: &'a str,
+    used_as_namespace: bool,
+}
+
+impl<'ast> Visit<'ast> for BindingNamespaceUseVisitor<'_> {
+    fn visit_expr_path(&mut self, node: &'ast ExprPath) {
+        if path_uses_binding_as_namespace(&node.path, self.binding_name) {
+            self.used_as_namespace = true;
+            return;
+        }
+        visit::visit_expr_path(self, node);
+    }
+
+    fn visit_type_path(&mut self, node: &'ast TypePath) {
+        if node.qself.is_none() && path_uses_binding_as_namespace(&node.path, self.binding_name) {
+            self.used_as_namespace = true;
+            return;
+        }
+        visit::visit_type_path(self, node);
+    }
+
+    fn visit_item_mod(&mut self, _node: &'ast ItemMod) {}
+}
+
+fn path_uses_binding_as_namespace(path: &SynPath, binding_name: &str) -> bool {
+    path.segments.len() >= 2
+        && path
+            .segments
+            .first()
+            .is_some_and(|segment| segment.ident == binding_name)
 }
 
 fn canonical_parent_surface_reexport(

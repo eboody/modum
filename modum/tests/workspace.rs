@@ -142,6 +142,56 @@ pub fn render(nav: NavBar) -> NavBar {
 }
 
 #[test]
+fn analyze_workspace_allows_semantic_child_module_namespace_under_preserved_parent() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod components;
+mod page;
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/components.rs"),
+        r#"
+pub use tab_set::Component as TabSet;
+
+pub mod tab_set {
+    pub struct Component;
+    pub struct ContentProps;
+
+    pub mod content {
+        pub struct Content;
+    }
+}
+"#,
+    )
+    .expect("write components");
+    fs::write(
+        root.join("src/page.rs"),
+        r#"
+use crate::components::tab_set;
+
+pub fn render(props: tab_set::ContentProps) -> tab_set::Component {
+    let _ = core::mem::size_of::<tab_set::content::Content>();
+    todo!()
+}
+"#,
+    )
+    .expect("write page");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("namespace_flat_use_preserve_module")
+            && diag.message.contains("components::tab_set")
+    }));
+}
+
+#[test]
 fn analyze_workspace_allows_canonical_parent_surface_public_reexports() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
