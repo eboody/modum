@@ -168,7 +168,7 @@ Codex should default to these behaviors:
 - `api_redundant_leaf_context`
   Warning. Flags paths such as `user::UserRepository` or `page::ErrorPage` where the leaf repeats the parent context, and also flags flat public leaves such as `UserRepository` when a sibling semantic module surface like `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when their shared head suggests a semantic module surface like `user::{Repository, Service, Id}`, and also flags families such as `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome` when their shared generic tail suggests a semantic module surface like `outcome::{Completed, Rejected, Toxicity}`.
+  Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when their shared head suggests a semantic module surface like `user::{Repository, Service, Id}`, and also flags families such as `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome` when their shared generic tail suggests a semantic module surface like `outcome::{Completed, Rejected, Toxicity}`. It skips weak promoted heads like `to`, `has`, `open`, and `rolled`, and it skips hidden or internal module scopes.
 - `api_redundant_category_suffix`
   Warning. Flags paths such as `user::error::InvalidEmailError` where the parent module already provides the category.
 - `api_catch_all_module`

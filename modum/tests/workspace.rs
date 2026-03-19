@@ -1409,6 +1409,85 @@ pub struct UserId;
 }
 
 #[test]
+fn analyze_workspace_does_not_flag_candidate_semantic_module_for_weak_head_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct ToSqlQuery;
+pub struct ToQueryValue;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_candidate_semantic_module_inside_hidden_internal_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[doc(hidden)]
+pub mod __private {
+    pub struct UserRepository;
+    pub struct UserService;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_treat_hidden_module_as_semantic_surface() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[doc(hidden)]
+pub mod user {
+    pub struct Repository;
+}
+
+pub struct UserRepository;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_redundant_leaf_context") })
+    );
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_candidate_semantic_module_when_surface_already_exists() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();

@@ -50,6 +50,12 @@ struct ScopeSurfaceContext<'a> {
     suppressed_child_module_exports: &'a BTreeSet<String>,
 }
 
+#[derive(Clone, Copy)]
+struct ScopeFlags {
+    path_is_public: bool,
+    allow_candidate_semantic_modules: bool,
+}
+
 pub(super) fn analyze_api_shape_rules(
     path: &Path,
     parsed: &File,
@@ -89,7 +95,12 @@ pub(super) fn analyze_api_shape_rules(
         path,
         &parsed.items,
         &inferred_module_path,
-        inferred_is_public,
+        ScopeFlags {
+            path_is_public: inferred_is_public,
+            allow_candidate_semantic_modules: !module_path_contains_internal_namespace(
+                &inferred_module_path,
+            ),
+        },
         settings,
         &mut diagnostics,
     );
@@ -101,7 +112,7 @@ fn analyze_scope(
     path: &Path,
     items: &[Item],
     module_path: &[String],
-    path_is_public: bool,
+    scope_flags: ScopeFlags,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -110,7 +121,7 @@ fn analyze_scope(
         path,
         items,
         module_path,
-        path_is_public,
+        scope_flags,
         &public_bindings,
         settings,
         diagnostics,
@@ -126,13 +137,13 @@ fn analyze_scope(
                 path,
                 item_mod,
                 module_path,
-                path_is_public,
+                scope_flags,
                 &scope_context,
                 settings,
                 diagnostics,
             ),
             Item::Use(item_use) => {
-                if path_is_public {
+                if scope_flags.path_is_public {
                     analyze_public_use_item(
                         path,
                         item_use,
@@ -149,7 +160,7 @@ fn analyze_scope(
                 item,
                 items,
                 module_path,
-                path_is_public,
+                scope_flags.path_is_public,
                 settings,
                 diagnostics,
             ),
@@ -161,7 +172,7 @@ fn analyze_module_item(
     path: &Path,
     item_mod: &ItemMod,
     module_path: &[String],
-    path_is_public: bool,
+    scope_flags: ScopeFlags,
     scope_context: &ScopeSurfaceContext<'_>,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
@@ -169,7 +180,7 @@ fn analyze_module_item(
     let module_name = item_mod.ident.to_string();
     let normalized = normalize_segment(&module_name);
     let line = item_mod.span().start().line;
-    let module_is_public = path_is_public && is_public(&item_mod.vis);
+    let module_is_public = scope_flags.path_is_public && is_public(&item_mod.vis);
 
     if module_is_public {
         if settings.catch_all_modules.contains(&normalized) {
@@ -216,7 +227,7 @@ fn analyze_module_item(
         }
     }
 
-    if is_surface_export_candidate(module_path, path_is_public, settings)
+    if is_surface_export_candidate(module_path, scope_flags.path_is_public, settings)
         && is_public(&item_mod.vis)
         && !scope_context
             .suppressed_child_module_exports
@@ -224,6 +235,7 @@ fn analyze_module_item(
         && let Some(surface_export) = child_module_surface_export_candidate(
             path,
             module_path,
+            Some(item_mod),
             &module_name,
             item_mod
                 .content
@@ -258,7 +270,11 @@ fn analyze_module_item(
             path,
             nested,
             &next_path,
-            module_is_public,
+            ScopeFlags {
+                path_is_public: module_is_public,
+                allow_candidate_semantic_modules: scope_flags.allow_candidate_semantic_modules
+                    && !module_is_hidden_or_internal(item_mod),
+            },
             settings,
             diagnostics,
         );
@@ -428,13 +444,13 @@ fn analyze_candidate_semantic_modules(
     path: &Path,
     items: &[Item],
     module_path: &[String],
-    path_is_public: bool,
+    scope_flags: ScopeFlags,
     public_bindings: &BTreeSet<String>,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> BTreeSet<String> {
     let mut suppressed_child_module_exports = BTreeSet::new();
-    if !path_is_public {
+    if !scope_flags.path_is_public || !scope_flags.allow_candidate_semantic_modules {
         return suppressed_child_module_exports;
     }
 
@@ -457,6 +473,7 @@ fn analyze_candidate_semantic_modules(
         if settings.weak_modules.contains(&module_candidate)
             || settings.catch_all_modules.contains(&module_candidate)
             || settings.organizational_modules.contains(&module_candidate)
+            || is_weak_semantic_head(&module_candidate)
             || child_modules
                 .keys()
                 .any(|module_name| normalize_segment(module_name) == normalize_segment(&head))
@@ -638,6 +655,7 @@ fn public_use_module_binding(
     let surface_export = child_module_surface_export_candidate(
         path,
         &resolved_module_path[..resolved_module_path.len() - 1],
+        None,
         module_name,
         None,
         settings,
@@ -648,6 +666,7 @@ fn public_use_module_binding(
 fn child_module_surface_export_candidate(
     path: &Path,
     module_path: &[String],
+    item_mod: Option<&ItemMod>,
     module_name: &str,
     inline_items: Option<&[Item]>,
     settings: &NamespaceSettings,
@@ -655,6 +674,8 @@ fn child_module_surface_export_candidate(
     if settings
         .organizational_modules
         .contains(&normalize_segment(module_name))
+        || is_internal_module_name(module_name)
+        || item_mod.is_some_and(module_is_hidden_or_internal)
     {
         return None;
     }
@@ -1092,6 +1113,9 @@ fn semantic_child_module_bindings(
         if !is_public(&item_mod.vis) {
             continue;
         }
+        if module_is_hidden_or_internal(item_mod) {
+            continue;
+        }
 
         let module_name = item_mod.ident.to_string();
         let normalized = normalize_segment(&module_name);
@@ -1119,6 +1143,45 @@ fn semantic_child_module_bindings(
     }
 
     out
+}
+
+fn is_weak_semantic_head(head: &str) -> bool {
+    matches!(head, "to" | "has" | "open" | "rolled")
+}
+
+fn module_is_hidden_or_internal(item_mod: &ItemMod) -> bool {
+    is_internal_module_name(&item_mod.ident.to_string())
+        || item_mod.attrs.iter().any(attribute_is_doc_hidden)
+}
+
+fn module_path_contains_internal_namespace(module_path: &[String]) -> bool {
+    module_path
+        .iter()
+        .any(|segment| is_internal_module_name(segment))
+}
+
+fn is_internal_module_name(module_name: &str) -> bool {
+    let normalized = normalize_segment(module_name);
+    normalized.starts_with("__")
+        || matches!(
+            normalized.as_str(),
+            "internal" | "private" | "detail" | "details"
+        )
+}
+
+fn attribute_is_doc_hidden(attr: &syn::Attribute) -> bool {
+    if !attr.path().is_ident("doc") {
+        return false;
+    }
+
+    let mut hidden = false;
+    let _ = attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("hidden") {
+            hidden = true;
+        }
+        Ok(())
+    });
+    hidden
 }
 
 fn public_bindings_for_child_module(
