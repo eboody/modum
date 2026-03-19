@@ -30,6 +30,25 @@ struct PublicLeafBinding {
     binding_name: String,
 }
 
+#[derive(Clone)]
+struct TailSemanticFamilyMember {
+    line: usize,
+    original_member: String,
+    suggested_leaf: String,
+    child_module_name: Option<String>,
+}
+
+#[derive(Clone)]
+struct ChildModuleSurfaceExport {
+    parent_binding: String,
+    child_leaf: String,
+}
+
+struct ScopeSurfaceContext<'a> {
+    public_bindings: &'a BTreeSet<String>,
+    suppressed_child_module_exports: &'a BTreeSet<String>,
+}
+
 #[derive(Clone, Copy)]
 enum NameStyle {
     Pascal,
@@ -98,14 +117,19 @@ fn analyze_scope(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let public_bindings = collect_scope_public_bindings(items);
-    analyze_candidate_semantic_modules(
+    let suppressed_child_module_exports = analyze_candidate_semantic_modules(
         path,
         items,
         module_path,
         path_is_public,
+        &public_bindings,
         settings,
         diagnostics,
     );
+    let scope_context = ScopeSurfaceContext {
+        public_bindings: &public_bindings,
+        suppressed_child_module_exports: &suppressed_child_module_exports,
+    };
 
     for item in items {
         match item {
@@ -114,7 +138,7 @@ fn analyze_scope(
                 item_mod,
                 module_path,
                 path_is_public,
-                &public_bindings,
+                &scope_context,
                 settings,
                 diagnostics,
             ),
@@ -125,7 +149,7 @@ fn analyze_scope(
                         item_use,
                         items,
                         module_path,
-                        &public_bindings,
+                        &scope_context,
                         settings,
                         diagnostics,
                     );
@@ -149,7 +173,7 @@ fn analyze_module_item(
     item_mod: &ItemMod,
     module_path: &[String],
     path_is_public: bool,
-    public_bindings: &BTreeSet<String>,
+    scope_context: &ScopeSurfaceContext<'_>,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -211,7 +235,10 @@ fn analyze_module_item(
 
     if is_surface_export_candidate(module_path, path_is_public, settings)
         && is_public(&item_mod.vis)
-        && let Some(main_leaf) = child_module_surface_leaf(
+        && !scope_context
+            .suppressed_child_module_exports
+            .contains(&normalized)
+        && let Some(surface_export) = child_module_surface_export_candidate(
             path,
             module_path,
             &module_name,
@@ -221,7 +248,9 @@ fn analyze_module_item(
                 .map(|(_, nested)| nested.as_slice()),
             settings,
         )
-        && !public_bindings.contains(&main_leaf)
+        && !scope_context
+            .public_bindings
+            .contains(&surface_export.parent_binding)
     {
         diagnostics.push(Diagnostic {
             level: DiagnosticLevel::Warning,
@@ -231,8 +260,12 @@ fn analyze_module_item(
             policy: true,
             message: format!(
                 "parent surface is missing `{}`; re-export it so callers do not have to use `{}`",
-                render_public_path(module_path, &main_leaf),
-                render_public_path_with_module(module_path, &module_name, &main_leaf),
+                render_public_path(module_path, &surface_export.parent_binding),
+                render_public_path_with_module(
+                    module_path,
+                    &module_name,
+                    &surface_export.child_leaf,
+                ),
             ),
         });
     }
@@ -287,7 +320,7 @@ fn analyze_public_use_item(
     item_use: &ItemUse,
     scope_items: &[Item],
     module_path: &[String],
-    public_bindings: &BTreeSet<String>,
+    scope_context: &ScopeSurfaceContext<'_>,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -301,8 +334,16 @@ fn analyze_public_use_item(
 
     for leaf in leaves {
         if is_surface_export_candidate(module_path, true, settings)
-            && let Some(module_binding) =
-                public_use_module_binding(path, module_path, &leaf, public_bindings, settings)
+            && !scope_context
+                .suppressed_child_module_exports
+                .contains(&normalize_segment(&leaf.binding_name))
+            && let Some(surface_export) = public_use_module_binding(
+                path,
+                module_path,
+                &leaf,
+                scope_context.public_bindings,
+                settings,
+            )
         {
             diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Warning,
@@ -312,8 +353,12 @@ fn analyze_public_use_item(
                 policy: true,
                 message: format!(
                     "parent surface is missing `{}`; re-export it so callers do not have to use `{}`",
-                    render_public_path(module_path, &module_binding),
-                    render_public_path_with_module(module_path, &leaf.binding_name, &module_binding),
+                    render_public_path(module_path, &surface_export.parent_binding),
+                    render_public_path_with_module(
+                        module_path,
+                        &leaf.binding_name,
+                        &surface_export.child_leaf,
+                    ),
                 ),
             });
         }
@@ -405,18 +450,20 @@ fn analyze_candidate_semantic_modules(
     items: &[Item],
     module_path: &[String],
     path_is_public: bool,
+    public_bindings: &BTreeSet<String>,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
-) {
+) -> BTreeSet<String> {
+    let mut suppressed_child_module_exports = BTreeSet::new();
     if !path_is_public {
-        return;
+        return suppressed_child_module_exports;
     }
 
     let child_modules = semantic_child_module_bindings(path, items, module_path, settings);
     let public_leaves = collect_scope_public_leaf_bindings(items);
     let mut families = BTreeMap::<String, Vec<(usize, String, String)>>::new();
 
-    for binding in public_leaves {
+    for binding in &public_leaves {
         if !matches!(detect_name_style(&binding.binding_name), NameStyle::Pascal) {
             continue;
         }
@@ -440,10 +487,11 @@ fn analyze_candidate_semantic_modules(
 
         let style = detect_name_style(&binding.binding_name);
         let shorter_leaf = render_segments(&segments[1..], style);
-        families
-            .entry(head)
-            .or_default()
-            .push((binding.line, binding.binding_name, shorter_leaf));
+        families.entry(head).or_default().push((
+            binding.line,
+            binding.binding_name.clone(),
+            shorter_leaf,
+        ));
     }
 
     for (head, members) in families {
@@ -481,6 +529,122 @@ fn analyze_candidate_semantic_modules(
             ),
         });
     }
+
+    for tail in public_bindings {
+        if !settings.generic_nouns.contains(tail) {
+            continue;
+        }
+
+        let module_candidate = tail.to_ascii_lowercase();
+        if settings.weak_modules.contains(&module_candidate)
+            || settings.catch_all_modules.contains(&module_candidate)
+            || settings.organizational_modules.contains(&module_candidate)
+            || child_modules
+                .keys()
+                .any(|module_name| normalize_segment(module_name) == normalize_segment(tail))
+        {
+            continue;
+        }
+
+        let mut members = Vec::<TailSemanticFamilyMember>::new();
+
+        for binding in &public_leaves {
+            if !matches!(detect_name_style(&binding.binding_name), NameStyle::Pascal) {
+                continue;
+            }
+
+            let segments = split_segments(&binding.binding_name);
+            if segments.len() < 2 {
+                continue;
+            }
+
+            let last_segment = segments.last().expect("len checked");
+            if normalize_segment(last_segment) != normalize_segment(tail) {
+                continue;
+            }
+
+            let shorter_leaf = render_segments(
+                &segments[..segments.len() - 1],
+                detect_name_style(&binding.binding_name),
+            );
+            members.push(TailSemanticFamilyMember {
+                line: binding.line,
+                original_member: binding.binding_name.clone(),
+                suggested_leaf: shorter_leaf,
+                child_module_name: None,
+            });
+        }
+
+        for item in items {
+            let Item::Mod(item_mod) = item else {
+                continue;
+            };
+            if !is_public(&item_mod.vis) {
+                continue;
+            }
+
+            let module_name = item_mod.ident.to_string();
+            let Some(bindings) = child_modules.get(&module_name) else {
+                continue;
+            };
+            if bindings.len() != 1 {
+                continue;
+            }
+
+            let child_leaf = bindings.iter().next().expect("len checked");
+            if normalize_segment(child_leaf) != normalize_segment(tail) {
+                continue;
+            }
+
+            members.push(TailSemanticFamilyMember {
+                line: item_mod.span().start().line,
+                original_member: format!("{module_name}::{child_leaf}"),
+                suggested_leaf: render_segments(&split_segments(&module_name), NameStyle::Pascal),
+                child_module_name: Some(module_name),
+            });
+        }
+
+        if members.len() < 2 {
+            continue;
+        }
+
+        let line = members
+            .iter()
+            .map(|member| member.line)
+            .min()
+            .expect("family has at least one member");
+        let original_members = members
+            .iter()
+            .map(|member| format!("`{}`", member.original_member))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suggested_members = members
+            .iter()
+            .map(|member| member.suggested_leaf.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            file: Some(path.to_path_buf()),
+            line: Some(line),
+            code: Some("api_candidate_semantic_module".to_string()),
+            policy: false,
+            message: format!(
+                "public siblings {original_members} share the generic `{tail}` tail; consider a semantic `{module_candidate}::{{{suggested_members}}}` surface"
+            ),
+        });
+
+        for member in members {
+            if let Some(module_name) = member.child_module_name {
+                suppressed_child_module_exports.insert(normalize_segment(&module_name));
+            }
+        }
+    }
+
+    suppressed_child_module_exports
 }
 
 fn public_use_module_binding(
@@ -489,30 +653,30 @@ fn public_use_module_binding(
     leaf: &PublicUseLeaf,
     public_bindings: &BTreeSet<String>,
     settings: &NamespaceSettings,
-) -> Option<String> {
+) -> Option<ChildModuleSurfaceExport> {
     let resolved_module_path = resolve_local_module_path(module_path, &leaf.full_path)?;
     let module_name = resolved_module_path.last()?;
     if normalize_segment(module_name) != normalize_segment(&leaf.binding_name) {
         return None;
     }
 
-    let main_leaf = child_module_surface_leaf(
+    let surface_export = child_module_surface_export_candidate(
         path,
         &resolved_module_path[..resolved_module_path.len() - 1],
         module_name,
         None,
         settings,
     )?;
-    (!public_bindings.contains(&main_leaf)).then_some(main_leaf)
+    (!public_bindings.contains(&surface_export.parent_binding)).then_some(surface_export)
 }
 
-fn child_module_surface_leaf(
+fn child_module_surface_export_candidate(
     path: &Path,
     module_path: &[String],
     module_name: &str,
     inline_items: Option<&[Item]>,
     settings: &NamespaceSettings,
-) -> Option<String> {
+) -> Option<ChildModuleSurfaceExport> {
     if settings
         .organizational_modules
         .contains(&normalize_segment(module_name))
@@ -520,24 +684,51 @@ fn child_module_surface_leaf(
         return None;
     }
 
-    let matching_leaf = if let Some(items) = inline_items {
-        matching_child_module_leaf(items, module_name)
-    } else {
-        let src_root = source_root(path)?;
-        let mut full_module_path = module_path.to_vec();
-        full_module_path.push(module_name.to_string());
-        matching_child_module_leaf_from_files(path, &src_root, &full_module_path, module_name)
-    }?;
+    if let Some(items) = inline_items {
+        return matching_child_module_surface_export(items, module_name, settings);
+    }
 
-    (matching_leaf != module_name).then_some(matching_leaf)
+    let src_root = source_root(path)?;
+    let mut full_module_path = module_path.to_vec();
+    full_module_path.push(module_name.to_string());
+    matching_child_module_surface_export_from_files(
+        path,
+        &src_root,
+        &full_module_path,
+        module_name,
+        settings,
+    )
 }
 
-fn matching_child_module_leaf_from_files(
+fn matching_child_module_surface_export(
+    items: &[Item],
+    module_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<ChildModuleSurfaceExport> {
+    if let Some(matching_leaf) = matching_child_module_leaf(items, module_name) {
+        return Some(ChildModuleSurfaceExport {
+            parent_binding: matching_leaf.clone(),
+            child_leaf: matching_leaf,
+        });
+    }
+
+    let child_leaf = sole_public_generic_binding(items, settings)?;
+    let parent_binding = render_segments(&split_segments(module_name), NameStyle::Pascal);
+    (normalize_segment(&parent_binding) != normalize_segment(&child_leaf)).then_some(
+        ChildModuleSurfaceExport {
+            parent_binding,
+            child_leaf,
+        },
+    )
+}
+
+fn matching_child_module_surface_export_from_files(
     current_file: &Path,
     src_root: &Path,
     module_path: &[String],
     module_name: &str,
-) -> Option<String> {
+    settings: &NamespaceSettings,
+) -> Option<ChildModuleSurfaceExport> {
     for candidate in parent_module_files(src_root, module_path) {
         let Ok(src) = fs::read_to_string(&candidate) else {
             continue;
@@ -545,7 +736,9 @@ fn matching_child_module_leaf_from_files(
         let Ok(parsed) = syn::parse_file(&src) else {
             continue;
         };
-        if let Some(matching) = matching_child_module_leaf(&parsed.items, module_name) {
+        if let Some(matching) =
+            matching_child_module_surface_export(&parsed.items, module_name, settings)
+        {
             return Some(matching);
         }
     }
@@ -570,11 +763,12 @@ fn matching_child_module_leaf_from_files(
             if resolved == module_path {
                 continue;
             }
-            if let Some(matching) = matching_child_module_leaf_from_files(
+            if let Some(matching) = matching_child_module_surface_export_from_files(
                 current_file,
                 src_root,
                 &resolved,
                 resolved.last()?,
+                settings,
             ) {
                 return Some(matching);
             }
@@ -582,6 +776,39 @@ fn matching_child_module_leaf_from_files(
     }
 
     None
+}
+
+fn sole_public_generic_binding(items: &[Item], settings: &NamespaceSettings) -> Option<String> {
+    let mut public_leaf = None;
+
+    for item in items {
+        if let Some((_, leaf_name, is_item_public)) = public_item_leaf(item)
+            && is_item_public
+        {
+            if public_leaf.replace(leaf_name).is_some() {
+                return None;
+            }
+            continue;
+        }
+
+        match item {
+            Item::Use(item_use) if is_public(&item_use.vis) => {
+                let mut leaves = Vec::new();
+                flatten_public_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+                for leaf in leaves {
+                    if public_leaf.replace(leaf.binding_name).is_some() {
+                        return None;
+                    }
+                }
+            }
+            Item::Mod(item_mod) if is_public(&item_mod.vis) => return None,
+            _ => {}
+        }
+    }
+
+    let leaf_name = public_leaf?;
+    (split_segments(&leaf_name).len() == 1 && settings.generic_nouns.contains(&leaf_name))
+        .then_some(leaf_name)
 }
 
 fn load_module_items(current_file: &Path, module_path: &[String]) -> Option<Vec<Item>> {
@@ -831,11 +1058,36 @@ fn semantic_module_surface_candidate(
             .into_iter()
             .map(|segment| normalize_segment(&segment))
             .collect::<Vec<_>>();
-        if module_segments.is_empty() || !leaf_normalized.starts_with(&module_segments) {
+        if module_segments.is_empty() {
             continue;
         }
 
-        let shorter_segments = &leaf_segments[module_segments.len()..];
+        if leaf_normalized.starts_with(&module_segments) {
+            let shorter_segments = &leaf_segments[module_segments.len()..];
+            if shorter_segments.is_empty() {
+                continue;
+            }
+
+            let shorter_leaf = render_segments(shorter_segments, style);
+            if !bindings
+                .iter()
+                .any(|binding| normalize_segment(binding) == normalize_segment(&shorter_leaf))
+            {
+                continue;
+            }
+
+            return Some(render_public_path_with_module(
+                module_path,
+                &module_name,
+                &shorter_leaf,
+            ));
+        }
+
+        if !leaf_normalized.ends_with(&module_segments) {
+            continue;
+        }
+
+        let shorter_segments = &leaf_segments[..leaf_segments.len() - module_segments.len()];
         if shorter_segments.is_empty() {
             continue;
         }

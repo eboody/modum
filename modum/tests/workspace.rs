@@ -431,6 +431,95 @@ fn analyze_workspace_flags_missing_parent_surface_export_for_public_child_module
 }
 
 #[test]
+fn analyze_workspace_flags_missing_parent_surface_export_for_generic_child_main_item() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/outcome")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod outcome;\n").expect("write lib");
+    fs::write(root.join("src/outcome.rs"), "pub mod toxicity;\n").expect("write outcome");
+    fs::write(
+        root.join("src/outcome/toxicity.rs"),
+        "pub struct Outcome;\n",
+    )
+    .expect("write toxicity");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+            && diag.message.contains("outcome::Toxicity")
+            && diag.message.contains("outcome::toxicity::Outcome")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_tail_family_candidate_semantic_module_and_suppresses_weaker_child_export_hint()
+ {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/terminal")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod terminal;\n").expect("write lib");
+    fs::write(
+        root.join("src/terminal.rs"),
+        r#"
+pub struct CompletedOutcome;
+pub struct RejectedOutcome;
+pub mod toxicity;
+pub enum Outcome {
+    Completed(CompletedOutcome),
+    Rejected(RejectedOutcome),
+    Toxicity(toxicity::Outcome),
+}
+"#,
+    )
+    .expect("write terminal");
+    fs::write(
+        root.join("src/terminal/toxicity.rs"),
+        "pub struct Outcome;\n",
+    )
+    .expect("write toxicity");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_candidate_semantic_module")
+            && !diag.policy
+            && diag.message.contains("CompletedOutcome")
+            && diag.message.contains("RejectedOutcome")
+            && diag.message.contains("toxicity::Outcome")
+            && diag
+                .message
+                .contains("outcome::{Completed, Rejected, Toxicity}")
+    }));
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+            && diag.message.contains("terminal::Toxicity")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_missing_parent_surface_export_for_generic_child_when_module_has_multiple_public_items()
+ {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/outcome")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod outcome;\n").expect("write lib");
+    fs::write(root.join("src/outcome.rs"), "pub mod toxicity;\n").expect("write outcome");
+    fs::write(
+        root.join("src/outcome/toxicity.rs"),
+        "pub struct Outcome;\npub struct Evidence;\n",
+    )
+    .expect("write toxicity");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+            && diag.message.contains("outcome::Toxicity")
+    }));
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_missing_parent_surface_export_at_weak_crate_root() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -1129,6 +1218,37 @@ pub struct Repository;
         diag.code.as_deref() == Some("api_redundant_leaf_context")
             && diag.message.contains("user::Repository")
             && diag.message.contains("UserRepository")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_tail_suffixed_public_root_item_when_semantic_module_surface_exists() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod outcome;
+
+pub struct CompletedOutcome;
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/outcome.rs"),
+        r#"
+pub struct Completed;
+"#,
+    )
+    .expect("write outcome");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code.as_deref() == Some("api_redundant_leaf_context")
+            && diag.message.contains("outcome::Completed")
+            && diag.message.contains("CompletedOutcome")
     }));
 }
 

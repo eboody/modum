@@ -183,7 +183,7 @@ Configure the lints in any workspace with Cargo metadata:
 
 ```toml
 [workspace.metadata.modum]
-generic_nouns = ["Id", "Repository", "Service", "Error", "Command", "Request", "Response"]
+generic_nouns = ["Id", "Repository", "Service", "Error", "Command", "Request", "Response", "Outcome"]
 weak_modules = ["storage", "transport", "infra", "common", "misc", "helpers", "helper", "types", "util", "utils"]
 catch_all_modules = ["common", "misc", "helpers", "helper", "types", "util", "utils"]
 organizational_modules = ["error", "errors", "request", "response"]
@@ -235,18 +235,21 @@ A semantic child module namespace can also stay flat when it is already doing th
 These warn when public leaves are too generic for a weak parent, when the path repeats context it already has, or when a flat family suggests a semantic module surface.
 
 - `api_missing_parent_surface_export`
+  Warning for public child modules that should also surface a readable parent alias, such as `components::Button` over `components::button::Button`, or `outcome::Toxicity` over `outcome::toxicity::Outcome`.
 - `api_weak_module_generic_leaf`
 - `api_redundant_leaf_context`
   Warning for public leaves that repeat semantic module context already carried by the path, such as `user::UserRepository`, or that bake a sibling semantic module into a flat public leaf when `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning for public item families such as `UserRepository`, `UserService`, and `UserId` that share a semantic head under one parent and suggest a module surface like `user::{Repository, Service, Id}`.
+  Advisory warning for public item families that suggest a semantic module surface, either through a shared head like `UserRepository`, `UserService`, and `UserId`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`.
 - `api_redundant_category_suffix`
 
 Examples:
 
 - `UserRepository`, `UserService`, `UserId`
+- `CompletedOutcome`, `RejectedOutcome`, `toxicity::Outcome`
 - `UserRepository` when `user::Repository` already exists
 - `partials::button::Button` when the intended surface should also expose `partials::Button`
+- `outcome::toxicity::Outcome` when the intended surface should also expose `outcome::Toxicity`
 - `storage::Repository`
 - `user::UserRepository`
 - `user::error::InvalidEmailError`

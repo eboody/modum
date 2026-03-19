@@ -160,13 +160,13 @@ Codex should default to these behaviors:
 - `namespace_flat_pub_use_redundant_leaf_context`
   Warning. Flags flattened public re-exports whose leaf still repeats the parent context. It does not flag family re-exports from private organizational child modules when flattening them is how the parent surface is intentionally shaped.
 - `api_missing_parent_surface_export`
-  Warning. Flags public child modules that expose a same-name main item such as `button::Button` without also re-exporting that item at the parent surface when that would produce the readable call-site path. It does not treat the crate root as automatically readable enough for domain items like `domain::User`.
+  Warning. Flags public child modules that expose a same-name main item such as `button::Button`, or a sole generic main item such as `toxicity::Outcome`, without also re-exporting the readable parent surface. It does not treat the crate root as automatically readable enough for domain items like `domain::User`.
 - `api_weak_module_generic_leaf`
   Warning. Flags paths such as `storage::Repository` where a weak technical module exposes a generic leaf.
 - `api_redundant_leaf_context`
   Warning. Flags paths such as `user::UserRepository` or `page::ErrorPage` where the leaf repeats the parent context, and also flags flat public leaves such as `UserRepository` when a sibling semantic module surface like `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when their shared head suggests a semantic module surface like `user::{Repository, Service, Id}`, but that module does not exist yet.
+  Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when their shared head suggests a semantic module surface like `user::{Repository, Service, Id}`, and also flags families such as `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome` when their shared generic tail suggests a semantic module surface like `outcome::{Completed, Rejected, Toxicity}`.
 - `api_redundant_category_suffix`
   Warning. Flags paths such as `user::error::InvalidEmailError` where the parent module already provides the category.
 - `api_catch_all_module`

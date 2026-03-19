@@ -20,6 +20,7 @@ const DEFAULT_GENERIC_NOUNS: &[&str] = &[
     "Command",
     "Request",
     "Response",
+    "Outcome",
 ];
 
 const DEFAULT_WEAK_MODULES: &[&str] = &[
@@ -828,6 +829,7 @@ mod tests {
         let settings = NamespaceSettings::default();
         assert!(settings.generic_nouns.contains("Repository"));
         assert!(settings.generic_nouns.contains("Id"));
+        assert!(settings.generic_nouns.contains("Outcome"));
         assert!(settings.weak_modules.contains("storage"));
         assert!(settings.catch_all_modules.contains("helpers"));
         assert!(settings.organizational_modules.contains("error"));
