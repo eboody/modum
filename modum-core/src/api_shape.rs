@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use syn::{
@@ -10,8 +10,9 @@ use syn::{
 };
 
 use super::{
-    Diagnostic, DiagnosticLevel, NamespaceSettings, is_public, normalize_segment, split_segments,
-    unraw_ident,
+    Diagnostic, NameStyle, NamespaceSettings, detect_name_style, inferred_file_module_path,
+    is_public, normalize_segment, parent_module_files, render_segments, source_root,
+    split_segments, unraw_ident,
 };
 
 pub(super) struct ApiShapeAnalysis {
@@ -49,13 +50,6 @@ struct ScopeSurfaceContext<'a> {
     suppressed_child_module_exports: &'a BTreeSet<String>,
 }
 
-#[derive(Clone, Copy)]
-enum NameStyle {
-    Pascal,
-    Snake,
-    ScreamingSnake,
-}
-
 pub(super) fn analyze_api_shape_rules(
     path: &Path,
     parsed: &File,
@@ -73,19 +67,13 @@ pub(super) fn analyze_api_shape_rules(
             .contains(&normalize_segment(module_name))
         && let Some(flatten_leaf) = organizational_flatten_candidate(Some(&parsed.items), settings)
     {
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Error,
-            file: Some(path.to_path_buf()),
-            line: Some(1),
-            code: Some("api_organizational_submodule_flatten".to_string()),
-            policy: true,
-            fix: None,
-            message: format!(
+        diagnostics.push(Diagnostic::policy_error(
+            Some(path.to_path_buf()),
+            Some(1),
+            "api_organizational_submodule_flatten",
+            format!(
                 "`{}` leaks organizational `{}` into the public API; prefer `{}` and keep `{}` private",
-                render_public_path(
-                    &inferred_module_path,
-                    &flatten_leaf
-                ),
+                render_public_path(&inferred_module_path, &flatten_leaf),
                 inferred_module_path.last().expect("non-empty inferred module path"),
                 render_preferred_public_path(
                     &inferred_module_path[..inferred_module_path.len() - 1],
@@ -94,7 +82,7 @@ pub(super) fn analyze_api_shape_rules(
                 ),
                 inferred_module_path.last().expect("non-empty inferred module path"),
             ),
-        });
+        ));
     }
 
     analyze_scope(
@@ -185,17 +173,14 @@ fn analyze_module_item(
 
     if module_is_public {
         if settings.catch_all_modules.contains(&normalized) {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Warning,
-                file: Some(path.to_path_buf()),
-                line: Some(line),
-                code: Some("api_catch_all_module".to_string()),
-                policy: true,
-                fix: None,
-                message: format!(
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(line),
+                "api_catch_all_module",
+                format!(
                     "`{module_name}` is a catch-all public module; prefer a stable domain or facet"
                 ),
-            });
+            ));
         }
 
         if settings.organizational_modules.contains(&normalized)
@@ -204,36 +189,30 @@ fn analyze_module_item(
                 settings,
             )
         {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                file: Some(path.to_path_buf()),
-                line: Some(line),
-                code: Some("api_organizational_submodule_flatten".to_string()),
-                policy: true,
-                fix: None,
-                message: format!(
+            diagnostics.push(Diagnostic::policy_error(
+                Some(path.to_path_buf()),
+                Some(line),
+                "api_organizational_submodule_flatten",
+                format!(
                     "`{}` leaks organizational `{module_name}` into the public API; prefer `{}` and keep `{module_name}` private",
                     render_public_path_with_module(module_path, &module_name, &flatten_leaf),
                     render_preferred_public_path(module_path, &flatten_leaf, settings)
                 ),
-            });
+            ));
         }
 
         if module_path
             .last()
             .is_some_and(|parent| normalize_segment(parent) == normalized)
         {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Warning,
-                file: Some(path.to_path_buf()),
-                line: Some(line),
-                code: Some("api_repeated_module_segment".to_string()),
-                policy: true,
-                fix: None,
-                message: format!(
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(line),
+                "api_repeated_module_segment",
+                format!(
                     "nested module path repeats `{module_name}`; flatten or rename the redundant segment"
                 ),
-            });
+            ));
         }
     }
 
@@ -256,14 +235,11 @@ fn analyze_module_item(
             .public_bindings
             .contains(&surface_export.parent_binding)
     {
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            file: Some(path.to_path_buf()),
-            line: Some(line),
-            code: Some("api_missing_parent_surface_export".to_string()),
-            policy: true,
-            fix: None,
-            message: format!(
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_missing_parent_surface_export",
+            format!(
                 "parent surface is missing `{}`; re-export it so callers do not have to use `{}`",
                 render_public_path(module_path, &surface_export.parent_binding),
                 render_public_path_with_module(
@@ -272,7 +248,7 @@ fn analyze_module_item(
                     &surface_export.child_leaf,
                 ),
             ),
-        });
+        ));
     }
 
     if let Some((_, nested)) = &item_mod.content {
@@ -350,14 +326,11 @@ fn analyze_public_use_item(
                 settings,
             )
         {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Warning,
-                file: Some(path.to_path_buf()),
-                line: Some(line),
-                code: Some("api_missing_parent_surface_export".to_string()),
-                policy: true,
-                fix: None,
-                message: format!(
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(line),
+                "api_missing_parent_surface_export",
+                format!(
                     "parent surface is missing `{}`; re-export it so callers do not have to use `{}`",
                     render_public_path(module_path, &surface_export.parent_binding),
                     render_public_path_with_module(
@@ -366,7 +339,7 @@ fn analyze_public_use_item(
                         &surface_export.child_leaf,
                     ),
                 ),
-            });
+            ));
         }
 
         analyze_public_leaf(
@@ -524,17 +497,14 @@ fn analyze_candidate_semantic_modules(
             .join(", ");
         let module_candidate = head.to_ascii_lowercase();
 
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            file: Some(path.to_path_buf()),
-            line: Some(line),
-            code: Some("api_candidate_semantic_module".to_string()),
-            policy: false,
-            fix: None,
-            message: format!(
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_candidate_semantic_module",
+            format!(
                 "public siblings {original_members} share the `{head}` head; consider a semantic `{module_candidate}::{{{suggested_members}}}` surface"
             ),
-        });
+        ));
     }
 
     for tail in public_bindings {
@@ -633,17 +603,14 @@ fn analyze_candidate_semantic_modules(
             .collect::<Vec<_>>()
             .join(", ");
 
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            file: Some(path.to_path_buf()),
-            line: Some(line),
-            code: Some("api_candidate_semantic_module".to_string()),
-            policy: false,
-            fix: None,
-            message: format!(
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_candidate_semantic_module",
+            format!(
                 "public siblings {original_members} share the generic `{tail}` tail; consider a semantic `{module_candidate}::{{{suggested_members}}}` surface"
             ),
-        });
+        ));
 
         for member in members {
             if let Some(module_name) = member.child_module_name {
@@ -932,18 +899,15 @@ fn analyze_public_leaf(
     if let Some(preferred_path) =
         semantic_module_surface_candidate(path, scope_items, module_path, leaf_name, settings)
     {
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            file: Some(path.to_path_buf()),
-            line: Some(line),
-            code: Some("api_redundant_leaf_context".to_string()),
-            policy: true,
-            fix: None,
-            message: format!(
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_redundant_leaf_context",
+            format!(
                 "public API already exposes `{preferred_path}`; prefer it over `{}`",
                 render_public_path(module_path, leaf_name),
             ),
-        });
+        ));
         return;
     }
 
@@ -955,35 +919,29 @@ fn analyze_public_leaf(
     if settings.weak_modules.contains(&parent_normalized)
         && settings.generic_nouns.contains(leaf_name)
     {
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            file: Some(path.to_path_buf()),
-            line: Some(line),
-            code: Some("api_weak_module_generic_leaf".to_string()),
-            policy: true,
-            fix: None,
-            message: format!(
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_weak_module_generic_leaf",
+            format!(
                 "`{}` is too generic for weak module `{parent_module}`; keep the domain in the leaf or choose a stronger module",
                 render_public_path(module_path, leaf_name),
             ),
-        });
+        ));
         return;
     }
 
     if let Some(shorter_leaf) = redundant_category_suffix_leaf(parent_module, leaf_name, settings) {
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            file: Some(path.to_path_buf()),
-            line: Some(line),
-            code: Some("api_redundant_category_suffix".to_string()),
-            policy: true,
-            fix: None,
-            message: format!(
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_redundant_category_suffix",
+            format!(
                 "`{}` repeats the `{parent_module}` category; prefer `{}`",
                 render_public_path(module_path, leaf_name),
                 render_preferred_public_path(module_path, &shorter_leaf, settings)
             ),
-        });
+        ));
         return;
     }
 
@@ -994,19 +952,16 @@ fn analyze_public_leaf(
     }
 
     if let Some(shorter_leaf) = redundant_leaf_context_candidate(parent_module, leaf_name) {
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            file: Some(path.to_path_buf()),
-            line: Some(line),
-            code: Some("api_redundant_leaf_context".to_string()),
-            policy: true,
-            fix: None,
-            message: format!(
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_redundant_leaf_context",
+            format!(
                 "`{}` repeats the `{parent_module}` context; prefer `{}`",
                 render_public_path(module_path, leaf_name),
                 render_preferred_public_path(module_path, &shorter_leaf, settings)
             ),
-        });
+        ));
     }
 }
 
@@ -1297,52 +1252,6 @@ fn redundant_leaf_context_candidate(parent_module: &str, leaf_name: &str) -> Opt
     None
 }
 
-fn detect_name_style(name: &str) -> NameStyle {
-    if name.contains('_') {
-        if name
-            .chars()
-            .filter(|ch| ch.is_ascii_alphabetic())
-            .all(|ch| ch.is_ascii_uppercase())
-        {
-            NameStyle::ScreamingSnake
-        } else {
-            NameStyle::Snake
-        }
-    } else {
-        NameStyle::Pascal
-    }
-}
-
-fn render_segments(segments: &[String], style: NameStyle) -> String {
-    match style {
-        NameStyle::Pascal => segments
-            .iter()
-            .map(|segment| {
-                let lower = segment.to_ascii_lowercase();
-                let mut chars = lower.chars();
-                let Some(first) = chars.next() else {
-                    return String::new();
-                };
-                let mut rendered = String::new();
-                rendered.push(first.to_ascii_uppercase());
-                rendered.extend(chars);
-                rendered
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        NameStyle::Snake => segments
-            .iter()
-            .map(|segment| segment.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join("_"),
-        NameStyle::ScreamingSnake => segments
-            .iter()
-            .map(|segment| segment.to_ascii_uppercase())
-            .collect::<Vec<_>>()
-            .join("_"),
-    }
-}
-
 fn render_public_path(module_path: &[String], leaf_name: &str) -> String {
     if module_path.is_empty() {
         leaf_name.to_string()
@@ -1396,42 +1305,6 @@ fn flatten_public_use_tree(prefix: Vec<String>, tree: &UseTree, leaves: &mut Vec
     }
 }
 
-fn inferred_file_module_path(path: &Path) -> Vec<String> {
-    let components = path
-        .iter()
-        .map(|component| component.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
-    let rel = if let Some(src_idx) = components.iter().rposition(|component| component == "src") {
-        &components[src_idx + 1..]
-    } else {
-        &components[..]
-    };
-
-    if rel.is_empty() || rel.first().is_some_and(|component| component == "bin") {
-        return Vec::new();
-    }
-
-    let mut module_path = Vec::new();
-    for (idx, component) in rel.iter().enumerate() {
-        let is_last = idx + 1 == rel.len();
-        if is_last {
-            match component.as_str() {
-                "lib.rs" | "main.rs" | "mod.rs" => {}
-                other => {
-                    if let Some(stem) = other.strip_suffix(".rs") {
-                        module_path.push(stem.to_string());
-                    }
-                }
-            }
-            continue;
-        }
-
-        module_path.push(component.to_string());
-    }
-
-    module_path
-}
-
 fn inferred_module_is_public(path: &Path, module_path: &[String]) -> bool {
     let Some(src_root) = source_root(path) else {
         return false;
@@ -1460,30 +1333,6 @@ fn inferred_module_is_public(path: &Path, module_path: &[String]) -> bool {
 
     true
 }
-
-fn source_root(path: &Path) -> Option<PathBuf> {
-    let mut root = PathBuf::new();
-    for component in path.components() {
-        root.push(component.as_os_str());
-        if component.as_os_str() == "src" {
-            return Some(root);
-        }
-    }
-    None
-}
-
-fn parent_module_files(src_root: &Path, prefix: &[String]) -> Vec<PathBuf> {
-    if prefix.is_empty() {
-        return vec![src_root.join("lib.rs"), src_root.join("main.rs")];
-    }
-
-    let joined = prefix.join("/");
-    vec![
-        src_root.join(format!("{joined}.rs")),
-        src_root.join(joined).join("mod.rs"),
-    ]
-}
-
 fn module_decl_visibility(file: &Path, segment: &str) -> Option<bool> {
     let src = fs::read_to_string(file).ok()?;
     let parsed = syn::parse_file(&src).ok()?;

@@ -10,7 +10,13 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 mod api_shape;
+mod diagnostic;
 mod namespace;
+
+pub use diagnostic::{
+    Diagnostic, DiagnosticClass, DiagnosticFix, DiagnosticFixKind, DiagnosticLevel,
+    DiagnosticSelection,
+};
 
 const DEFAULT_GENERIC_NOUNS: &[&str] = &[
     "Id",
@@ -55,39 +61,12 @@ const DEFAULT_NAMESPACE_PRESERVING_MODULES: &[&str] = &[
     "query",
     "repo",
     "store",
+    "trace",
     "storage",
     "transport",
     "infra",
+    "write_back",
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub enum DiagnosticLevel {
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiagnosticFixKind {
-    ReplacePath,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct DiagnosticFix {
-    pub kind: DiagnosticFixKind,
-    pub replacement: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct Diagnostic {
-    pub level: DiagnosticLevel,
-    pub file: Option<PathBuf>,
-    pub line: Option<usize>,
-    pub code: Option<String>,
-    pub policy: bool,
-    pub fix: Option<DiagnosticFix>,
-    pub message: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalysisResult {
@@ -113,47 +92,43 @@ impl WorkspaceReport {
     pub fn error_count(&self) -> usize {
         self.diagnostics
             .iter()
-            .filter(|diag| diag.level == DiagnosticLevel::Error)
+            .filter(|diag| diag.is_error())
             .count()
     }
 
     pub fn warning_count(&self) -> usize {
         self.diagnostics
             .iter()
-            .filter(|diag| diag.level == DiagnosticLevel::Warning)
+            .filter(|diag| !diag.is_error())
             .count()
     }
 
     pub fn policy_warning_count(&self) -> usize {
         self.diagnostics
             .iter()
-            .filter(|diag| diag.level == DiagnosticLevel::Warning && diag.policy)
+            .filter(|diag| diag.is_policy_warning())
             .count()
     }
 
     pub fn advisory_warning_count(&self) -> usize {
         self.diagnostics
             .iter()
-            .filter(|diag| diag.level == DiagnosticLevel::Warning && !diag.policy)
+            .filter(|diag| diag.is_advisory_warning())
             .count()
     }
 
     pub fn policy_violation_count(&self) -> usize {
-        self.diagnostics.iter().filter(|diag| diag.policy).count()
+        self.diagnostics
+            .iter()
+            .filter(|diag| diag.is_policy_violation())
+            .count()
     }
 
     pub fn filtered(&self, selection: DiagnosticSelection) -> Self {
         let diagnostics = self
             .diagnostics
             .iter()
-            .filter(|diag| match selection {
-                DiagnosticSelection::All => true,
-                DiagnosticSelection::Policy => diag.level == DiagnosticLevel::Error || diag.policy,
-                DiagnosticSelection::Advisory => {
-                    diag.level == DiagnosticLevel::Error
-                        || (diag.level == DiagnosticLevel::Warning && !diag.policy)
-                }
-            })
+            .filter(|diag| selection.includes(diag))
             .cloned()
             .collect::<Vec<_>>();
         let files_with_violations = diagnostics
@@ -179,6 +154,14 @@ pub enum CheckMode {
 
 impl CheckMode {
     pub fn parse(raw: &str) -> Result<Self, String> {
+        raw.parse()
+    }
+}
+
+impl std::str::FromStr for CheckMode {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
             "off" => Ok(Self::Off),
             "warn" => Ok(Self::Warn),
@@ -192,13 +175,6 @@ impl CheckMode {
 pub struct CheckOutcome {
     pub report: WorkspaceReport,
     pub exit_code: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagnosticSelection {
-    All,
-    Policy,
-    Advisory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -304,15 +280,11 @@ fn analyze_file_with_settings(
         Ok(file) => file,
         Err(err) => {
             return AnalysisResult {
-                diagnostics: vec![Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    file: Some(path.to_path_buf()),
-                    line: None,
-                    code: None,
-                    policy: false,
-                    fix: None,
-                    message: format!("failed to parse rust file: {err}"),
-                }],
+                diagnostics: vec![Diagnostic::error(
+                    Some(path.to_path_buf()),
+                    None,
+                    format!("failed to parse rust file: {err}"),
+                )],
             };
         }
     };
@@ -353,15 +325,11 @@ pub fn analyze_workspace_with_scan_settings(
     ) {
         Ok(files) => files,
         Err(err) => {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                file: None,
-                line: None,
-                code: None,
-                policy: false,
-                fix: None,
-                message: format!("failed to discover rust files: {err}"),
-            });
+            diagnostics.push(Diagnostic::error(
+                None,
+                None,
+                format!("failed to discover rust files: {err}"),
+            ));
             return WorkspaceReport {
                 scanned_files: 0,
                 files_with_violations: 0,
@@ -371,17 +339,11 @@ pub fn analyze_workspace_with_scan_settings(
     };
 
     if rust_files.is_empty() {
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            file: None,
-            line: None,
-            code: None,
-            policy: false,
-            fix: None,
-            message:
-                "no Rust files were discovered; pass --include <path>... or run from a crate/workspace root"
-                    .to_string(),
-        });
+        diagnostics.push(Diagnostic::warning(
+            None,
+            None,
+            "no Rust files were discovered; pass --include <path>... or run from a crate/workspace root",
+        ));
     }
 
     let mut files_with_violations = BTreeSet::new();
@@ -391,15 +353,11 @@ pub fn analyze_workspace_with_scan_settings(
         let src = match fs::read_to_string(file) {
             Ok(src) => src,
             Err(err) => {
-                diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    file: Some(file.clone()),
-                    line: None,
-                    code: None,
-                    policy: false,
-                    fix: None,
-                    message: format!("failed to read file: {err}"),
-                });
+                diagnostics.push(Diagnostic::error(
+                    Some(file.clone()),
+                    None,
+                    format!("failed to read file: {err}"),
+                ));
                 continue;
             }
         };
@@ -444,15 +402,11 @@ fn load_workspace_settings(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Na
     let manifest: toml::Value = match toml::from_str(&manifest_src) {
         Ok(manifest) => manifest,
         Err(err) => {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                file: Some(manifest_path),
-                line: None,
-                code: None,
-                policy: false,
-                fix: None,
-                message: format!("failed to parse Cargo.toml for modum settings: {err}"),
-            });
+            diagnostics.push(Diagnostic::error(
+                Some(manifest_path),
+                None,
+                format!("failed to parse Cargo.toml for modum settings: {err}"),
+            ));
             return NamespaceSettings::default();
         }
     };
@@ -479,15 +433,11 @@ fn load_repo_scan_settings(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Sc
     let manifest: toml::Value = match toml::from_str(&manifest_src) {
         Ok(manifest) => manifest,
         Err(err) => {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                file: Some(manifest_path),
-                line: None,
-                code: None,
-                policy: false,
-                fix: None,
-                message: format!("failed to parse Cargo.toml for modum settings: {err}"),
-            });
+            diagnostics.push(Diagnostic::error(
+                Some(manifest_path),
+                None,
+                format!("failed to parse Cargo.toml for modum settings: {err}"),
+            ));
             return ScanSettings::default();
         }
     };
@@ -615,15 +565,11 @@ fn parse_string_set_field(
 ) -> Option<BTreeSet<String>> {
     let value = table.get(key)?;
     let Some(array) = value.as_array() else {
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Error,
-            file: Some(manifest_path.to_path_buf()),
-            line: None,
-            code: None,
-            policy: false,
-            fix: None,
-            message: format!("`metadata.modum.{key}` must be an array of strings"),
-        });
+        diagnostics.push(Diagnostic::error(
+            Some(manifest_path.to_path_buf()),
+            None,
+            format!("`metadata.modum.{key}` must be an array of strings"),
+        ));
         return None;
     };
 
@@ -644,15 +590,11 @@ fn parse_string_list_field(
 ) -> Option<Vec<String>> {
     let value = table.get(key)?;
     let Some(array) = value.as_array() else {
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Error,
-            file: Some(manifest_path.to_path_buf()),
-            line: None,
-            code: None,
-            policy: false,
-            fix: None,
-            message: format!("`metadata.modum.{key}` must be an array of strings"),
-        });
+        diagnostics.push(Diagnostic::error(
+            Some(manifest_path.to_path_buf()),
+            None,
+            format!("`metadata.modum.{key}` must be an array of strings"),
+        ));
         return None;
     };
 
@@ -707,12 +649,7 @@ pub fn render_pretty_report_with_selection(
         filtered.policy_warning_count(),
         filtered.advisory_warning_count()
     );
-    if selection != DiagnosticSelection::All {
-        let selection_label = match selection {
-            DiagnosticSelection::All => "all diagnostics",
-            DiagnosticSelection::Policy => "policy diagnostics and errors only",
-            DiagnosticSelection::Advisory => "advisory diagnostics and errors only",
-        };
+    if let Some(selection_label) = selection.report_label() {
         let _ = writeln!(
             &mut out,
             "showing: {selection_label} (exit code still reflects the full report)"
@@ -738,10 +675,7 @@ pub fn render_pretty_report_with_selection(
         render_diagnostic_section(
             &mut out,
             "Errors:",
-            filtered
-                .diagnostics
-                .iter()
-                .filter(|diag| diag.level == DiagnosticLevel::Error),
+            filtered.diagnostics.iter().filter(|diag| diag.is_error()),
         );
         render_diagnostic_section(
             &mut out,
@@ -749,7 +683,7 @@ pub fn render_pretty_report_with_selection(
             filtered
                 .diagnostics
                 .iter()
-                .filter(|diag| diag.level == DiagnosticLevel::Warning && diag.policy),
+                .filter(|diag| diag.is_policy_warning()),
         );
         render_diagnostic_section(
             &mut out,
@@ -757,7 +691,7 @@ pub fn render_pretty_report_with_selection(
             filtered
                 .diagnostics
                 .iter()
-                .filter(|diag| diag.level == DiagnosticLevel::Warning && !diag.policy),
+                .filter(|diag| diag.is_advisory_warning()),
         );
     }
 
@@ -776,13 +710,12 @@ fn render_diagnostic_section<'a>(
 
     let _ = writeln!(out, "{title}");
     for diag in diagnostics {
-        let level = match diag.level {
+        let level = match diag.level() {
             DiagnosticLevel::Warning => "warning",
             DiagnosticLevel::Error => "error",
         };
         let code = diag
-            .code
-            .as_deref()
+            .code()
             .map(|code| format!(" ({code})"))
             .unwrap_or_default();
         match (&diag.file, diag.line) {
@@ -1100,6 +1033,118 @@ pub(crate) fn normalize_segment(segment: &str) -> String {
     segment.to_ascii_lowercase()
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum NameStyle {
+    Pascal,
+    Snake,
+    ScreamingSnake,
+}
+
+pub(crate) fn detect_name_style(name: &str) -> NameStyle {
+    if name.contains('_') {
+        if name
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic())
+            .all(|ch| ch.is_ascii_uppercase())
+        {
+            NameStyle::ScreamingSnake
+        } else {
+            NameStyle::Snake
+        }
+    } else {
+        NameStyle::Pascal
+    }
+}
+
+pub(crate) fn render_segments(segments: &[String], style: NameStyle) -> String {
+    match style {
+        NameStyle::Pascal => segments
+            .iter()
+            .map(|segment| {
+                let lower = segment.to_ascii_lowercase();
+                let mut chars = lower.chars();
+                let Some(first) = chars.next() else {
+                    return String::new();
+                };
+                let mut rendered = String::new();
+                rendered.push(first.to_ascii_uppercase());
+                rendered.extend(chars);
+                rendered
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        NameStyle::Snake => segments
+            .iter()
+            .map(|segment| segment.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("_"),
+        NameStyle::ScreamingSnake => segments
+            .iter()
+            .map(|segment| segment.to_ascii_uppercase())
+            .collect::<Vec<_>>()
+            .join("_"),
+    }
+}
+
+pub(crate) fn inferred_file_module_path(path: &Path) -> Vec<String> {
+    let components = path
+        .iter()
+        .map(|component| component.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let rel = if let Some(src_idx) = components.iter().rposition(|component| component == "src") {
+        &components[src_idx + 1..]
+    } else {
+        &components[..]
+    };
+
+    if rel.is_empty() || rel.first().is_some_and(|component| component == "bin") {
+        return Vec::new();
+    }
+
+    let mut module_path = Vec::new();
+    for (idx, component) in rel.iter().enumerate() {
+        let is_last = idx + 1 == rel.len();
+        if is_last {
+            match component.as_str() {
+                "lib.rs" | "main.rs" | "mod.rs" => {}
+                other => {
+                    if let Some(stem) = other.strip_suffix(".rs") {
+                        module_path.push(stem.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+
+        module_path.push(component.to_string());
+    }
+
+    module_path
+}
+
+pub(crate) fn source_root(path: &Path) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        root.push(component.as_os_str());
+        if component.as_os_str() == "src" {
+            return Some(root);
+        }
+    }
+    None
+}
+
+pub(crate) fn parent_module_files(src_root: &Path, prefix: &[String]) -> Vec<PathBuf> {
+    if prefix.is_empty() {
+        return vec![src_root.join("lib.rs"), src_root.join("main.rs")];
+    }
+
+    let joined = prefix.join("/");
+    vec![
+        src_root.join(format!("{joined}.rs")),
+        src_root.join(joined).join("mod.rs"),
+    ]
+}
+
 pub(crate) fn replace_path_fix(replacement: impl Into<String>) -> DiagnosticFix {
     DiagnosticFix {
         kind: DiagnosticFixKind::ReplacePath,
@@ -1110,8 +1155,8 @@ pub(crate) fn replace_path_fix(replacement: impl Into<String>) -> DiagnosticFix 
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckMode, Diagnostic, DiagnosticLevel, DiagnosticSelection, NamespaceSettings,
-        WorkspaceReport, check_exit_code, parse_check_mode, split_segments,
+        CheckMode, Diagnostic, DiagnosticSelection, NamespaceSettings, WorkspaceReport,
+        check_exit_code, parse_check_mode, split_segments,
     };
 
     #[test]
@@ -1130,9 +1175,38 @@ mod tests {
     }
 
     #[test]
+    fn check_mode_supports_standard_parsing() {
+        assert_eq!("off".parse::<CheckMode>(), Ok(CheckMode::Off));
+        assert_eq!("warn".parse::<CheckMode>(), Ok(CheckMode::Warn));
+        assert_eq!("deny".parse::<CheckMode>(), Ok(CheckMode::Deny));
+    }
+
+    #[test]
     fn rejects_invalid_check_mode() {
         let err = parse_check_mode("strict").unwrap_err();
         assert!(err.contains("expected off|warn|deny"));
+    }
+
+    #[test]
+    fn diagnostic_selection_supports_standard_parsing() {
+        assert_eq!(
+            "all".parse::<DiagnosticSelection>(),
+            Ok(DiagnosticSelection::All)
+        );
+        assert_eq!(
+            "policy".parse::<DiagnosticSelection>(),
+            Ok(DiagnosticSelection::Policy)
+        );
+        assert_eq!(
+            "advisory".parse::<DiagnosticSelection>(),
+            Ok(DiagnosticSelection::Advisory)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_diagnostic_selection() {
+        let err = "warnings".parse::<DiagnosticSelection>().unwrap_err();
+        assert!(err.contains("expected all|policy|advisory"));
     }
 
     #[test]
@@ -1148,15 +1222,7 @@ mod tests {
         let with_policy = WorkspaceReport {
             scanned_files: 1,
             files_with_violations: 1,
-            diagnostics: vec![Diagnostic {
-                level: DiagnosticLevel::Warning,
-                file: None,
-                line: None,
-                code: Some("lint".to_string()),
-                policy: true,
-                fix: None,
-                message: "warning".to_string(),
-            }],
+            diagnostics: vec![Diagnostic::policy(None, None, "lint", "warning")],
         };
         assert_eq!(check_exit_code(&with_policy, CheckMode::Warn), 0);
         assert_eq!(check_exit_code(&with_policy, CheckMode::Deny), 2);
@@ -1164,15 +1230,7 @@ mod tests {
         let with_error = WorkspaceReport {
             scanned_files: 1,
             files_with_violations: 1,
-            diagnostics: vec![Diagnostic {
-                level: DiagnosticLevel::Error,
-                file: None,
-                line: None,
-                code: None,
-                policy: false,
-                fix: None,
-                message: "error".to_string(),
-            }],
+            diagnostics: vec![Diagnostic::error(None, None, "error")],
         };
         assert_eq!(check_exit_code(&with_error, CheckMode::Warn), 1);
         assert_eq!(check_exit_code(&with_error, CheckMode::Deny), 1);
@@ -1192,6 +1250,8 @@ mod tests {
         assert!(settings.namespace_preserving_modules.contains("email"));
         assert!(settings.namespace_preserving_modules.contains("components"));
         assert!(settings.namespace_preserving_modules.contains("partials"));
+        assert!(settings.namespace_preserving_modules.contains("trace"));
+        assert!(settings.namespace_preserving_modules.contains("write_back"));
         assert!(!settings.namespace_preserving_modules.contains("views"));
         assert!(!settings.namespace_preserving_modules.contains("handlers"));
     }
@@ -1202,33 +1262,14 @@ mod tests {
             scanned_files: 2,
             files_with_violations: 2,
             diagnostics: vec![
-                Diagnostic {
-                    level: DiagnosticLevel::Warning,
-                    file: Some("src/policy.rs".into()),
-                    line: Some(1),
-                    code: Some("policy".to_string()),
-                    policy: true,
-                    fix: None,
-                    message: "policy".to_string(),
-                },
-                Diagnostic {
-                    level: DiagnosticLevel::Warning,
-                    file: Some("src/advisory.rs".into()),
-                    line: Some(2),
-                    code: Some("advisory".to_string()),
-                    policy: false,
-                    fix: None,
-                    message: "advisory".to_string(),
-                },
-                Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    file: Some("src/error.rs".into()),
-                    line: Some(3),
-                    code: None,
-                    policy: false,
-                    fix: None,
-                    message: "error".to_string(),
-                },
+                Diagnostic::policy(Some("src/policy.rs".into()), Some(1), "policy", "policy"),
+                Diagnostic::advisory(
+                    Some("src/advisory.rs".into()),
+                    Some(2),
+                    "advisory",
+                    "advisory",
+                ),
+                Diagnostic::error(Some("src/error.rs".into()), Some(3), "error"),
             ],
         };
 

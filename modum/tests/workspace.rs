@@ -46,9 +46,9 @@ mod app {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.level == DiagnosticLevel::Warning
-            && diag.policy
-            && diag.code.as_deref() == Some("namespace_flat_use")
+        diag.level() == DiagnosticLevel::Warning
+            && diag.is_policy_violation()
+            && diag.code() == Some("namespace_flat_use")
     }));
 }
 
@@ -76,8 +76,7 @@ pub fn load(repo: Repository) -> Repository {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_use")
-            && diag.message.contains("storage::Repository")
+        diag.code() == Some("namespace_flat_use") && diag.message.contains("storage::Repository")
     }));
 }
 
@@ -105,9 +104,138 @@ pub fn connect(client: Client) -> Client {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_use_preserve_module")
+        diag.code() == Some("namespace_flat_use_preserve_module")
             && diag.message.contains("http::Client")
     }));
+}
+
+#[test]
+fn analyze_workspace_prefers_trace_namespace_for_shortened_entry_leaf() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use trace::TraceEntry;
+
+pub mod trace {
+    pub struct TraceEntry;
+}
+
+pub fn keep(entry: TraceEntry) -> TraceEntry {
+    entry
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use_redundant_leaf_context")
+            && diag.message.contains("trace::Entry")
+    }));
+}
+
+#[test]
+fn analyze_workspace_prefers_write_back_namespace_for_shortened_submission_leaf() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use write_back::WriteBackSubmission;
+
+pub mod write_back {
+    pub struct WriteBackSubmission;
+}
+
+pub fn keep(submission: WriteBackSubmission) -> WriteBackSubmission {
+    submission
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use_redundant_leaf_context")
+            && diag.message.contains("write_back::Submission")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_flattened_namespace_alias_paths() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use domain::write_back as write_back_domain;
+
+pub mod domain {
+    pub mod write_back {
+        pub enum Submission {
+            Accepted,
+            Rejected,
+        }
+    }
+}
+
+pub fn keep(submission: write_back_domain::Submission) -> write_back_domain::Submission {
+    match submission {
+        write_back_domain::Submission::Accepted => write_back_domain::Submission::Rejected,
+        write_back_domain::Submission::Rejected => write_back_domain::Submission::Accepted,
+    }
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_aliased_qualified_path")
+            && diag.message.contains("write_back_domain::Submission")
+            && diag.message.contains("domain::write_back::Submission")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_non_flattening_namespace_alias_paths() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use domain::write_back as outbound;
+
+pub mod domain {
+    pub mod write_back {
+        pub struct Submission;
+    }
+}
+
+pub fn keep(submission: outbound::Submission) -> outbound::Submission {
+    submission
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("namespace_aliased_qualified_path") })
+    );
 }
 
 #[test]
@@ -136,7 +264,7 @@ pub fn render(nav: NavBar) -> NavBar {
 
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_use_preserve_module")
+        diag.code() == Some("namespace_flat_use_preserve_module")
             && diag.message.contains("components::NavBar")
     }));
 }
@@ -186,7 +314,7 @@ pub fn render(props: tab_set::ContentProps) -> tab_set::Component {
 
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_use_preserve_module")
+        diag.code() == Some("namespace_flat_use_preserve_module")
             && diag.message.contains("components::tab_set")
     }));
 }
@@ -227,7 +355,7 @@ pub type Result<T> = core::result::Result<T, Error>;
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
         matches!(
-            diag.code.as_deref(),
+            diag.code(),
             Some("namespace_flat_pub_use" | "namespace_flat_pub_use_preserve_module")
         )
     }));
@@ -251,7 +379,7 @@ fn analyze_workspace_allows_canonical_parent_surface_public_reexports_from_inter
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
         matches!(
-            diag.code.as_deref(),
+            diag.code(),
             Some("namespace_flat_pub_use" | "namespace_flat_pub_use_preserve_module")
         )
     }));
@@ -281,7 +409,7 @@ pub use auth::{login, login_form};
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_pub_use_preserve_module")
+        diag.code() == Some("namespace_flat_pub_use_preserve_module")
             && diag.message.contains("auth::login")
     }));
 }
@@ -306,7 +434,7 @@ pub use message::MessageBody;
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_pub_use_redundant_leaf_context")
+        diag.code() == Some("namespace_flat_pub_use_redundant_leaf_context")
             && diag.message.contains("message::Body")
     }));
 }
@@ -335,7 +463,7 @@ pub use auth_shell::{AuthShell, AuthShellVariant};
 
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_pub_use_redundant_leaf_context")
+        diag.code() == Some("namespace_flat_pub_use_redundant_leaf_context")
             && diag.message.contains("auth_shell::Variant")
     }));
 }
@@ -364,7 +492,7 @@ pub use components::{Button, SectionHeader};
 
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_pub_use_preserve_module")
+        diag.code() == Some("namespace_flat_pub_use_preserve_module")
             && diag.message.contains("components::SectionHeader")
     }));
 }
@@ -403,7 +531,7 @@ pub use section_header::SectionHeader;
     let report = analyze_workspace(root, &[]);
     let alias_file = root.join("src/layout/section_header.rs");
     assert!(!report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_pub_use_preserve_module")
+        diag.code() == Some("namespace_flat_pub_use_preserve_module")
             && diag.file.as_deref() == Some(alias_file.as_path())
     }));
 }
@@ -424,7 +552,7 @@ fn analyze_workspace_flags_missing_parent_surface_export_for_public_child_module
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+        diag.code() == Some("api_missing_parent_surface_export")
             && diag.message.contains("components::Button")
             && diag.message.contains("components::button::Button")
     }));
@@ -446,7 +574,7 @@ fn analyze_workspace_flags_missing_parent_surface_export_for_generic_child_main_
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+        diag.code() == Some("api_missing_parent_surface_export")
             && diag.message.contains("outcome::Toxicity")
             && diag.message.contains("outcome::toxicity::Outcome")
     }));
@@ -482,8 +610,8 @@ pub enum Outcome {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_candidate_semantic_module")
-            && !diag.policy
+        diag.code() == Some("api_candidate_semantic_module")
+            && !diag.is_policy_violation()
             && diag.message.contains("CompletedOutcome")
             && diag.message.contains("RejectedOutcome")
             && diag.message.contains("toxicity::Outcome")
@@ -492,7 +620,7 @@ pub enum Outcome {
                 .contains("outcome::{Completed, Rejected, Toxicity}")
     }));
     assert!(!report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+        diag.code() == Some("api_missing_parent_surface_export")
             && diag.message.contains("terminal::Toxicity")
     }));
 }
@@ -514,7 +642,7 @@ fn analyze_workspace_does_not_flag_missing_parent_surface_export_for_generic_chi
 
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+        diag.code() == Some("api_missing_parent_surface_export")
             && diag.message.contains("outcome::Toxicity")
     }));
 }
@@ -530,7 +658,7 @@ fn analyze_workspace_does_not_flag_missing_parent_surface_export_at_weak_crate_r
 
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_missing_parent_surface_export")
+        diag.code() == Some("api_missing_parent_surface_export")
             && diag.message.contains("user::User")
     }));
 }
@@ -558,7 +686,7 @@ fn analyze_workspace_does_not_flag_missing_parent_surface_export_when_parent_alr
         !report
             .diagnostics
             .iter()
-            .any(|diag| { diag.code.as_deref() == Some("api_missing_parent_surface_export") })
+            .any(|diag| { diag.code() == Some("api_missing_parent_surface_export") })
     );
 }
 
@@ -582,7 +710,7 @@ pub fn keep(event: PageEvent) -> PageEvent {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
+        diag.code() == Some("namespace_flat_use_redundant_leaf_context")
             && diag.message.contains("page::Event")
     }));
 }
@@ -609,7 +737,7 @@ mod tests {
         !report
             .diagnostics
             .iter()
-            .any(|diag| { diag.code.as_deref() == Some("namespace_flat_use_preserve_module") })
+            .any(|diag| { diag.code() == Some("namespace_flat_use_preserve_module") })
     );
 }
 
@@ -643,7 +771,7 @@ pub fn keep(value: Response) -> Response {
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
         matches!(
-            diag.code.as_deref(),
+            diag.code(),
             Some("namespace_flat_use") | Some("namespace_flat_use_preserve_module")
         )
     }));
@@ -670,7 +798,7 @@ pub fn source(error: &dyn Error) -> &(dyn Error + '_) {
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
         matches!(
-            diag.code.as_deref(),
+            diag.code(),
             Some("namespace_flat_use") | Some("namespace_flat_use_preserve_module")
         )
     }));
@@ -702,8 +830,7 @@ pub fn keep(error: Error) -> Error {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_parent_surface")
-            && diag.message.contains("crate::Error")
+        diag.code() == Some("namespace_parent_surface") && diag.message.contains("crate::Error")
     }));
 }
 
@@ -743,8 +870,7 @@ pub fn keep<T>(value: Result<T>) -> Result<T> {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_parent_surface")
-            && diag.message.contains("user::Result")
+        diag.code() == Some("namespace_parent_surface") && diag.message.contains("user::Result")
     }));
 }
 
@@ -785,7 +911,7 @@ pub fn keep<T>(value: Result<T>) -> Result<T> {
         !report
             .diagnostics
             .iter()
-            .any(|diag| { diag.code.as_deref() == Some("namespace_parent_surface") })
+            .any(|diag| { diag.code() == Some("namespace_parent_surface") })
     );
 }
 
@@ -812,7 +938,7 @@ mod parent {
     let report = analyze_workspace(root, &[]);
     assert!(!report.diagnostics.iter().any(|diag| {
         matches!(
-            diag.code.as_deref(),
+            diag.code(),
             Some("namespace_flat_use") | Some("namespace_flat_use_redundant_leaf_context")
         )
     }));
@@ -844,9 +970,10 @@ pub fn sample() {
 
     let report = analyze_workspace(root, &[]);
     assert!(
-        !report.diagnostics.iter().any(|diag| {
-            diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
-        })
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("namespace_flat_use_redundant_leaf_context") })
     );
 }
 
@@ -872,7 +999,7 @@ pub fn keep(value: response::Response) -> response::Response {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_redundant_qualified_generic")
+        diag.code() == Some("namespace_redundant_qualified_generic")
             && diag.message.contains("response::Response")
             && diag.message.contains("prefer `Response`")
     }));
@@ -900,7 +1027,7 @@ pub fn keep(value: crate::error::Error) -> crate::error::Error {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_redundant_qualified_generic")
+        diag.code() == Some("namespace_redundant_qualified_generic")
             && diag.message.contains("crate::error::Error")
             && diag.message.contains("prefer `crate::Error`")
     }));
@@ -935,7 +1062,7 @@ pub fn keep(status: http::StatusCode, url: url::Url) -> (http::StatusCode, url::
         !report
             .diagnostics
             .iter()
-            .any(|diag| { diag.code.as_deref() == Some("namespace_redundant_qualified_generic") })
+            .any(|diag| { diag.code() == Some("namespace_redundant_qualified_generic") })
     );
 }
 
@@ -957,9 +1084,10 @@ pub fn keep(_input: ParseStream<'_>) {}
 
     let report = analyze_workspace(root, &[]);
     assert!(
-        !report.diagnostics.iter().any(|diag| {
-            diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
-        })
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("namespace_flat_use_redundant_leaf_context") })
     );
 }
 
@@ -981,9 +1109,10 @@ pub fn keep(_path: SynPath) {}
 
     let report = analyze_workspace(root, &[]);
     assert!(
-        !report.diagnostics.iter().any(|diag| {
-            diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
-        })
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("namespace_flat_use_redundant_leaf_context") })
     );
 }
 
@@ -1007,7 +1136,7 @@ pub fn keep(code: HttpStatusCode) -> HttpStatusCode {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
+        diag.code() == Some("namespace_flat_use_redundant_leaf_context")
             && diag.message.contains("http::StatusCode")
     }));
 }
@@ -1036,7 +1165,7 @@ pub fn load(repo: UserRepository) -> UserRepository {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
+        diag.code() == Some("namespace_flat_use_redundant_leaf_context")
             && diag.message.contains("user::Repository")
     }));
 }
@@ -1067,7 +1196,7 @@ mod message {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("namespace_flat_use_redundant_leaf_context")
+        diag.code() == Some("namespace_flat_use_redundant_leaf_context")
             && diag.message.contains("room::Id")
     }));
 }
@@ -1089,7 +1218,7 @@ pub struct UserRepository;
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_redundant_leaf_context")
+        diag.code() == Some("api_redundant_leaf_context")
             && diag.message.contains("user::Repository")
     }));
 }
@@ -1105,7 +1234,7 @@ fn analyze_workspace_flags_public_root_generic_response_module_as_error() {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_organizational_submodule_flatten")
+        diag.code() == Some("api_organizational_submodule_flatten")
             && diag.message.contains("response::Response")
             && diag.message.contains("prefer `Response`")
     }));
@@ -1123,7 +1252,7 @@ fn analyze_workspace_flags_nested_generic_response_module_with_final_parent_surf
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_organizational_submodule_flatten")
+        diag.code() == Some("api_organizational_submodule_flatten")
             && diag.message.contains("auth::response::Response")
             && diag.message.contains("prefer `auth::Response`")
     }));
@@ -1146,7 +1275,7 @@ pub struct ResponseResponse;
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_redundant_category_suffix")
+        diag.code() == Some("api_redundant_category_suffix")
             && diag.message.contains("ResponseResponse")
             && diag.message.contains("prefer `Response`")
             && !diag.message.contains("prefer `response::Response`")
@@ -1178,7 +1307,7 @@ pub struct Repository;
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_redundant_leaf_context")
+        diag.code() == Some("api_redundant_leaf_context")
             && diag.message.contains("user::Repository")
             && diag.message.contains("UserRepository")
     }));
@@ -1215,7 +1344,7 @@ pub struct Repository;
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_redundant_leaf_context")
+        diag.code() == Some("api_redundant_leaf_context")
             && diag.message.contains("user::Repository")
             && diag.message.contains("UserRepository")
     }));
@@ -1246,7 +1375,7 @@ pub struct Completed;
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_redundant_leaf_context")
+        diag.code() == Some("api_redundant_leaf_context")
             && diag.message.contains("outcome::Completed")
             && diag.message.contains("CompletedOutcome")
     }));
@@ -1270,8 +1399,8 @@ pub struct UserId;
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_candidate_semantic_module")
-            && !diag.policy
+        diag.code() == Some("api_candidate_semantic_module")
+            && !diag.is_policy_violation()
             && diag.message.contains("UserRepository")
             && diag.message.contains("UserService")
             && diag.message.contains("UserId")
@@ -1309,7 +1438,7 @@ pub struct Id;
         !report
             .diagnostics
             .iter()
-            .any(|diag| { diag.code.as_deref() == Some("api_candidate_semantic_module") })
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
     );
 }
 
@@ -1330,7 +1459,7 @@ pub struct Repository;
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_weak_module_generic_leaf")
+        diag.code() == Some("api_weak_module_generic_leaf")
             && diag.message.contains("weak module `storage`")
     }));
 }
@@ -1355,7 +1484,7 @@ pub mod user {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_redundant_category_suffix")
+        diag.code() == Some("api_redundant_category_suffix")
             && diag.message.contains("user::error::InvalidEmail")
     }));
 }
@@ -1378,7 +1507,7 @@ pub mod helpers {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_catch_all_module")
+        diag.code() == Some("api_catch_all_module")
             && diag.message.contains("catch-all public module")
     }));
 }
@@ -1403,7 +1532,7 @@ pub mod error {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.code.as_deref() == Some("api_repeated_module_segment")
+        diag.code() == Some("api_repeated_module_segment")
             && diag.message.contains("repeats `error`")
     }));
 }
@@ -1420,8 +1549,8 @@ fn analyze_workspace_flags_public_organizational_submodule_as_error() {
 
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
-        diag.level == DiagnosticLevel::Error
-            && diag.code.as_deref() == Some("api_organizational_submodule_flatten")
+        diag.level() == DiagnosticLevel::Error
+            && diag.code() == Some("api_organizational_submodule_flatten")
             && diag.message.contains("partials::error::Error")
     }));
 }

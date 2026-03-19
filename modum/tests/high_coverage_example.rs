@@ -12,7 +12,7 @@ fn high_coverage_example_emits_expected_lints() {
     let codes = report
         .diagnostics
         .iter()
-        .filter_map(|diag| diag.code.clone())
+        .filter_map(|diag| diag.code().map(str::to_owned))
         .collect::<BTreeSet<_>>();
 
     assert_eq!(

@@ -1,8 +1,8 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
 use modum::{
-    CheckMode, DiagnosticSelection, ScanSettings, parse_check_mode,
-    render_pretty_report_with_selection, run_check_with_scan_settings,
+    CheckMode, DiagnosticSelection, ScanSettings, render_pretty_report_with_selection,
+    run_check_with_scan_settings,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -11,11 +11,16 @@ enum OutputFormat {
     Json,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OutputSelection {
-    All,
-    Policy,
-    Advisory,
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            _ => Err(format!("invalid format `{raw}`; expected text|json")),
+        }
+    }
 }
 
 pub fn run_main(command_prefix: &'static str, strip_subcommand_name: bool) -> ExitCode {
@@ -60,10 +65,10 @@ fn run_check_command(
     let mut scan_settings = ScanSettings::default();
     let mut mode = env::var("MODUM")
         .ok()
-        .and_then(|raw| parse_check_mode(&raw).ok())
+        .and_then(|raw| raw.parse().ok())
         .unwrap_or(CheckMode::Deny);
     let mut format = OutputFormat::Text;
-    let mut selection = OutputSelection::All;
+    let mut selection = DiagnosticSelection::All;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -89,19 +94,19 @@ fn run_check_command(
                 let value = args
                     .next()
                     .ok_or_else(|| "--mode requires one of: off|warn|deny".to_string())?;
-                mode = parse_check_mode(&value)?;
+                mode = value.parse()?;
             }
             "--show" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--show requires one of: all|policy|advisory".to_string())?;
-                selection = parse_output_selection(&value)?;
+                selection = value.parse()?;
             }
             "--format" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--format requires one of: text|json".to_string())?;
-                format = parse_output_format(&value)?;
+                format = value.parse()?;
             }
             "--help" | "-h" => {
                 println!("{}", check_usage(command_prefix));
@@ -121,7 +126,7 @@ fn run_check_command(
         return Ok(ExitCode::from(0));
     }
 
-    if format == OutputFormat::Json && selection != OutputSelection::All {
+    if format == OutputFormat::Json && selection != DiagnosticSelection::All {
         return Err(
             "--show is only available with text output; json already includes `policy` and `fix` metadata"
                 .to_string(),
@@ -132,7 +137,7 @@ fn run_check_command(
     match format {
         OutputFormat::Text => print!(
             "{}",
-            render_pretty_report_with_selection(&outcome.report, selection.into())
+            render_pretty_report_with_selection(&outcome.report, selection)
         ),
         OutputFormat::Json => {
             println!(
@@ -143,35 +148,6 @@ fn run_check_command(
         }
     }
     Ok(ExitCode::from(outcome.exit_code))
-}
-
-fn parse_output_format(raw: &str) -> Result<OutputFormat, String> {
-    match raw {
-        "text" => Ok(OutputFormat::Text),
-        "json" => Ok(OutputFormat::Json),
-        _ => Err(format!("invalid format `{raw}`; expected text|json")),
-    }
-}
-
-fn parse_output_selection(raw: &str) -> Result<OutputSelection, String> {
-    match raw {
-        "all" => Ok(OutputSelection::All),
-        "policy" => Ok(OutputSelection::Policy),
-        "advisory" => Ok(OutputSelection::Advisory),
-        _ => Err(format!(
-            "invalid show mode `{raw}`; expected all|policy|advisory"
-        )),
-    }
-}
-
-impl From<OutputSelection> for DiagnosticSelection {
-    fn from(value: OutputSelection) -> Self {
-        match value {
-            OutputSelection::All => DiagnosticSelection::All,
-            OutputSelection::Policy => DiagnosticSelection::Policy,
-            OutputSelection::Advisory => DiagnosticSelection::Advisory,
-        }
-    }
 }
 
 fn top_level_usage(command_prefix: &'static str) -> String {

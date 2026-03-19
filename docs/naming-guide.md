@@ -150,6 +150,8 @@ Codex should default to these behaviors:
   Warning. Flags flattened imports or actionable rename-heavy aliases such as `use user::UserRepository;` or `use playwright::api::page::Event as PageEvent;` where the child module already supplies the missing context. For plain imports, this only applies when the shorter leaf would land on an actionable generic noun such as `Repository`, `Error`, or `Id`. For rename aliases, this only applies when the preserved qualifier still adds real context at call sites.
 - `namespace_redundant_qualified_generic`
   Warning. Flags qualified call-site paths such as `response::Response` or `error::Error` when the qualifier only repeats a generic category that the leaf already names clearly.
+- `namespace_aliased_qualified_path`
+  Warning. Flags qualified call-site paths such as `write_back_domain::Submission` when a renamed snake_case namespace alias has flattened a semantic path like `domain::write_back` into a technical local synonym. If the resolved canonical path is itself redundant, it suggests the final readable surface instead.
 - `namespace_parent_surface`
   Warning. Flags imports that reach into an internal child module even though the containing parent surface already exposes the same readable item, such as preferring `http::Error` over `error::Error`.
 - `namespace_flat_pub_use`

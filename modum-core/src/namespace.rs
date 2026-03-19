@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use syn::{
     ExprPath, File, Item, ItemConst, ItemEnum, ItemFn, ItemMod, ItemStatic, ItemStruct, ItemTrait,
@@ -11,25 +7,33 @@ use syn::{
     visit::{self, Visit},
 };
 
-use super::{Diagnostic, DiagnosticLevel, NamespaceSettings, replace_path_fix};
+use super::{
+    Diagnostic, NamespaceSettings, detect_name_style, inferred_file_module_path,
+    parent_module_files, render_segments, replace_path_fix, source_root, split_segments,
+};
 
 pub(super) struct NamespaceAnalysis {
     pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Clone)]
-struct UseLeaf {
+struct UseBinding {
     full_path: Vec<String>,
-    source_name: Option<String>,
-    binding_name: Option<String>,
-    kind: UseLeafKind,
+    source_name: String,
+    binding_name: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum UseLeafKind {
-    Name,
-    Rename,
+#[derive(Clone)]
+enum UseLeaf {
+    Direct(UseBinding),
+    Rename(UseBinding),
     Glob,
+}
+
+#[derive(Clone)]
+struct ScopeUseBinding {
+    binding: UseBinding,
+    renamed: bool,
 }
 
 pub(super) fn analyze_namespace_rules(
@@ -48,6 +52,8 @@ fn analyze_scope(
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let scope_use_bindings = collect_scope_use_bindings(items);
+
     for item in items {
         match item {
             Item::Use(item_use) => analyze_use_item(path, items, item_use, settings, diagnostics),
@@ -55,7 +61,13 @@ fn analyze_scope(
                 content: Some((_, nested)),
                 ..
             }) => analyze_scope(path, nested, settings, diagnostics),
-            _ => analyze_qualified_callsite_paths(path, item, settings, diagnostics),
+            _ => analyze_qualified_callsite_paths(
+                path,
+                item,
+                settings,
+                diagnostics,
+                &scope_use_bindings,
+            ),
         }
     }
 }
@@ -65,11 +77,13 @@ fn analyze_qualified_callsite_paths(
     item: &Item,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
+    scope_use_bindings: &[ScopeUseBinding],
 ) {
     let mut visitor = QualifiedCallsitePathVisitor {
         file: path,
         settings,
         diagnostics,
+        scope_use_bindings,
     };
     visitor.visit_item(item);
 }
@@ -78,17 +92,30 @@ struct QualifiedCallsitePathVisitor<'a> {
     file: &'a Path,
     settings: &'a NamespaceSettings,
     diagnostics: &'a mut Vec<Diagnostic>,
+    scope_use_bindings: &'a [ScopeUseBinding],
 }
 
 impl<'ast> Visit<'ast> for QualifiedCallsitePathVisitor<'_> {
     fn visit_expr_path(&mut self, node: &'ast ExprPath) {
-        analyze_qualified_generic_path(self.file, &node.path, self.settings, self.diagnostics);
+        analyze_qualified_generic_path(
+            self.file,
+            &node.path,
+            self.settings,
+            self.diagnostics,
+            self.scope_use_bindings,
+        );
         visit::visit_expr_path(self, node);
     }
 
     fn visit_type_path(&mut self, node: &'ast TypePath) {
         if node.qself.is_none() {
-            analyze_qualified_generic_path(self.file, &node.path, self.settings, self.diagnostics);
+            analyze_qualified_generic_path(
+                self.file,
+                &node.path,
+                self.settings,
+                self.diagnostics,
+                self.scope_use_bindings,
+            );
         }
         visit::visit_type_path(self, node);
     }
@@ -105,29 +132,28 @@ fn analyze_use_item(
     flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
     let line = item_use.span().start().line;
     let is_reexport = !matches!(item_use.vis, Visibility::Inherited);
+    let current_module_path = inferred_file_module_path(path);
 
     for leaf in leaves {
-        if matches!(leaf.kind, UseLeafKind::Glob) {
-            continue;
-        }
-        let Some(source_name) = &leaf.source_name else {
-            continue;
+        let (binding, renamed) = match &leaf {
+            UseLeaf::Direct(binding) => (binding, false),
+            UseLeaf::Rename(binding) => (binding, true),
+            UseLeaf::Glob => continue,
         };
-        let binding_name = leaf.binding_name.as_deref().unwrap_or(source_name);
-        if is_nonbinding_import(source_name) || is_nonbinding_import(binding_name) {
+        if is_nonbinding_import(&binding.source_name) || is_nonbinding_import(&binding.binding_name)
+        {
             continue;
         }
 
-        let analysis_path = trim_relative_prefix(&leaf.full_path);
+        let analysis_path = trim_relative_prefix(&binding.full_path);
         let Some(parent_module) = analysis_path.iter().rev().nth(1).cloned() else {
             continue;
         };
         let parent_normalized = parent_module.to_ascii_lowercase();
-        let current_module_path = inferred_file_module_path(path);
         let redundant_leaf = redundant_leaf_context_candidate(
             analysis_path,
-            binding_name,
-            leaf.kind,
+            &binding.binding_name,
+            renamed,
             is_reexport,
             settings,
         );
@@ -136,13 +162,13 @@ fn analyze_use_item(
                 || canonical_parent_surface_reexport(
                     &current_module_path,
                     analysis_path,
-                    binding_name,
+                    &binding.binding_name,
                     settings,
                 )
                 || parent_surface_reexports_current_binding(
                     path,
                     &current_module_path,
-                    binding_name,
+                    &binding.binding_name,
                 )
                 || preserved_parent_surface_reexport(
                     &current_module_path,
@@ -161,29 +187,34 @@ fn analyze_use_item(
                 path,
                 &current_module_path,
                 analysis_path,
-                binding_name,
+                &binding.binding_name,
                 settings,
             )
         };
         let visible_callsite_surface =
-            visible_callsite_surface_candidate(analysis_path, binding_name, settings);
+            visible_callsite_surface_candidate(analysis_path, &binding.binding_name, settings);
         let binding_used_as_namespace =
-            binding_is_used_as_namespace_in_scope(scope_items, binding_name);
+            binding_is_used_as_namespace_in_scope(scope_items, &binding.binding_name);
 
         let (code, message) =
             if let Some(canonical_parent_surface) = canonical_parent_surface.as_deref() {
                 canonical_parent_surface_message(
-                    binding_name,
-                    source_name,
+                    &binding.binding_name,
+                    &binding.source_name,
                     &parent_module,
                     canonical_parent_surface,
                 )
             } else if let Some(shorter_leaf) = redundant_leaf {
-                redundant_context_message(is_reexport, &parent_module, binding_name, &shorter_leaf)
-            } else if settings.generic_nouns.contains(binding_name)
+                redundant_context_message(
+                    is_reexport,
+                    &parent_module,
+                    &binding.binding_name,
+                    &shorter_leaf,
+                )
+            } else if settings.generic_nouns.contains(&binding.binding_name)
                 && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
             {
-                generic_noun_message(is_reexport, source_name, visible_callsite_surface)
+                generic_noun_message(is_reexport, &binding.source_name, visible_callsite_surface)
             } else if settings
                 .namespace_preserving_modules
                 .contains(&parent_normalized)
@@ -193,23 +224,20 @@ fn analyze_use_item(
             {
                 preserve_module_message(
                     is_reexport,
-                    source_name,
-                    binding_name,
+                    &binding.source_name,
+                    &binding.binding_name,
                     visible_callsite_surface,
                 )
             } else {
                 continue;
             };
 
-        diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            file: Some(path.to_path_buf()),
-            line: Some(line),
-            code: Some(code.to_string()),
-            policy: true,
-            fix: None,
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            code,
             message,
-        });
+        ));
     }
 }
 
@@ -218,44 +246,153 @@ fn analyze_qualified_generic_path(
     path: &SynPath,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
+    scope_use_bindings: &[ScopeUseBinding],
 ) {
     let full_path = path
         .segments
         .iter()
         .map(|segment| segment.ident.to_string())
         .collect::<Vec<_>>();
-    let analysis_path = trim_relative_prefix(&full_path);
-    if analysis_path.len() < 2 {
+    let current_module_path = inferred_file_module_path(file);
+    let rendered_path = full_path.join("::");
+
+    if let Some(resolved_alias_path) = resolved_namespace_alias_path(&full_path, scope_use_bindings)
+    {
+        let preferred_path = preferred_qualified_path_surface(
+            file,
+            &current_module_path,
+            &resolved_alias_path,
+            settings,
+        )
+        .unwrap_or_else(|| resolved_alias_path.join("::"));
+        if preferred_path != rendered_path {
+            diagnostics.push(Diagnostic::policy(
+                Some(file.to_path_buf()),
+                Some(path.span().start().line),
+                "namespace_aliased_qualified_path",
+                format!(
+                    "`{rendered_path}` flattens a semantic module path; prefer `{preferred_path}`"
+                ),
+            ));
+            return;
+        }
+    }
+
+    let Some(preferred_path) =
+        preferred_qualified_path_surface(file, &current_module_path, &full_path, settings)
+    else {
         return;
+    };
+
+    diagnostics.push(
+        Diagnostic::policy(
+            Some(file.to_path_buf()),
+            Some(path.span().start().line),
+            "namespace_redundant_qualified_generic",
+            format!("`{rendered_path}` repeats a generic category; prefer `{preferred_path}`"),
+        )
+        .with_fix(replace_path_fix(preferred_path.clone())),
+    );
+}
+
+fn preferred_qualified_path_surface(
+    file: &Path,
+    current_module_path: &[String],
+    full_path: &[String],
+    settings: &NamespaceSettings,
+) -> Option<String> {
+    let analysis_path = trim_relative_prefix(full_path);
+    if analysis_path.len() < 2 {
+        return None;
     }
 
     let parent_module = &analysis_path[analysis_path.len() - 2];
     let leaf_name = &analysis_path[analysis_path.len() - 1];
     if !qualified_generic_context_is_redundant(parent_module, leaf_name, settings) {
-        return;
+        return None;
     }
-    let current_module_path = inferred_file_module_path(file);
-    let preferred_path = qualified_generic_parent_surface_candidate(
-        file,
-        &current_module_path,
-        &full_path,
-        leaf_name,
-    );
-    if analysis_path.len() > 2 && preferred_path.is_none() {
-        return;
-    }
-    let preferred_path = preferred_path.unwrap_or_else(|| leaf_name.to_string());
-    let rendered_path = full_path.join("::");
 
-    diagnostics.push(Diagnostic {
-        level: DiagnosticLevel::Warning,
-        file: Some(file.to_path_buf()),
-        line: Some(path.span().start().line),
-        code: Some("namespace_redundant_qualified_generic".to_string()),
-        policy: true,
-        fix: Some(replace_path_fix(preferred_path.clone())),
-        message: format!("`{rendered_path}` repeats a generic category; prefer `{preferred_path}`"),
+    let preferred_path =
+        qualified_generic_parent_surface_candidate(file, current_module_path, full_path, leaf_name);
+    if analysis_path.len() > 2 && preferred_path.is_none() {
+        return None;
+    }
+
+    Some(preferred_path.unwrap_or_else(|| leaf_name.to_string()))
+}
+
+fn resolved_namespace_alias_path(
+    full_path: &[String],
+    scope_use_bindings: &[ScopeUseBinding],
+) -> Option<Vec<String>> {
+    let alias_name = full_path.first()?;
+    let mut matches = scope_use_bindings.iter().filter(|binding| {
+        binding.renamed
+            && binding.binding.binding_name == *alias_name
+            && actionable_namespace_alias(&binding.binding)
     });
+    let binding = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+
+    let mut resolved = binding.binding.full_path.clone();
+    resolved.extend(full_path.iter().skip(1).cloned());
+    Some(resolved)
+}
+
+fn actionable_namespace_alias(binding: &UseBinding) -> bool {
+    matches!(
+        detect_name_style(&binding.source_name),
+        super::NameStyle::Snake
+    ) && matches!(
+        detect_name_style(&binding.binding_name),
+        super::NameStyle::Snake
+    ) && alias_flattens_import_path(binding)
+}
+
+fn alias_flattens_import_path(binding: &UseBinding) -> bool {
+    if binding.full_path.len() < 2 {
+        return false;
+    }
+
+    let source_segments = normalized_segments(&binding.source_name);
+    let alias_segments = normalized_segments(&binding.binding_name);
+    if source_segments.is_empty() || alias_segments == source_segments {
+        return false;
+    }
+
+    let ancestor_segments = binding
+        .full_path
+        .iter()
+        .take(binding.full_path.len() - 1)
+        .flat_map(|segment| normalized_segments(segment))
+        .collect::<BTreeSet<_>>();
+
+    if alias_segments.starts_with(&source_segments) {
+        let extra = &alias_segments[source_segments.len()..];
+        return !extra.is_empty()
+            && extra
+                .iter()
+                .all(|segment| ancestor_segments.contains(segment));
+    }
+
+    if alias_segments.ends_with(&source_segments) {
+        let extra = &alias_segments[..alias_segments.len() - source_segments.len()];
+        return !extra.is_empty()
+            && extra
+                .iter()
+                .all(|segment| ancestor_segments.contains(segment));
+    }
+
+    false
+}
+
+fn normalized_segments(name: &str) -> Vec<String> {
+    split_segments(name)
+        .into_iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect()
 }
 
 fn qualified_generic_parent_surface_candidate(
@@ -467,35 +604,56 @@ fn flatten_use_tree(prefix: Vec<String>, tree: &UseTree, leaves: &mut Vec<UseLea
             let mut full_path = prefix;
             let source_name = name.ident.to_string();
             full_path.push(source_name.clone());
-            leaves.push(UseLeaf {
+            leaves.push(UseLeaf::Direct(UseBinding {
                 full_path,
-                source_name: Some(source_name.clone()),
-                binding_name: Some(source_name),
-                kind: UseLeafKind::Name,
-            });
+                source_name: source_name.clone(),
+                binding_name: source_name,
+            }));
         }
         UseTree::Rename(rename) => {
             let mut full_path = prefix;
-            full_path.push(rename.ident.to_string());
-            leaves.push(UseLeaf {
+            let source_name = rename.ident.to_string();
+            full_path.push(source_name.clone());
+            leaves.push(UseLeaf::Rename(UseBinding {
                 full_path,
-                source_name: Some(rename.ident.to_string()),
-                binding_name: Some(rename.rename.to_string()),
-                kind: UseLeafKind::Rename,
-            });
+                source_name,
+                binding_name: rename.rename.to_string(),
+            }));
         }
-        UseTree::Glob(_) => leaves.push(UseLeaf {
-            full_path: prefix,
-            source_name: None,
-            binding_name: None,
-            kind: UseLeafKind::Glob,
-        }),
+        UseTree::Glob(_) => leaves.push(UseLeaf::Glob),
         UseTree::Group(group) => {
             for item in &group.items {
                 flatten_use_tree(prefix.clone(), item, leaves);
             }
         }
     }
+}
+
+fn collect_scope_use_bindings(items: &[Item]) -> Vec<ScopeUseBinding> {
+    let mut bindings = Vec::new();
+
+    for item in items {
+        let Item::Use(item_use) = item else {
+            continue;
+        };
+        let mut leaves = Vec::new();
+        flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+        for leaf in leaves {
+            match leaf {
+                UseLeaf::Direct(binding) => bindings.push(ScopeUseBinding {
+                    binding,
+                    renamed: false,
+                }),
+                UseLeaf::Rename(binding) => bindings.push(ScopeUseBinding {
+                    binding,
+                    renamed: true,
+                }),
+                UseLeaf::Glob => {}
+            }
+        }
+    }
+
+    bindings
 }
 
 fn generic_noun_message(
@@ -582,7 +740,7 @@ fn visible_callsite_surface_candidate(
 fn redundant_leaf_context_candidate(
     full_path: &[String],
     leaf_name: &str,
-    kind: UseLeafKind,
+    renamed: bool,
     is_reexport: bool,
     settings: &NamespaceSettings,
 ) -> Option<String> {
@@ -606,7 +764,13 @@ fn redundant_leaf_context_candidate(
         let shorter_segments = &leaf_segments[module_segments.len()..];
         if !shorter_segments.is_empty() {
             let shorter_leaf = render_segments(shorter_segments, style);
-            if prefix_overlap_is_actionable(full_path, kind, &shorter_leaf, is_reexport, settings) {
+            if prefix_overlap_is_actionable(
+                full_path,
+                renamed,
+                &shorter_leaf,
+                is_reexport,
+                settings,
+            ) {
                 return Some(shorter_leaf);
             }
         }
@@ -641,7 +805,7 @@ fn redundant_leaf_context_candidate(
 
 fn prefix_overlap_is_actionable(
     full_path: &[String],
-    kind: UseLeafKind,
+    renamed: bool,
     shorter_leaf: &str,
     is_reexport: bool,
     settings: &NamespaceSettings,
@@ -650,7 +814,7 @@ fn prefix_overlap_is_actionable(
         return false;
     }
 
-    if matches!(kind, UseLeafKind::Rename) {
+    if renamed {
         if is_reexport {
             return true;
         }
@@ -825,13 +989,12 @@ fn collect_public_bindings(items: &[Item]) -> BTreeSet<String> {
                 let mut leaves = Vec::new();
                 flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
                 for leaf in leaves {
-                    if matches!(leaf.kind, UseLeafKind::Glob) {
-                        continue;
-                    }
-                    if let Some(binding_name) = leaf.binding_name
-                        && !is_nonbinding_import(&binding_name)
-                    {
-                        bindings.insert(binding_name);
+                    let binding = match leaf {
+                        UseLeaf::Direct(binding) | UseLeaf::Rename(binding) => binding,
+                        UseLeaf::Glob => continue,
+                    };
+                    if !is_nonbinding_import(&binding.binding_name) {
+                        bindings.insert(binding.binding_name);
                     }
                 }
             }
@@ -893,118 +1056,6 @@ fn render_canonical_parent_surface(
     format!("{}::{binding_name}", module_path.join("::"))
 }
 
-fn inferred_file_module_path(path: &Path) -> Vec<String> {
-    let components = path
-        .iter()
-        .map(|component| component.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
-    let rel = if let Some(src_idx) = components.iter().rposition(|component| component == "src") {
-        &components[src_idx + 1..]
-    } else {
-        &components[..]
-    };
-
-    if rel.is_empty() || rel.first().is_some_and(|component| component == "bin") {
-        return Vec::new();
-    }
-
-    let mut module_path = Vec::new();
-    for (idx, component) in rel.iter().enumerate() {
-        let is_last = idx + 1 == rel.len();
-        if is_last {
-            match component.as_str() {
-                "lib.rs" | "main.rs" | "mod.rs" => {}
-                other => {
-                    if let Some(stem) = other.strip_suffix(".rs") {
-                        module_path.push(stem.to_string());
-                    }
-                }
-            }
-            continue;
-        }
-
-        module_path.push(component.to_string());
-    }
-
-    module_path
-}
-
-fn source_root(path: &Path) -> Option<PathBuf> {
-    let mut root = PathBuf::new();
-    for component in path.components() {
-        root.push(component.as_os_str());
-        if component.as_os_str() == "src" {
-            return Some(root);
-        }
-    }
-    None
-}
-
-fn parent_module_files(src_root: &Path, prefix: &[String]) -> Vec<PathBuf> {
-    if prefix.is_empty() {
-        return vec![src_root.join("lib.rs"), src_root.join("main.rs")];
-    }
-
-    let joined = prefix.join("/");
-    vec![
-        src_root.join(format!("{joined}.rs")),
-        src_root.join(joined).join("mod.rs"),
-    ]
-}
-
-#[derive(Clone, Copy)]
-enum NameStyle {
-    Pascal,
-    Snake,
-    ScreamingSnake,
-}
-
-fn detect_name_style(name: &str) -> NameStyle {
-    if name.contains('_') {
-        if name
-            .chars()
-            .filter(|ch| ch.is_ascii_alphabetic())
-            .all(|ch| ch.is_ascii_uppercase())
-        {
-            NameStyle::ScreamingSnake
-        } else {
-            NameStyle::Snake
-        }
-    } else {
-        NameStyle::Pascal
-    }
-}
-
-fn render_segments(segments: &[String], style: NameStyle) -> String {
-    match style {
-        NameStyle::Pascal => segments
-            .iter()
-            .map(|segment| {
-                let lower = segment.to_ascii_lowercase();
-                let mut chars = lower.chars();
-                let Some(first) = chars.next() else {
-                    return String::new();
-                };
-                let mut rendered = String::new();
-                rendered.push(first.to_ascii_uppercase());
-                rendered.extend(chars);
-                rendered
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        NameStyle::Snake => segments
-            .iter()
-            .map(|segment| segment.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join("_"),
-        NameStyle::ScreamingSnake => segments
-            .iter()
-            .map(|segment| segment.to_ascii_uppercase())
-            .collect::<Vec<_>>()
-            .join("_"),
-    }
-}
-
 fn module_path_contains_namespace(module_path: &[String], namespace: &str) -> bool {
     module_path
         .iter()
@@ -1033,49 +1084,4 @@ fn child_module_visibility_in_file(path: &Path, child_name: &str) -> Option<bool
         }
         _ => None,
     })
-}
-
-fn split_segments(name: &str) -> Vec<String> {
-    if name.contains('_') {
-        return name
-            .split('_')
-            .filter(|segment| !segment.is_empty())
-            .map(std::string::ToString::to_string)
-            .collect();
-    }
-
-    let chars: Vec<(usize, char)> = name.char_indices().collect();
-    if chars.is_empty() {
-        return Vec::new();
-    }
-
-    let mut starts = vec![0usize];
-    for i in 1..chars.len() {
-        let prev = chars[i - 1].1;
-        let curr = chars[i].1;
-        let next = chars.get(i + 1).map(|(_, c)| *c);
-
-        let lower_to_upper = prev.is_ascii_lowercase() && curr.is_ascii_uppercase();
-        let acronym_to_word = prev.is_ascii_uppercase()
-            && curr.is_ascii_uppercase()
-            && next.map(|c| c.is_ascii_lowercase()).unwrap_or(false);
-
-        if lower_to_upper || acronym_to_word {
-            starts.push(chars[i].0);
-        }
-    }
-
-    let mut out = Vec::with_capacity(starts.len());
-    for (idx, start) in starts.iter().enumerate() {
-        let end = if let Some(next) = starts.get(idx + 1) {
-            *next
-        } else {
-            name.len()
-        };
-        let seg = &name[*start..end];
-        if !seg.is_empty() {
-            out.push(seg.to_string());
-        }
-    }
-    out
 }
