@@ -11,7 +11,7 @@ use syn::{
     visit::{self, Visit},
 };
 
-use super::{Diagnostic, DiagnosticLevel, NamespaceSettings};
+use super::{Diagnostic, DiagnosticLevel, NamespaceSettings, replace_path_fix};
 
 pub(super) struct NamespaceAnalysis {
     pub diagnostics: Vec<Diagnostic>,
@@ -207,6 +207,7 @@ fn analyze_use_item(
             line: Some(line),
             code: Some(code.to_string()),
             policy: true,
+            fix: None,
             message,
         });
     }
@@ -252,6 +253,7 @@ fn analyze_qualified_generic_path(
         line: Some(path.span().start().line),
         code: Some("namespace_redundant_qualified_generic".to_string()),
         policy: true,
+        fix: Some(replace_path_fix(preferred_path.clone())),
         message: format!("`{rendered_path}` repeats a generic category; prefer `{preferred_path}`"),
     });
 }

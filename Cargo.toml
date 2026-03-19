@@ -5,3 +5,6 @@ members = [
     "modum",
     "modum-core",
 ]
+
+[workspace.metadata.modum]
+exclude = ["examples/high-coverage"]

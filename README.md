@@ -92,6 +92,8 @@ So the rule is:
 cargo install modum
 cargo modum check --root .
 cargo modum check --root . --mode warn
+cargo modum check --root . --show advisory
+cargo modum check --root . --exclude examples/high-coverage
 cargo modum check --root . --format json
 ```
 
@@ -162,6 +164,17 @@ MODUM=off|warn|deny
 
 Default mode is `deny`.
 
+## Output
+
+Text output groups diagnostics into `Errors`, `Policy Diagnostics`, and `Advisory Diagnostics`.
+
+Use `--show policy` or `--show advisory` when you want to focus one side of the report without changing exit behavior. The exit code still reflects the full report.
+
+JSON output keeps the full diagnostic list and includes:
+
+- `policy`: whether the diagnostic counts as a policy violation
+- `fix`: optional autofix metadata when the rewrite is a direct path replacement, such as `response::Response` to `Response`
+
 ## CI Usage
 
 Use `modum` the same way you would use `clippy` or `cargo-deny`: run it as a normal command in CI, not from `build.rs`.
@@ -183,6 +196,8 @@ Configure the lints in any workspace with Cargo metadata:
 
 ```toml
 [workspace.metadata.modum]
+include = ["src", "crates/*/src"]
+exclude = ["examples/high-coverage"]
 generic_nouns = ["Id", "Repository", "Service", "Error", "Command", "Request", "Response", "Outcome"]
 weak_modules = ["storage", "transport", "infra", "common", "misc", "helpers", "helper", "types", "util", "utils"]
 catch_all_modules = ["common", "misc", "helpers", "helper", "types", "util", "utils"]
@@ -191,6 +206,8 @@ namespace_preserving_modules = ["auth", "command", "components", "email", "error
 ```
 
 Use `[package.metadata.modum]` inside a member crate to override workspace defaults for that package.
+
+`include` and `exclude` are optional scan defaults. CLI `--include` overrides metadata `include`, and CLI `--exclude` adds to metadata `exclude`.
 
 Tuning guide:
 

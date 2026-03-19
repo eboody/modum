@@ -79,6 +79,7 @@ pub(super) fn analyze_api_shape_rules(
             line: Some(1),
             code: Some("api_organizational_submodule_flatten".to_string()),
             policy: true,
+            fix: None,
             message: format!(
                 "`{}` leaks organizational `{}` into the public API; prefer `{}` and keep `{}` private",
                 render_public_path(
@@ -190,6 +191,7 @@ fn analyze_module_item(
                 line: Some(line),
                 code: Some("api_catch_all_module".to_string()),
                 policy: true,
+                fix: None,
                 message: format!(
                     "`{module_name}` is a catch-all public module; prefer a stable domain or facet"
                 ),
@@ -208,6 +210,7 @@ fn analyze_module_item(
                 line: Some(line),
                 code: Some("api_organizational_submodule_flatten".to_string()),
                 policy: true,
+                fix: None,
                 message: format!(
                     "`{}` leaks organizational `{module_name}` into the public API; prefer `{}` and keep `{module_name}` private",
                     render_public_path_with_module(module_path, &module_name, &flatten_leaf),
@@ -226,6 +229,7 @@ fn analyze_module_item(
                 line: Some(line),
                 code: Some("api_repeated_module_segment".to_string()),
                 policy: true,
+                fix: None,
                 message: format!(
                     "nested module path repeats `{module_name}`; flatten or rename the redundant segment"
                 ),
@@ -258,6 +262,7 @@ fn analyze_module_item(
             line: Some(line),
             code: Some("api_missing_parent_surface_export".to_string()),
             policy: true,
+            fix: None,
             message: format!(
                 "parent surface is missing `{}`; re-export it so callers do not have to use `{}`",
                 render_public_path(module_path, &surface_export.parent_binding),
@@ -351,6 +356,7 @@ fn analyze_public_use_item(
                 line: Some(line),
                 code: Some("api_missing_parent_surface_export".to_string()),
                 policy: true,
+                fix: None,
                 message: format!(
                     "parent surface is missing `{}`; re-export it so callers do not have to use `{}`",
                     render_public_path(module_path, &surface_export.parent_binding),
@@ -524,6 +530,7 @@ fn analyze_candidate_semantic_modules(
             line: Some(line),
             code: Some("api_candidate_semantic_module".to_string()),
             policy: false,
+            fix: None,
             message: format!(
                 "public siblings {original_members} share the `{head}` head; consider a semantic `{module_candidate}::{{{suggested_members}}}` surface"
             ),
@@ -632,6 +639,7 @@ fn analyze_candidate_semantic_modules(
             line: Some(line),
             code: Some("api_candidate_semantic_module".to_string()),
             policy: false,
+            fix: None,
             message: format!(
                 "public siblings {original_members} share the generic `{tail}` tail; consider a semantic `{module_candidate}::{{{suggested_members}}}` surface"
             ),
@@ -930,6 +938,7 @@ fn analyze_public_leaf(
             line: Some(line),
             code: Some("api_redundant_leaf_context".to_string()),
             policy: true,
+            fix: None,
             message: format!(
                 "public API already exposes `{preferred_path}`; prefer it over `{}`",
                 render_public_path(module_path, leaf_name),
@@ -952,6 +961,7 @@ fn analyze_public_leaf(
             line: Some(line),
             code: Some("api_weak_module_generic_leaf".to_string()),
             policy: true,
+            fix: None,
             message: format!(
                 "`{}` is too generic for weak module `{parent_module}`; keep the domain in the leaf or choose a stronger module",
                 render_public_path(module_path, leaf_name),
@@ -967,6 +977,7 @@ fn analyze_public_leaf(
             line: Some(line),
             code: Some("api_redundant_category_suffix".to_string()),
             policy: true,
+            fix: None,
             message: format!(
                 "`{}` repeats the `{parent_module}` category; prefer `{}`",
                 render_public_path(module_path, leaf_name),
@@ -989,6 +1000,7 @@ fn analyze_public_leaf(
             line: Some(line),
             code: Some("api_redundant_leaf_context".to_string()),
             policy: true,
+            fix: None,
             message: format!(
                 "`{}` repeats the `{parent_module}` context; prefer `{}`",
                 render_public_path(module_path, leaf_name),

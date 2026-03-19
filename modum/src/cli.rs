@@ -1,11 +1,21 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
-use modum::{CheckMode, parse_check_mode, render_pretty_report, run_check};
+use modum::{
+    CheckMode, DiagnosticSelection, ScanSettings, parse_check_mode,
+    render_pretty_report_with_selection, run_check_with_scan_settings,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
     Text,
     Json,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputSelection {
+    All,
+    Policy,
+    Advisory,
 }
 
 pub fn run_main(command_prefix: &'static str, strip_subcommand_name: bool) -> ExitCode {
@@ -47,12 +57,13 @@ fn run_check_command(
     command_prefix: &'static str,
 ) -> Result<ExitCode, String> {
     let mut root = env::current_dir().map_err(|err| format!("failed to get current dir: {err}"))?;
-    let mut include_globs = Vec::new();
+    let mut scan_settings = ScanSettings::default();
     let mut mode = env::var("MODUM")
         .ok()
         .and_then(|raw| parse_check_mode(&raw).ok())
         .unwrap_or(CheckMode::Deny);
     let mut format = OutputFormat::Text;
+    let mut selection = OutputSelection::All;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -66,13 +77,25 @@ fn run_check_command(
                 let value = args
                     .next()
                     .ok_or_else(|| "--include requires a path value".to_string())?;
-                include_globs.push(value);
+                scan_settings.include.push(value);
+            }
+            "--exclude" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--exclude requires a path or glob value".to_string())?;
+                scan_settings.exclude.push(value);
             }
             "--mode" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--mode requires one of: off|warn|deny".to_string())?;
                 mode = parse_check_mode(&value)?;
+            }
+            "--show" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--show requires one of: all|policy|advisory".to_string())?;
+                selection = parse_output_selection(&value)?;
             }
             "--format" => {
                 let value = args
@@ -98,9 +121,19 @@ fn run_check_command(
         return Ok(ExitCode::from(0));
     }
 
-    let outcome = run_check(&root, &include_globs, mode);
+    if format == OutputFormat::Json && selection != OutputSelection::All {
+        return Err(
+            "--show is only available with text output; json already includes `policy` and `fix` metadata"
+                .to_string(),
+        );
+    }
+
+    let outcome = run_check_with_scan_settings(&root, &scan_settings, mode);
     match format {
-        OutputFormat::Text => print!("{}", render_pretty_report(&outcome.report)),
+        OutputFormat::Text => print!(
+            "{}",
+            render_pretty_report_with_selection(&outcome.report, selection.into())
+        ),
         OutputFormat::Json => {
             println!(
                 "{}",
@@ -117,6 +150,27 @@ fn parse_output_format(raw: &str) -> Result<OutputFormat, String> {
         "text" => Ok(OutputFormat::Text),
         "json" => Ok(OutputFormat::Json),
         _ => Err(format!("invalid format `{raw}`; expected text|json")),
+    }
+}
+
+fn parse_output_selection(raw: &str) -> Result<OutputSelection, String> {
+    match raw {
+        "all" => Ok(OutputSelection::All),
+        "policy" => Ok(OutputSelection::Policy),
+        "advisory" => Ok(OutputSelection::Advisory),
+        _ => Err(format!(
+            "invalid show mode `{raw}`; expected all|policy|advisory"
+        )),
+    }
+}
+
+impl From<OutputSelection> for DiagnosticSelection {
+    fn from(value: OutputSelection) -> Self {
+        match value {
+            OutputSelection::All => DiagnosticSelection::All,
+            OutputSelection::Policy => DiagnosticSelection::Policy,
+            OutputSelection::Advisory => DiagnosticSelection::Advisory,
+        }
     }
 }
 
@@ -138,13 +192,15 @@ fn check_usage(command_prefix: &'static str) -> String {
     [
         "Usage:",
         &format!(
-            "  {} check [--root <path>] [--include <path>]... [--mode off|warn|deny] [--format text|json]",
+            "  {} check [--root <path>] [--include <path-or-glob>]... [--exclude <path-or-glob>]... [--show all|policy|advisory] [--mode off|warn|deny] [--format text|json]",
             command_prefix
         ),
         "",
         "Examples:",
         &format!("  {command_prefix} check"),
         &format!("  {command_prefix} check --mode warn"),
+        &format!("  {command_prefix} check --exclude examples/high-coverage/**"),
+        &format!("  {command_prefix} check --show advisory"),
         &format!("  {command_prefix} check --format json"),
         "",
         "Environment:",
