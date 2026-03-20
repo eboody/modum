@@ -257,7 +257,25 @@ These warn when public leaves are too generic for a weak parent, when the path r
 - `api_redundant_leaf_context`
   Warning for public leaves that repeat semantic module context already carried by the path, such as `user::UserRepository`, or that bake a sibling semantic module into a flat public leaf when `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning for public item families that suggest a semantic module surface, either through a shared head like `UserRepository`, `UserService`, and `UserId`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`.
+  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`.
+- `api_manual_enum_string_helper`
+  Advisory warning for public enum string surfaces that are spelled manually, including bespoke non-const methods such as `label()` or `as_str()`, free helpers such as `scenario_label(&Scenario)`, and manual `Display` impls that only map variants to string literals.
+- `api_ad_hoc_parse_helper`
+  Advisory warning for public enum parse helpers, including free `parse_*` functions and inherent methods such as `Mode::parse(&str) -> Result<Self, _>`, when `FromStr` or `TryFrom<&str>` would be a better standard boundary.
+- `api_parallel_enum_metadata_helper`
+  Advisory warning for public enums that expose several parallel metadata helpers like `label()`, `code()`, and `source_term()` over repeated `match self` blocks, when a typed descriptor surface would model that metadata more cleanly.
+- `api_strum_serialize_all_candidate`
+  Warning for per-variant `strum` string attributes that could be replaced by one enum-level `serialize_all` rule without changing the external strings.
+- `api_builder_candidate`
+  Warning for public constructors or workflow entrypoints that take several positional weak parameters and would read better as a builder or typed options struct. It skips functions already marked with a builder surface.
+- `api_standalone_builder_surface`
+  Advisory warning for families of public `with_*` or `set_*` free functions that collectively behave like a builder surface for one type.
+- `api_boolean_protocol_decision`
+  Warning for public `bool` parameters or fields that encode a domain or protocol decision rather than a runtime toggle.
+- `api_forwarding_compat_wrapper`
+  Warning for explicit conversion helpers such as `to_*` or `into_*` methods that only forward to an existing `From` conversion already present in the crate.
+- `api_stringly_model_scaffold`
+  Advisory warning for public structs that carry several semantic descriptor fields as raw strings, such as `state_path`, `kind_label`, and `next_machine`, when those concepts would read better as typed enums, newtypes, or a focused descriptor type.
 - `api_redundant_category_suffix`
 
 Examples:

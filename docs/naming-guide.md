@@ -168,7 +168,25 @@ Codex should default to these behaviors:
 - `api_redundant_leaf_context`
   Warning. Flags paths such as `user::UserRepository` or `page::ErrorPage` where the leaf repeats the parent context, and also flags flat public leaves such as `UserRepository` when a sibling semantic module surface like `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when their shared head suggests a semantic module surface like `user::{Repository, Service, Id}`, and also flags families such as `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome` when their shared generic tail suggests a semantic module surface like `outcome::{Completed, Rejected, Toxicity}`. It skips weak promoted heads like `to`, `has`, `open`, and `rolled`, and it skips hidden or internal module scopes.
+  Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when at least three shared-head items suggest a semantic module surface like `user::{Repository, Service, Id}`, and also flags families such as `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome` when their shared generic tail suggests a semantic module surface like `outcome::{Completed, Rejected, Toxicity}`. It skips weak promoted heads like `to`, `has`, `open`, and `rolled`, and it skips hidden or internal module scopes.
+- `api_manual_enum_string_helper`
+  Advisory warning. Flags public enum string surfaces that are spelled manually, including non-const methods like `label()` or `as_str()`, free helpers like `scenario_label(&Scenario)`, and manual `Display` impls that only map variants to string literals.
+- `api_ad_hoc_parse_helper`
+  Advisory warning. Flags public enum parse helpers such as free `parse_*` functions and inherent methods like `Mode::parse(&str) -> Result<Self, _>` when `FromStr` or `TryFrom<&str>` would be a more standard boundary surface. It skips helpers when the enum already implements `FromStr` in the same scope.
+- `api_parallel_enum_metadata_helper`
+  Advisory warning. Flags public enums that expose several parallel metadata helpers such as `label()`, `code()`, and `source_term()` over repeated `match self` blocks, when a typed descriptor surface would model that metadata more cleanly.
+- `api_strum_serialize_all_candidate`
+  Warning. Flags per-variant `strum` string attributes that could be replaced by one enum-level `serialize_all` rule without changing the external strings.
+- `api_builder_candidate`
+  Warning. Flags public constructors or workflow entrypoints that take several positional weak parameters and would likely read better as a builder or typed options struct. It skips functions already marked with a builder surface.
+- `api_standalone_builder_surface`
+  Advisory warning. Flags public `with_*` or `set_*` free-function families that collectively behave like a builder surface for one type.
+- `api_boolean_protocol_decision`
+  Warning. Flags public `bool` parameters or fields that encode a domain or protocol decision rather than a runtime toggle.
+- `api_forwarding_compat_wrapper`
+  Warning. Flags explicit conversion helpers such as `to_*` or `into_*` methods that only forward to an existing `From` conversion already present in the crate.
+- `api_stringly_model_scaffold`
+  Advisory warning. Flags public structs that carry several semantic descriptor fields as raw strings, such as `state_path`, `kind_label`, and `next_machine`, when those concepts would likely read better as typed enums, newtypes, or a focused descriptor type. It is intentionally narrower than a generic "too many strings" check and targets obvious modeling scaffolds rather than ordinary text payloads.
 - `api_redundant_category_suffix`
   Warning. Flags paths such as `user::error::InvalidEmailError` where the parent module already provides the category.
 - `api_catch_all_module`

@@ -5,8 +5,9 @@ use std::{
 };
 
 use syn::{
-    File, Item, ItemConst, ItemEnum, ItemFn, ItemMod, ItemStatic, ItemStruct, ItemTrait,
-    ItemTraitAlias, ItemType, ItemUnion, ItemUse, UseTree, spanned::Spanned,
+    Expr, File, FnArg, GenericArgument, ImplItem, ImplItemFn, Item, ItemConst, ItemEnum, ItemFn,
+    ItemImpl, ItemMod, ItemStatic, ItemStruct, ItemTrait, ItemTraitAlias, ItemType, ItemUnion,
+    ItemUse, Lit, LitStr, PathArguments, ReturnType, Stmt, Type, UseTree, spanned::Spanned,
 };
 
 use super::{
@@ -43,6 +44,31 @@ struct TailSemanticFamilyMember {
 struct ChildModuleSurfaceExport {
     parent_binding: String,
     child_leaf: String,
+}
+
+struct StringFieldSignal {
+    name: String,
+    scaffold_like: bool,
+    has_strong_metadata_token: bool,
+}
+
+#[derive(Default)]
+struct TraitSurfaceCatalog {
+    from_targets_by_source: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetadataHelperKind {
+    StringSurface,
+    TypedSurface,
+}
+
+#[derive(Clone, Copy)]
+enum StrumCase {
+    KebabCase,
+    SnakeCase,
+    ScreamingSnakeCase,
+    Lowercase,
 }
 
 struct ScopeSurfaceContext<'a> {
@@ -130,6 +156,8 @@ fn analyze_scope(
         public_bindings: &public_bindings,
         suppressed_child_module_exports: &suppressed_child_module_exports,
     };
+    analyze_stringly_public_surfaces(path, items, scope_flags.path_is_public, diagnostics);
+    analyze_modeling_api_surfaces(path, items, scope_flags.path_is_public, diagnostics);
 
     for item in items {
         match item {
@@ -440,6 +468,1468 @@ fn collect_scope_public_leaf_bindings(items: &[Item]) -> Vec<PublicLeafBinding> 
     bindings
 }
 
+fn collect_scope_public_enum_names(items: &[Item]) -> BTreeSet<String> {
+    let mut enums = BTreeSet::new();
+
+    for item in items {
+        if let Item::Enum(item_enum) = item
+            && is_public(&item_enum.vis)
+        {
+            enums.insert(unraw_ident(&item_enum.ident));
+        }
+    }
+
+    enums
+}
+
+fn collect_scope_from_str_targets(items: &[Item]) -> BTreeSet<String> {
+    let mut targets = BTreeSet::new();
+
+    for item in items {
+        let Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let Some((_, trait_path, _)) = &item_impl.trait_ else {
+            continue;
+        };
+        let Some(trait_name) = trait_path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+        else {
+            continue;
+        };
+        if trait_name != "FromStr" {
+            continue;
+        }
+        if let Some(self_ty) = type_leaf_ident(&item_impl.self_ty) {
+            targets.insert(self_ty);
+        }
+    }
+
+    targets
+}
+
+fn analyze_stringly_public_surfaces(
+    path: &Path,
+    items: &[Item],
+    path_is_public: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !path_is_public {
+        return;
+    }
+
+    let public_enum_names = collect_scope_public_enum_names(items);
+    let from_str_targets = if public_enum_names.is_empty() {
+        BTreeSet::new()
+    } else {
+        collect_scope_from_str_targets(items)
+    };
+
+    for item in items {
+        match item {
+            Item::Impl(item_impl) if !public_enum_names.is_empty() => {
+                analyze_public_enum_impl_string_helpers(
+                    path,
+                    item_impl,
+                    &public_enum_names,
+                    &from_str_targets,
+                    diagnostics,
+                )
+            }
+            Item::Fn(item_fn) => {
+                if !public_enum_names.is_empty() {
+                    analyze_public_enum_string_helper_functions(
+                        path,
+                        item_fn,
+                        &public_enum_names,
+                        diagnostics,
+                    );
+                    analyze_public_parse_helpers(
+                        path,
+                        item_fn,
+                        &public_enum_names,
+                        &from_str_targets,
+                        diagnostics,
+                    );
+                }
+            }
+            Item::Struct(item_struct) => {
+                analyze_public_stringly_model_scaffolds(path, item_struct, diagnostics);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn analyze_modeling_api_surfaces(
+    path: &Path,
+    items: &[Item],
+    path_is_public: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !path_is_public {
+        return;
+    }
+
+    let public_enum_names = collect_scope_public_enum_names(items);
+    let trait_surfaces = collect_scope_trait_surfaces(items);
+
+    analyze_standalone_builder_surfaces(path, items, diagnostics);
+
+    for item in items {
+        match item {
+            Item::Enum(item_enum) => {
+                analyze_public_enum_strum_serialize_all_candidate(path, item_enum, diagnostics);
+            }
+            Item::Struct(item_struct) => {
+                analyze_public_struct_boolean_protocol_decisions(path, item_struct, diagnostics);
+            }
+            Item::Fn(item_fn) => {
+                analyze_public_fn_boolean_protocol_decisions(path, item_fn, diagnostics);
+                analyze_public_fn_builder_candidate(path, item_fn, diagnostics);
+            }
+            Item::Impl(item_impl) => {
+                analyze_public_impl_boolean_protocol_decisions(path, item_impl, diagnostics);
+                analyze_public_impl_builder_candidates(path, item_impl, diagnostics);
+                analyze_forwarding_compat_wrappers(path, item_impl, &trait_surfaces, diagnostics);
+
+                if !public_enum_names.is_empty() {
+                    analyze_public_enum_manual_display_surfaces(
+                        path,
+                        item_impl,
+                        &public_enum_names,
+                        diagnostics,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_scope_trait_surfaces(items: &[Item]) -> TraitSurfaceCatalog {
+    let mut catalog = TraitSurfaceCatalog::default();
+
+    for item in items {
+        let Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let Some((_, trait_path, _)) = &item_impl.trait_ else {
+            continue;
+        };
+        let Some(trait_name) = trait_path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+        else {
+            continue;
+        };
+
+        if trait_name.as_str() == "From" {
+            let Some(source) = trait_first_generic_type_leaf_ident(trait_path) else {
+                continue;
+            };
+            let Some(target) = type_leaf_ident(&item_impl.self_ty) else {
+                continue;
+            };
+            catalog
+                .from_targets_by_source
+                .entry(source)
+                .or_default()
+                .insert(target);
+        }
+    }
+
+    catalog
+}
+
+fn analyze_public_enum_manual_display_surfaces(
+    path: &Path,
+    item_impl: &ItemImpl,
+    public_enum_names: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some((_, trait_path, _)) = &item_impl.trait_ else {
+        return;
+    };
+    let Some(trait_name) = trait_path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+    else {
+        return;
+    };
+    if trait_name != "Display" {
+        return;
+    }
+
+    let Some(enum_name) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+    if !public_enum_names.contains(&enum_name) {
+        return;
+    }
+
+    let Some(fmt_method) = item_impl.items.iter().find_map(|item| match item {
+        ImplItem::Fn(method) if method.sig.ident == "fmt" => Some(method),
+        _ => None,
+    }) else {
+        return;
+    };
+    if !display_impl_is_literal_string_match(fmt_method) {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_impl.span().start().line),
+        "api_manual_enum_string_helper",
+        format!(
+            "public enum `{enum_name}` has a manual `Display` impl that only maps variants to string literals; prefer `strum::Display` when that string surface is canonical"
+        ),
+    ));
+}
+
+fn analyze_public_enum_strum_serialize_all_candidate(
+    path: &Path,
+    item_enum: &ItemEnum,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_enum.vis)
+        || item_enum.variants.len() < 4
+        || enum_has_strum_serialize_all(&item_enum.attrs)
+    {
+        return;
+    }
+
+    let mut variant_values = Vec::new();
+    for variant in &item_enum.variants {
+        let Some(value) = variant_single_strum_surface(variant) else {
+            return;
+        };
+        variant_values.push((unraw_ident(&variant.ident), value));
+    }
+
+    for case in [
+        StrumCase::KebabCase,
+        StrumCase::SnakeCase,
+        StrumCase::ScreamingSnakeCase,
+        StrumCase::Lowercase,
+    ] {
+        if variant_values.iter().all(|(variant_name, value)| {
+            render_strum_case(&split_segments(variant_name), case) == *value
+        }) {
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(item_enum.span().start().line),
+                "api_strum_serialize_all_candidate",
+                format!(
+                    "enum `{}` repeats per-variant `strum` strings that match `{}`; prefer one enum-level `serialize_all` rule",
+                    item_enum.ident,
+                    strum_case_label(case),
+                ),
+            ));
+            return;
+        }
+    }
+}
+
+fn analyze_public_struct_boolean_protocol_decisions(
+    path: &Path,
+    item_struct: &ItemStruct,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+
+    let item_name = unraw_ident(&item_struct.ident);
+    for field in &fields.named {
+        if !is_public(&field.vis) || !type_is_bool(&field.ty) {
+            continue;
+        }
+        let Some(field_name) = field.ident.as_ref().map(unraw_ident) else {
+            continue;
+        };
+        if !looks_like_protocol_decision_bool(&item_name, &field_name) {
+            continue;
+        }
+
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(field.span().start().line),
+            "api_boolean_protocol_decision",
+            format!(
+                "public boolean `{field_name}` encodes a protocol or domain decision on `{item_name}`; prefer a typed decision enum or small decision struct"
+            ),
+        ));
+    }
+}
+
+fn analyze_public_fn_boolean_protocol_decisions(
+    path: &Path,
+    item_fn: &ItemFn,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    analyze_boolean_protocol_decisions_in_signature(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.inputs,
+        diagnostics,
+    );
+}
+
+fn analyze_public_impl_boolean_protocol_decisions(
+    path: &Path,
+    item_impl: &ItemImpl,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+
+        analyze_boolean_protocol_decisions_in_signature(
+            path,
+            method.span().start().line,
+            &method.sig.ident.to_string(),
+            &method.sig.inputs,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_boolean_protocol_decisions_in_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for input in inputs {
+        let FnArg::Typed(arg) = input else {
+            continue;
+        };
+        if !type_is_bool(&arg.ty) {
+            continue;
+        }
+        let Some(param_name) = typed_arg_name(arg) else {
+            continue;
+        };
+        if !looks_like_protocol_decision_bool(item_name, &param_name) {
+            continue;
+        }
+
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_boolean_protocol_decision",
+            format!(
+                "boolean `{param_name}` encodes a protocol or domain decision in `{item_name}`; prefer a typed decision enum or small decision struct"
+            ),
+        ));
+    }
+}
+
+fn analyze_public_fn_builder_candidate(
+    path: &Path,
+    item_fn: &ItemFn,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) || has_builder_attribute(&item_fn.attrs) {
+        return;
+    }
+
+    analyze_builder_candidate_signature(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.inputs,
+        &item_fn.sig.output,
+        diagnostics,
+    );
+}
+
+fn analyze_public_impl_builder_candidates(
+    path: &Path,
+    item_impl: &ItemImpl,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) || has_builder_attribute(&method.attrs) {
+            continue;
+        }
+
+        analyze_builder_candidate_signature(
+            path,
+            method.span().start().line,
+            &method.sig.ident.to_string(),
+            &method.sig.inputs,
+            &method.sig.output,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_builder_candidate_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    output: &ReturnType,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let typed_inputs = typed_inputs(inputs);
+    if typed_inputs.len() < 3 {
+        return;
+    }
+
+    let builderish_name = is_builderish_function_name(item_name);
+    let returns_constructed = output_returns_constructed_type(output);
+    if !builderish_name && !returns_constructed {
+        return;
+    }
+
+    let weak_param_count = typed_inputs
+        .iter()
+        .filter(|(_, ty)| is_weak_builder_param_type(ty))
+        .count();
+    let duplicate_type_names = repeated_simplified_type_names(&typed_inputs);
+    let should_flag = if typed_inputs.len() >= 4 {
+        builderish_name || weak_param_count >= 1 || !duplicate_type_names.is_empty()
+    } else {
+        weak_param_count >= 2 || !duplicate_type_names.is_empty()
+    };
+    if !should_flag {
+        return;
+    }
+
+    let param_names = typed_inputs
+        .iter()
+        .filter_map(|(name, _)| name.clone())
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diagnostics.push(Diagnostic::policy(
+        Some(path.to_path_buf()),
+        Some(line),
+        "api_builder_candidate",
+        format!(
+            "public entrypoint `{item_name}` takes {} positional parameters ({param_names}); prefer a builder or typed options struct when setup is this configuration-heavy",
+            typed_inputs.len()
+        ),
+    ));
+}
+
+fn analyze_standalone_builder_surfaces(
+    path: &Path,
+    items: &[Item],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut families = BTreeMap::<String, Vec<(usize, String)>>::new();
+
+    for item in items {
+        let Item::Fn(item_fn) = item else {
+            continue;
+        };
+        if !is_public(&item_fn.vis) {
+            continue;
+        }
+
+        let function_name = item_fn.sig.ident.to_string();
+        if !is_standalone_builder_function_name(&function_name) {
+            continue;
+        }
+        let Some(subject_type) = standalone_builder_subject_type(item_fn) else {
+            continue;
+        };
+        families
+            .entry(subject_type)
+            .or_default()
+            .push((item_fn.span().start().line, function_name));
+    }
+
+    for (subject_type, functions) in families {
+        if functions.len() < 3 {
+            continue;
+        }
+
+        let line = functions
+            .iter()
+            .map(|(line, _)| *line)
+            .min()
+            .expect("non-empty");
+        let function_names = functions
+            .iter()
+            .map(|(_, name)| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_standalone_builder_surface",
+            format!(
+                "public free functions {function_names} look like a standalone builder surface for `{subject_type}`; prefer inherent setters or a builder instead of parallel `with_*` helpers"
+            ),
+        ));
+    }
+}
+
+fn analyze_forwarding_compat_wrappers(
+    path: &Path,
+    item_impl: &ItemImpl,
+    trait_surfaces: &TraitSurfaceCatalog,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) || method.sig.inputs.len() != 1 {
+            continue;
+        }
+
+        let Some(expr) = block_single_expr(&method.block) else {
+            continue;
+        };
+        let helper_name = method.sig.ident.to_string();
+        if !is_explicit_from_wrapper_name(&helper_name, &method.sig.output) {
+            continue;
+        }
+
+        if let Some(target_type) = output_type_leaf_ident(&method.sig.output)
+            && trait_surfaces
+                .from_targets_by_source
+                .get(&self_type)
+                .is_some_and(|targets| targets.contains(&target_type))
+            && expr_is_direct_from_forward(expr, &target_type)
+        {
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(method.span().start().line),
+                "api_forwarding_compat_wrapper",
+                format!(
+                    "public method `{helper_name}` only forwards to existing `From<{self_type}> for {target_type}` conversion; prefer using the trait surface directly"
+                ),
+            ));
+            continue;
+        }
+    }
+}
+
+fn analyze_public_enum_impl_string_helpers(
+    path: &Path,
+    item_impl: &ItemImpl,
+    public_enum_names: &BTreeSet<String>,
+    from_str_targets: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(enum_name) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+    if !public_enum_names.contains(&enum_name) {
+        return;
+    }
+
+    let helper_names = item_impl
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ImplItem::Fn(method) => manual_enum_string_helper_name(method),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if !helper_names.is_empty() {
+        let helpers = helper_names
+            .into_iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(item_impl.span().start().line),
+            "api_manual_enum_string_helper",
+            format!(
+                "public enum `{enum_name}` exposes manual string helper(s) {helpers}; prefer a standard string surface such as `Display`/`AsRefStr`, and `EnumString` if parsing is canonical"
+            ),
+        ));
+    }
+
+    let metadata_helpers = item_impl
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ImplItem::Fn(method) => enum_metadata_helper(method).map(|kind| {
+                (
+                    method.sig.ident.to_string(),
+                    matches!(kind, MetadataHelperKind::StringSurface),
+                )
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let string_helpers = metadata_helpers
+        .iter()
+        .filter(|(_, is_string)| *is_string)
+        .count();
+    let typed_helpers = metadata_helpers.len() - string_helpers;
+    if metadata_helpers.len() >= 3 && (string_helpers >= 2 || typed_helpers >= 1) {
+        let helpers = metadata_helpers
+            .iter()
+            .map(|(name, _)| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(item_impl.span().start().line),
+            "api_parallel_enum_metadata_helper",
+            format!(
+                "public enum `{enum_name}` exposes parallel metadata helpers {helpers}; prefer a typed descriptor surface instead of repeating separate matches for each metadata view"
+            ),
+        ));
+    }
+
+    let parse_methods = item_impl
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ImplItem::Fn(method) => manual_enum_parse_helper_name(method, &enum_name),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if parse_methods.is_empty() || from_str_targets.contains(&enum_name) {
+        return;
+    }
+
+    let helpers = parse_methods
+        .into_iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_impl.span().start().line),
+        "api_ad_hoc_parse_helper",
+        format!(
+            "public enum `{enum_name}` exposes ad hoc parse helper(s) {helpers}; prefer `FromStr` or `TryFrom<&str>` on `{enum_name}` when string parsing is the canonical boundary"
+        ),
+    ));
+}
+
+fn manual_enum_string_helper_name(method: &ImplItemFn) -> Option<String> {
+    if !is_public(&method.vis) || method.sig.constness.is_some() || method.sig.inputs.len() != 1 {
+        return None;
+    }
+    if !matches!(method.sig.inputs.first(), Some(FnArg::Receiver(_))) {
+        return None;
+    }
+    if !returns_string_surface(&method.sig.output) {
+        return None;
+    }
+
+    let helper_name = method.sig.ident.to_string();
+    matches!(helper_name.as_str(), "as_str" | "label" | "to_str").then_some(helper_name)
+}
+
+fn analyze_public_enum_string_helper_functions(
+    path: &Path,
+    item_fn: &ItemFn,
+    public_enum_names: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) || !returns_string_surface(&item_fn.sig.output) {
+        return;
+    }
+
+    let helper_name = item_fn.sig.ident.to_string();
+    if !is_enum_string_helper_function_name(&helper_name) {
+        return;
+    }
+    let Some(target_enum) = single_public_enum_input(&item_fn.sig.inputs, public_enum_names) else {
+        return;
+    };
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_fn.span().start().line),
+        "api_manual_enum_string_helper",
+        format!(
+            "public helper `{helper_name}` renders `{target_enum}` as a string; prefer a standard string surface on `{target_enum}` such as `Display`/`AsRefStr`"
+        ),
+    ));
+}
+
+fn analyze_public_parse_helpers(
+    path: &Path,
+    item_fn: &ItemFn,
+    public_enum_names: &BTreeSet<String>,
+    from_str_targets: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    let helper_name = item_fn.sig.ident.to_string();
+    if !helper_name.starts_with("parse_") || !has_single_string_input(&item_fn.sig.inputs) {
+        return;
+    }
+
+    let Some(target_enum) = returned_public_enum_name(&item_fn.sig.output, public_enum_names)
+    else {
+        return;
+    };
+    if from_str_targets.contains(&target_enum) {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_fn.span().start().line),
+        "api_ad_hoc_parse_helper",
+        format!(
+            "public helper `{helper_name}` parses strings into `{target_enum}`; prefer `FromStr` or `TryFrom<&str>` on `{target_enum}` when the parse is the canonical boundary"
+        ),
+    ));
+}
+
+fn analyze_public_stringly_model_scaffolds(
+    path: &Path,
+    item_struct: &ItemStruct,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+
+    let string_fields = fields
+        .named
+        .iter()
+        .filter(|field| is_public(&field.vis))
+        .filter_map(string_field_signal)
+        .collect::<Vec<_>>();
+    if string_fields.len() < 3 {
+        return;
+    }
+
+    let scaffold_fields = string_fields
+        .iter()
+        .filter(|field| field.scaffold_like)
+        .collect::<Vec<_>>();
+    if scaffold_fields.len() < 2
+        || !scaffold_fields
+            .iter()
+            .any(|field| field.has_strong_metadata_token)
+    {
+        return;
+    }
+
+    let field_names = scaffold_fields
+        .iter()
+        .map(|field| format!("`{}`", field.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_stringly_model_scaffold",
+        format!(
+            "public struct `{}` carries semantic descriptor fields as raw strings ({field_names}); this looks like string-heavy model scaffolding. Prefer typed enums, newtypes, or a focused descriptor type and render strings only at the boundary",
+            item_struct.ident
+        ),
+    ));
+}
+
+fn enum_metadata_helper(method: &ImplItemFn) -> Option<MetadataHelperKind> {
+    if !is_public(&method.vis) || method.sig.constness.is_some() || method.sig.inputs.len() != 1 {
+        return None;
+    }
+    if !matches!(method.sig.inputs.first(), Some(FnArg::Receiver(_))) {
+        return None;
+    }
+    if !body_is_match_on_self(&method.block) {
+        return None;
+    }
+
+    if returns_string_surface(&method.sig.output) {
+        return Some(MetadataHelperKind::StringSurface);
+    }
+
+    returns_metadata_surface(&method.sig.output).then_some(MetadataHelperKind::TypedSurface)
+}
+
+fn manual_enum_parse_helper_name(method: &ImplItemFn, enum_name: &str) -> Option<String> {
+    if !is_public(&method.vis) || method.sig.constness.is_some() || method.sig.inputs.len() != 1 {
+        return None;
+    }
+    if matches!(method.sig.inputs.first(), Some(FnArg::Receiver(_))) {
+        return None;
+    }
+    if !has_single_string_input(&method.sig.inputs)
+        || !returns_named_enum_or_self(&method.sig.output, enum_name)
+    {
+        return None;
+    }
+
+    let helper_name = method.sig.ident.to_string();
+    (helper_name == "parse"
+        || helper_name.starts_with("parse_")
+        || helper_name.starts_with("from_"))
+    .then_some(helper_name)
+}
+
+fn has_single_string_input(inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>) -> bool {
+    if inputs.len() != 1 {
+        return false;
+    }
+
+    match inputs.first() {
+        Some(FnArg::Typed(arg)) => type_is_string_input(&arg.ty),
+        Some(FnArg::Receiver(_)) | None => false,
+    }
+}
+
+fn returned_public_enum_name(
+    output: &ReturnType,
+    public_enum_names: &BTreeSet<String>,
+) -> Option<String> {
+    let ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+    let returned = returned_type_leaf_ident(ty)?;
+    public_enum_names.contains(&returned).then_some(returned)
+}
+
+fn returns_named_enum_or_self(output: &ReturnType, enum_name: &str) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+
+    returned_type_leaf_ident(ty).is_some_and(|returned| returned == enum_name || returned == "Self")
+}
+
+fn returns_metadata_surface(output: &ReturnType) -> bool {
+    if returns_string_surface(output) {
+        return true;
+    }
+
+    let Some(leaf) = output_type_leaf_ident(output) else {
+        return false;
+    };
+    !is_obvious_scalar_type_name(&leaf) && leaf != "Self"
+}
+
+fn returned_type_leaf_ident(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(type_path) => {
+            let segment = type_path.path.segments.last()?;
+            if matches!(segment.ident.to_string().as_str(), "Result" | "Option") {
+                let PathArguments::AngleBracketed(args) = &segment.arguments else {
+                    return None;
+                };
+                let first = args.args.iter().find_map(|arg| match arg {
+                    GenericArgument::Type(ty) => Some(ty),
+                    _ => None,
+                })?;
+                return type_leaf_ident(first);
+            }
+
+            type_leaf_ident(ty)
+        }
+        _ => None,
+    }
+}
+
+fn returns_string_surface(output: &ReturnType) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+
+    type_is_string_surface(ty)
+}
+
+fn type_is_string_surface(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(reference) => {
+            type_leaf_ident(&reference.elem).is_some_and(|ident| ident == "str")
+        }
+        Type::Path(_) => type_leaf_ident(ty).is_some_and(|ident| ident == "String"),
+        _ => false,
+    }
+}
+
+fn type_is_string_input(ty: &Type) -> bool {
+    matches!(ty, Type::Reference(_) | Type::Path(_)) && type_is_string_surface(ty)
+}
+
+fn type_is_bool(ty: &Type) -> bool {
+    borrowed_or_owned_type_leaf_ident(ty).is_some_and(|ident| ident == "bool")
+}
+
+fn single_public_enum_input(
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    public_enum_names: &BTreeSet<String>,
+) -> Option<String> {
+    if inputs.len() != 1 {
+        return None;
+    }
+
+    match inputs.first() {
+        Some(FnArg::Typed(arg)) => {
+            let enum_name = borrowed_or_owned_type_leaf_ident(&arg.ty)?;
+            public_enum_names.contains(&enum_name).then_some(enum_name)
+        }
+        Some(FnArg::Receiver(_)) | None => None,
+    }
+}
+
+fn is_enum_string_helper_function_name(name: &str) -> bool {
+    name.ends_with("_label") || name.ends_with("_name") || name.ends_with("_str")
+}
+
+fn type_leaf_ident(ty: &Type) -> Option<String> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    type_path
+        .qself
+        .is_none()
+        .then(|| {
+            type_path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+        })
+        .flatten()
+}
+
+fn borrowed_or_owned_type_leaf_ident(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Reference(reference) => borrowed_or_owned_type_leaf_ident(&reference.elem),
+        _ => type_leaf_ident(ty),
+    }
+}
+
+fn output_type_leaf_ident(output: &ReturnType) -> Option<String> {
+    let ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+
+    returned_type_leaf_ident(ty)
+}
+
+fn typed_inputs(
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+) -> Vec<(Option<String>, &Type)> {
+    inputs
+        .iter()
+        .filter_map(|input| match input {
+            FnArg::Typed(arg) => Some((typed_arg_name(arg), arg.ty.as_ref())),
+            FnArg::Receiver(_) => None,
+        })
+        .collect()
+}
+
+fn typed_arg_name(arg: &syn::PatType) -> Option<String> {
+    let syn::Pat::Ident(ident) = arg.pat.as_ref() else {
+        return None;
+    };
+
+    Some(unraw_ident(&ident.ident))
+}
+
+fn is_builderish_function_name(name: &str) -> bool {
+    matches!(
+        name,
+        "new" | "start" | "open" | "create" | "build" | "run" | "entry"
+    ) || matches!(
+        name,
+        _
+            if name.starts_with("build_")
+                || name.starts_with("start_")
+                || name.starts_with("create_")
+                || name.starts_with("open_")
+    )
+}
+
+fn output_returns_constructed_type(output: &ReturnType) -> bool {
+    let Some(type_name) = output_type_leaf_ident(output) else {
+        return false;
+    };
+
+    type_name == "Self" || !is_obvious_scalar_type_name(&type_name)
+}
+
+fn is_weak_builder_param_type(ty: &Type) -> bool {
+    type_is_bool(ty)
+        || type_is_string_surface(ty)
+        || type_is_string_field(ty)
+        || borrowed_or_owned_type_leaf_ident(ty)
+            .is_some_and(|type_name| is_obvious_scalar_type_name(&type_name))
+}
+
+fn repeated_simplified_type_names(typed_inputs: &[(Option<String>, &Type)]) -> Vec<String> {
+    let mut counts = BTreeMap::<String, usize>::new();
+
+    for (_, ty) in typed_inputs {
+        let Some(type_name) = borrowed_or_owned_type_leaf_ident(ty) else {
+            continue;
+        };
+        *counts.entry(type_name).or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .filter_map(|(type_name, count)| (count > 1).then_some(type_name))
+        .collect()
+}
+
+fn is_standalone_builder_function_name(name: &str) -> bool {
+    matches!(
+        name,
+        _
+            if name.starts_with("with_")
+                || name.starts_with("set_")
+                || name.starts_with("enable_")
+                || name.starts_with("disable_")
+                || name.starts_with("apply_")
+    )
+}
+
+fn standalone_builder_subject_type(item_fn: &ItemFn) -> Option<String> {
+    let typed_inputs = typed_inputs(&item_fn.sig.inputs);
+    if typed_inputs.len() < 2 {
+        return None;
+    }
+
+    let subject_type = borrowed_or_owned_type_leaf_ident(typed_inputs.first()?.1)?;
+    let returned_type = output_type_leaf_ident(&item_fn.sig.output)?;
+    (subject_type == returned_type).then_some(subject_type)
+}
+
+fn looks_like_protocol_decision_bool(item_name: &str, bool_name: &str) -> bool {
+    let item_tokens = split_segments(item_name)
+        .into_iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let bool_tokens = split_segments(bool_name)
+        .into_iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    let toggle_tokens = [
+        "verbose",
+        "pretty",
+        "recursive",
+        "follow",
+        "force",
+        "color",
+        "dry",
+        "strict",
+        "debug",
+    ];
+    if bool_tokens
+        .iter()
+        .any(|token| toggle_tokens.contains(&token.as_str()))
+    {
+        return false;
+    }
+
+    let decision_tokens = [
+        "approved",
+        "rejected",
+        "supported",
+        "accepted",
+        "denied",
+        "reviewed",
+        "known",
+        "allowed",
+        "bound",
+    ];
+    let domain_tokens = [
+        "vendor",
+        "workflow",
+        "review",
+        "validate",
+        "gate",
+        "transition",
+        "approval",
+        "support",
+        "protocol",
+        "machine",
+        "policy",
+        "scope",
+        "release",
+        "contract",
+        "audit",
+        "bind",
+    ];
+
+    bool_tokens
+        .iter()
+        .any(|token| decision_tokens.contains(&token.as_str()))
+        && (bool_tokens
+            .iter()
+            .any(|token| domain_tokens.contains(&token.as_str()))
+            || item_tokens
+                .iter()
+                .any(|token| domain_tokens.contains(&token.as_str())))
+}
+
+fn block_single_expr(block: &syn::Block) -> Option<&Expr> {
+    if block.stmts.len() != 1 {
+        return None;
+    }
+
+    match &block.stmts[0] {
+        Stmt::Expr(expr, _) => Some(expr),
+        _ => None,
+    }
+}
+
+fn body_is_match_on_self(block: &syn::Block) -> bool {
+    let Some(expr) = block_single_expr(block) else {
+        return false;
+    };
+
+    let Expr::Match(expr_match) = expr else {
+        return false;
+    };
+
+    expr_is_self_receiver(expr_match.expr.as_ref())
+}
+
+fn expr_is_self_receiver(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path(expr_path) => path_is_self(&expr_path.path),
+        Expr::Unary(expr_unary) => {
+            matches!(expr_unary.op, syn::UnOp::Deref(_))
+                && expr_is_self_receiver(expr_unary.expr.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn path_is_self(path: &syn::Path) -> bool {
+    path.segments.len() == 1 && path.segments[0].ident == "self"
+}
+
+fn display_impl_is_literal_string_match(method: &ImplItemFn) -> bool {
+    if method.sig.inputs.len() != 2 {
+        return false;
+    }
+    if !matches!(method.sig.inputs.first(), Some(FnArg::Receiver(_))) {
+        return false;
+    }
+
+    let Some(expr) = block_single_expr(&method.block) else {
+        return false;
+    };
+    let Expr::Match(expr_match) = expr else {
+        return false;
+    };
+    if !expr_is_self_receiver(expr_match.expr.as_ref()) {
+        return false;
+    }
+
+    expr_match
+        .arms
+        .iter()
+        .all(|arm| expr_is_literal_write_str(arm.body.as_ref()))
+}
+
+fn expr_is_literal_write_str(expr: &Expr) -> bool {
+    match expr {
+        Expr::MethodCall(method_call) => {
+            method_call.method == "write_str"
+                && method_call.args.len() == 1
+                && method_call.args.first().is_some_and(expr_is_string_literal)
+        }
+        Expr::Block(expr_block) => {
+            block_single_expr(&expr_block.block).is_some_and(expr_is_literal_write_str)
+        }
+        _ => false,
+    }
+}
+
+fn expr_is_string_literal(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Lit(syn::ExprLit {
+            lit: Lit::Str(_),
+            ..
+        })
+    )
+}
+
+fn trait_first_generic_type_leaf_ident(trait_path: &syn::Path) -> Option<String> {
+    let segment = trait_path.segments.last()?;
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    let first = args.args.iter().find_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    })?;
+
+    borrowed_or_owned_type_leaf_ident(first)
+}
+
+fn enum_has_strum_serialize_all(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("strum"))
+        .any(|attr| {
+            let mut found = false;
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("serialize_all") {
+                    found = true;
+                }
+                if meta.input.peek(syn::Token![=]) {
+                    let _ = meta.value()?.parse::<LitStr>()?;
+                }
+                Ok(())
+            });
+            found
+        })
+}
+
+fn variant_single_strum_surface(variant: &syn::Variant) -> Option<String> {
+    let mut values = Vec::new();
+
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("strum") {
+            continue;
+        }
+
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("serialize") || meta.path.is_ident("to_string") {
+                values.push(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.input.peek(syn::Token![=]) {
+                let _ = meta.value()?.parse::<LitStr>()?;
+            }
+            Ok(())
+        })
+        .ok()?;
+    }
+
+    (values.len() == 1).then(|| values.into_iter().next().expect("len checked"))
+}
+
+fn render_strum_case(segments: &[String], case: StrumCase) -> String {
+    let lowered = segments
+        .iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    match case {
+        StrumCase::KebabCase => lowered.join("-"),
+        StrumCase::SnakeCase => lowered.join("_"),
+        StrumCase::ScreamingSnakeCase => lowered.join("_").to_ascii_uppercase(),
+        StrumCase::Lowercase => lowered.join(""),
+    }
+}
+
+fn strum_case_label(case: StrumCase) -> &'static str {
+    match case {
+        StrumCase::KebabCase => "kebab-case",
+        StrumCase::SnakeCase => "snake_case",
+        StrumCase::ScreamingSnakeCase => "SCREAMING_SNAKE_CASE",
+        StrumCase::Lowercase => "lowercase",
+    }
+}
+
+fn expr_is_direct_from_forward(expr: &Expr, target_type: &str) -> bool {
+    match expr {
+        Expr::Call(expr_call) => {
+            expr_path_ends_with(expr_call.func.as_ref(), &[target_type, "from"])
+                && expr_call.args.len() == 1
+                && expr_call.args.first().is_some_and(expr_is_self_or_clone)
+        }
+        Expr::MethodCall(method_call) => {
+            method_call.method == "into"
+                && method_call.args.is_empty()
+                && expr_is_self_or_clone(method_call.receiver.as_ref())
+        }
+        Expr::Block(expr_block) => block_single_expr(&expr_block.block)
+            .is_some_and(|inner| expr_is_direct_from_forward(inner, target_type)),
+        _ => false,
+    }
+}
+
+fn expr_is_self_or_clone(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path(expr_path) => path_is_self(&expr_path.path),
+        Expr::MethodCall(method_call) => {
+            method_call.method == "clone"
+                && method_call.args.is_empty()
+                && expr_is_self_receiver(method_call.receiver.as_ref())
+        }
+        Expr::Unary(expr_unary) => {
+            matches!(expr_unary.op, syn::UnOp::Deref(_))
+                && expr_is_self_receiver(expr_unary.expr.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn expr_path_ends_with(expr: &Expr, segments: &[&str]) -> bool {
+    let Expr::Path(expr_path) = expr else {
+        return false;
+    };
+    if expr_path.path.segments.len() < segments.len() {
+        return false;
+    }
+
+    expr_path
+        .path
+        .segments
+        .iter()
+        .rev()
+        .zip(segments.iter().rev())
+        .all(|(actual, expected)| actual.ident == *expected)
+}
+
+fn is_explicit_from_wrapper_name(helper_name: &str, output: &ReturnType) -> bool {
+    let Some(target_type) = output_type_leaf_ident(output) else {
+        return false;
+    };
+    let target_name = render_segments(&split_segments(&target_type), NameStyle::Snake);
+
+    helper_name == format!("to_{target_name}") || helper_name == format!("into_{target_name}")
+}
+
+fn is_obvious_scalar_type_name(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "bool"
+            | "char"
+            | "str"
+            | "String"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+    )
+}
+
+fn string_field_signal(field: &syn::Field) -> Option<StringFieldSignal> {
+    let name = field.ident.as_ref().map(unraw_ident)?;
+    if !type_is_string_field(&field.ty) {
+        return None;
+    }
+
+    let tokens = split_segments(&name)
+        .into_iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let strong_metadata_tokens = [
+        "state",
+        "machine",
+        "protocol",
+        "artifact",
+        "transition",
+        "gate",
+        "typestate",
+        "step",
+        "phase",
+    ];
+    let descriptor_tokens = [
+        "kind", "label", "path", "code", "name", "status", "mode", "variant", "next", "current",
+        "target",
+    ];
+    let has_strong_metadata_token = tokens
+        .iter()
+        .any(|token| strong_metadata_tokens.contains(&token.as_str()));
+    let descriptor_hits = tokens
+        .iter()
+        .filter(|token| descriptor_tokens.contains(&token.as_str()))
+        .count();
+
+    Some(StringFieldSignal {
+        name,
+        scaffold_like: has_strong_metadata_token || descriptor_hits >= 2,
+        has_strong_metadata_token,
+    })
+}
+
+fn type_is_string_field(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(reference) => type_is_string_field(&reference.elem),
+        Type::Path(type_path) => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return false;
+            };
+            match segment.ident.to_string().as_str() {
+                "String" => true,
+                "Option" => {
+                    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+                        return false;
+                    };
+                    args.args.iter().any(|arg| match arg {
+                        GenericArgument::Type(inner) => type_is_string_field(inner),
+                        _ => false,
+                    })
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn analyze_candidate_semantic_modules(
     path: &Path,
     items: &[Item],
@@ -491,7 +1981,7 @@ fn analyze_candidate_semantic_modules(
     }
 
     for (head, members) in families {
-        if members.len() < 2 {
+        if members.len() < 3 {
             continue;
         }
 
@@ -1182,6 +2672,10 @@ fn attribute_is_doc_hidden(attr: &syn::Attribute) -> bool {
         Ok(())
     });
     hidden
+}
+
+fn has_builder_attribute(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("builder"))
 }
 
 fn public_bindings_for_child_module(

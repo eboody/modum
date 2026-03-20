@@ -1433,6 +1433,30 @@ pub struct ToQueryValue;
 }
 
 #[test]
+fn analyze_workspace_does_not_flag_candidate_semantic_module_for_two_item_head_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct ConfigurationError;
+pub struct ConfigurationErrorKind;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_candidate_semantic_module_inside_hidden_internal_module() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -1484,6 +1508,692 @@ pub struct UserRepository;
             .diagnostics
             .iter()
             .any(|diag| { diag.code() == Some("api_redundant_leaf_context") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_manual_enum_string_helper_methods() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Scenario {
+    HappyPath,
+    Failure,
+}
+
+impl Scenario {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::HappyPath => "happy-path",
+            Self::Failure => "failure",
+        }
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_manual_enum_string_helper")
+            && diag.message.contains("Scenario")
+            && diag.message.contains("`label`")
+            && diag.message.contains("Display")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_manual_display_impls_for_public_enums() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Mode {
+    Warn,
+    Deny,
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Warn => f.write_str("warn"),
+            Self::Deny => f.write_str("deny"),
+        }
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_manual_enum_string_helper")
+            && diag.message.contains("manual `Display` impl")
+            && diag.message.contains("Mode")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_free_enum_string_helper_functions_for_borrowed_inputs() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Scenario {
+    HappyPath,
+    Failure,
+}
+
+pub fn scenario_label(value: &Scenario) -> &'static str {
+    match value {
+        Scenario::HappyPath => "happy-path",
+        Scenario::Failure => "failure",
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_manual_enum_string_helper")
+            && diag.message.contains("scenario_label")
+            && diag.message.contains("Scenario")
+            && diag.message.contains("Display")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_parallel_enum_metadata_helpers() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Id {
+    Crossing,
+    OutboundScope,
+    WriteBack,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceTerm {
+    CRoute,
+    ReleaseGate,
+}
+
+impl Id {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Crossing => "Crossing",
+            Self::OutboundScope => "Outbound scope",
+            Self::WriteBack => "Write-back",
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Crossing => "crossing::Flow",
+            Self::OutboundScope => "outbound_scope::Flow",
+            Self::WriteBack => "write_back::Flow",
+        }
+    }
+
+    pub fn source_term(self) -> Option<SourceTerm> {
+        match self {
+            Self::Crossing => Some(SourceTerm::CRoute),
+            Self::OutboundScope => Some(SourceTerm::ReleaseGate),
+            Self::WriteBack => None,
+        }
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_parallel_enum_metadata_helper")
+            && diag.message.contains("Id")
+            && diag.message.contains("descriptor")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_stringly_model_scaffold_structs() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct MachineDescriptor {
+    pub state_path: String,
+    pub kind_label: String,
+    pub next_machine: String,
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_stringly_model_scaffold")
+            && diag.message.contains("MachineDescriptor")
+            && diag.message.contains("state_path")
+            && diag.message.contains("typed enums")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_plain_text_structs_as_model_scaffolds() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct ContactCard {
+    pub first_name: String,
+    pub last_name: String,
+    pub email: String,
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_stringly_model_scaffold") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_boolean_protocol_decisions() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct UserId;
+
+pub fn review(approved: bool, actor: UserId) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_boolean_protocol_decision")
+            && diag.message.contains("approved")
+            && diag.message.contains("review")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_runtime_toggle_bools_as_protocol_decisions() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn render(pretty: bool) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_boolean_protocol_decision") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_builder_candidates_for_configuration_heavy_entrypoints() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Workflow;
+
+pub fn start(vendor: String, approved: bool, retries: usize, release_gate: bool) -> Workflow {
+    Workflow
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_builder_candidate")
+            && diag.message.contains("start")
+            && diag.message.contains("builder")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_distinct_domain_constructors_as_builder_candidates() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct UserId;
+pub struct UserRepo;
+pub struct Policy;
+
+pub struct Session;
+
+impl Session {
+    pub fn new(id: UserId, repo: UserRepo, policy: Policy) -> Self {
+        Self
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_builder_candidate") })
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_builder_annotated_entrypoints() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "bon = \"3\"");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use bon::bon;
+
+pub struct Workflow;
+
+#[bon]
+impl Workflow {
+    #[builder]
+    pub fn start(vendor: String, approved: bool, retries: usize, release_gate: bool) -> Self {
+        Self
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_builder_candidate") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_standalone_builder_surfaces() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Request;
+pub struct Vendor;
+pub struct Scope;
+pub struct Release;
+
+pub fn with_vendor(request: Request, _vendor: Vendor) -> Request {
+    request
+}
+
+pub fn with_scope(request: Request, _scope: Scope) -> Request {
+    request
+}
+
+pub fn with_release(request: Request, _release: Release) -> Request {
+    request
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_standalone_builder_surface")
+            && diag.message.contains("Request")
+            && diag.message.contains("with_vendor")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_forwarding_compat_wrappers() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Request;
+pub struct Action;
+
+impl From<Request> for Action {
+    fn from(_value: Request) -> Self {
+        Self
+    }
+}
+
+impl Request {
+    pub fn to_action(self) -> Action {
+        Action::from(self)
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_forwarding_compat_wrapper")
+            && diag.message.contains("to_action")
+            && diag.message.contains("From<Request> for Action")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_noun_convenience_wrappers_for_from_impls() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct App;
+pub struct Request;
+
+impl From<&App> for Request {
+    fn from(_value: &App) -> Self {
+        Self
+    }
+}
+
+impl App {
+    pub fn request(&self) -> Request {
+        self.into()
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_forwarding_compat_wrapper") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_strum_serialize_all_candidates() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use strum::{AsRefStr, Display, EnumString};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Display, EnumString, AsRefStr)]
+pub enum Scenario {
+    #[strum(serialize = "happy-path")]
+    HappyPath,
+    #[strum(serialize = "ttl-expired")]
+    TtlExpired,
+    #[strum(serialize = "policy-denied")]
+    PolicyDenied,
+    #[strum(serialize = "audit-failure")]
+    AuditFailure,
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_strum_serialize_all_candidate")
+            && diag.message.contains("serialize_all")
+            && diag.message.contains("kebab-case")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_strum_aliases_as_serialize_all_candidates() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use strum::{AsRefStr, Display, EnumString};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Display, EnumString, AsRefStr)]
+pub enum Scenario {
+    #[strum(serialize = "c-route", serialize = "C-Route")]
+    CRoute,
+    #[strum(serialize = "release-gate")]
+    ReleaseGate,
+    #[strum(serialize = "audit-access")]
+    AuditAccess,
+    #[strum(serialize = "write-back")]
+    WriteBack,
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_strum_serialize_all_candidate") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_ad_hoc_parse_helpers_for_public_enums() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Mode {
+    Warn,
+    Deny,
+}
+
+pub fn parse_mode(raw: &str) -> Result<Mode, String> {
+    match raw {
+        "warn" => Ok(Mode::Warn),
+        "deny" => Ok(Mode::Deny),
+        _ => Err(format!("unknown mode: {raw}")),
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_ad_hoc_parse_helper")
+            && diag.message.contains("parse_mode")
+            && diag.message.contains("FromStr")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_inherent_enum_parse_helpers_returning_self() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Mode {
+    Warn,
+    Deny,
+}
+
+impl Mode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "warn" => Ok(Self::Warn),
+            "deny" => Ok(Self::Deny),
+            _ => Err(format!("unknown mode: {raw}")),
+        }
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_ad_hoc_parse_helper")
+            && diag.message.contains("Mode")
+            && diag.message.contains("`parse`")
+            && diag.message.contains("FromStr")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_parse_helpers_when_enum_already_implements_from_str() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Mode {
+    Warn,
+    Deny,
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "warn" => Ok(Self::Warn),
+            "deny" => Ok(Self::Deny),
+            _ => Err(format!("unknown mode: {raw}")),
+        }
+    }
+}
+
+pub fn parse_mode(raw: &str) -> Result<Mode, String> {
+    raw.parse()
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_ad_hoc_parse_helper") })
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_inherent_parse_helpers_when_enum_already_implements_from_str() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Mode {
+    Warn,
+    Deny,
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "warn" => Ok(Self::Warn),
+            "deny" => Ok(Self::Deny),
+            _ => Err(format!("unknown mode: {raw}")),
+        }
+    }
+}
+
+impl Mode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        raw.parse()
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_ad_hoc_parse_helper") })
     );
 }
 

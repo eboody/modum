@@ -86,6 +86,7 @@ mod response {
 
 pub struct UserRepository;
 pub struct UserService;
+pub struct UserId;
 
 pub fn handler() -> response::Response {
     todo!()
