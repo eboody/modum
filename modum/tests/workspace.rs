@@ -1457,6 +1457,42 @@ pub struct ConfigurationErrorKind;
 }
 
 #[test]
+fn analyze_workspace_dedupes_candidate_semantic_module_for_same_file_head() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct QueryError;
+pub struct QueryResult;
+pub struct QueryValue;
+
+pub mod nested {
+    pub struct QueryBuilder;
+    pub struct QueryType;
+    pub struct QueryPredicate;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert_eq!(
+        report
+            .diagnostics
+            .iter()
+            .filter(|diag| {
+                diag.code() == Some("api_candidate_semantic_module")
+                    && diag.message.contains("query::{")
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_candidate_semantic_module_inside_hidden_internal_module() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -1727,6 +1763,51 @@ pub struct ContactCard {
 }
 
 #[test]
+fn analyze_workspace_flags_stringly_protocol_collections() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub static LEGAL_STATES: &[&str] = &["draft", "published"];
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_stringly_protocol_collection")
+            && diag.message.contains("LEGAL_STATES")
+            && !diag.is_policy_violation()
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_generic_string_collections() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub static TAGS: &[&str] = &["blue", "green"];
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_stringly_protocol_collection") })
+    );
+}
+
+#[test]
 fn analyze_workspace_flags_boolean_protocol_decisions() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -1800,6 +1881,59 @@ pub fn start(vendor: String, approved: bool, retries: usize, release_gate: bool)
 }
 
 #[test]
+fn analyze_workspace_flags_repeated_parameter_clusters() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct TaskId;
+pub struct Kind;
+pub struct AuditRecord;
+
+pub struct Outcome;
+pub struct Rejected;
+
+impl Outcome {
+    pub fn rejected(
+        task_id: TaskId,
+        kind: Kind,
+        reason: String,
+        audit_record: AuditRecord,
+    ) -> Self {
+        let _ = (task_id, kind, reason, audit_record);
+        Self
+    }
+}
+
+impl Rejected {
+    pub fn from_audit(
+        task_id: TaskId,
+        kind: Kind,
+        reason: String,
+        audit_record: AuditRecord,
+    ) -> Self {
+        let _ = (task_id, kind, reason, audit_record);
+        Self
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_repeated_parameter_cluster")
+            && diag.message.contains("Outcome::rejected")
+            && diag.message.contains("Rejected::from_audit")
+            && diag.message.contains("task_id")
+            && diag.message.contains("bon")
+    }));
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_distinct_domain_constructors_as_builder_candidates() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -1833,6 +1967,171 @@ impl Session {
 }
 
 #[test]
+fn analyze_workspace_does_not_flag_repeated_clusters_of_strong_domain_types() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct UserId;
+pub struct UserRepo;
+pub struct Policy;
+
+pub struct Session;
+pub struct Login;
+
+impl Session {
+    pub fn new(id: UserId, repo: UserRepo, policy: Policy) -> Self {
+        let _ = (id, repo, policy);
+        Self
+    }
+}
+
+impl Login {
+    pub fn create(id: UserId, repo: UserRepo, policy: Policy) -> Self {
+        let _ = (id, repo, policy);
+        Self
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_repeated_parameter_cluster") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_optional_parameter_builders() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Request;
+
+impl Request {
+    pub fn new(id: String, label: Option<String>) -> Self {
+        let _ = (id, label);
+        Self
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_optional_parameter_builder")
+            && diag.message.contains("new")
+            && diag.message.contains("label")
+            && diag.message.contains("bon")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_defaulted_optional_parameters() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Request;
+
+impl Request {
+    pub fn new(id: String, label: Option<String>) -> Self {
+        let _ = (id, label.unwrap_or_default());
+        Self
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_defaulted_optional_parameter")
+            && diag.message.contains("label")
+            && diag.message.contains("bon")
+    }));
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_optional_parameter_builder") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_optional_parameter_builders_for_free_functions() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Workflow;
+pub struct Task;
+pub struct Audit;
+
+pub fn start(task: Task, audit: Option<Audit>) -> Workflow {
+    let _ = (task, audit);
+    Workflow
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_optional_parameter_builder")
+            && diag.message.contains("start")
+            && diag.message.contains("audit")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_optional_parameters_for_non_builderish_helpers() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Report;
+pub struct Theme;
+
+pub fn summarize(report: Report, theme: Option<Theme>) -> Report {
+    let _ = theme;
+    report
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_optional_parameter_builder") })
+    );
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_builder_annotated_entrypoints() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -1848,7 +2147,13 @@ pub struct Workflow;
 #[bon]
 impl Workflow {
     #[builder]
-    pub fn start(vendor: String, approved: bool, retries: usize, release_gate: bool) -> Self {
+    pub fn start(
+        vendor: String,
+        approved: bool,
+        retries: usize,
+        release_gate: Option<bool>,
+    ) -> Self {
+        let _ = (vendor, approved, retries, release_gate);
         Self
     }
 }
@@ -1857,12 +2162,12 @@ impl Workflow {
     .expect("write lib");
 
     let report = analyze_workspace(root, &[]);
-    assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|diag| { diag.code() == Some("api_builder_candidate") })
-    );
+    assert!(!report.diagnostics.iter().any(|diag| {
+        matches!(
+            diag.code(),
+            Some("api_builder_candidate" | "api_optional_parameter_builder")
+        )
+    }));
 }
 
 #[test]

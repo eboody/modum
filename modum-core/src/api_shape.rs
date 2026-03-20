@@ -8,6 +8,7 @@ use syn::{
     Expr, File, FnArg, GenericArgument, ImplItem, ImplItemFn, Item, ItemConst, ItemEnum, ItemFn,
     ItemImpl, ItemMod, ItemStatic, ItemStruct, ItemTrait, ItemTraitAlias, ItemType, ItemUnion,
     ItemUse, Lit, LitStr, PathArguments, ReturnType, Stmt, Type, UseTree, spanned::Spanned,
+    visit::Visit,
 };
 
 use super::{
@@ -555,6 +556,12 @@ fn analyze_stringly_public_surfaces(
                     );
                 }
             }
+            Item::Const(item_const) => {
+                analyze_public_stringly_protocol_collection_const(path, item_const, diagnostics);
+            }
+            Item::Static(item_static) => {
+                analyze_public_stringly_protocol_collection_static(path, item_static, diagnostics);
+            }
             Item::Struct(item_struct) => {
                 analyze_public_stringly_model_scaffolds(path, item_struct, diagnostics);
             }
@@ -577,6 +584,7 @@ fn analyze_modeling_api_surfaces(
     let trait_surfaces = collect_scope_trait_surfaces(items);
 
     analyze_standalone_builder_surfaces(path, items, diagnostics);
+    analyze_repeated_parameter_clusters(path, items, diagnostics);
 
     for item in items {
         match item {
@@ -606,6 +614,98 @@ fn analyze_modeling_api_surfaces(
             }
             _ => {}
         }
+    }
+}
+
+fn analyze_repeated_parameter_clusters(
+    path: &Path,
+    items: &[Item],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut families = BTreeMap::<Vec<(String, String)>, Vec<(usize, String)>>::new();
+
+    for item in items {
+        match item {
+            Item::Fn(item_fn) => {
+                if !is_public(&item_fn.vis) || has_builder_attribute(&item_fn.attrs) {
+                    continue;
+                }
+                let item_name = item_fn.sig.ident.to_string();
+                let typed_inputs = typed_inputs(&item_fn.sig.inputs);
+                let Some(cluster) = repeated_parameter_cluster_signature(
+                    &item_name,
+                    &typed_inputs,
+                    &item_fn.sig.output,
+                ) else {
+                    continue;
+                };
+                families
+                    .entry(cluster)
+                    .or_default()
+                    .push((item_fn.span().start().line, item_name));
+            }
+            Item::Impl(item_impl) => {
+                if item_impl.trait_.is_some() {
+                    continue;
+                }
+                let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+                    continue;
+                };
+                for item in &item_impl.items {
+                    let ImplItem::Fn(method) = item else {
+                        continue;
+                    };
+                    if !is_public(&method.vis) || has_builder_attribute(&method.attrs) {
+                        continue;
+                    }
+
+                    let method_name = method.sig.ident.to_string();
+                    let typed_inputs = typed_inputs(&method.sig.inputs);
+                    let Some(cluster) = repeated_parameter_cluster_signature(
+                        &method_name,
+                        &typed_inputs,
+                        &method.sig.output,
+                    ) else {
+                        continue;
+                    };
+                    families.entry(cluster).or_default().push((
+                        method.span().start().line,
+                        format!("{self_type}::{method_name}"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (cluster, members) in families {
+        if members.len() < 2 {
+            continue;
+        }
+
+        let line = members
+            .iter()
+            .map(|(line, _)| *line)
+            .min()
+            .expect("cluster has members");
+        let item_names = members
+            .iter()
+            .map(|(_, name)| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let param_names = cluster
+            .iter()
+            .map(|(name, _)| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_repeated_parameter_cluster",
+            format!(
+                "public entrypoints {item_names} repeat the same positional parameter cluster ({param_names}); prefer a shared options type or `bon` builder instead of duplicating the call shape"
+            ),
+        ));
     }
 }
 
@@ -864,6 +964,7 @@ fn analyze_public_fn_builder_candidate(
         &item_fn.sig.ident.to_string(),
         &item_fn.sig.inputs,
         &item_fn.sig.output,
+        Some(&item_fn.block),
         diagnostics,
     );
 }
@@ -891,6 +992,7 @@ fn analyze_public_impl_builder_candidates(
             &method.sig.ident.to_string(),
             &method.sig.inputs,
             &method.sig.output,
+            Some(&method.block),
             diagnostics,
         );
     }
@@ -902,9 +1004,31 @@ fn analyze_builder_candidate_signature(
     item_name: &str,
     inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
     output: &ReturnType,
+    block: Option<&syn::Block>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let typed_inputs = typed_inputs(inputs);
+    if let Some(block) = block
+        && analyze_defaulted_optional_parameter_signature(
+            path,
+            line,
+            item_name,
+            &typed_inputs,
+            block,
+            diagnostics,
+        )
+    {
+        return;
+    }
+    if analyze_optional_parameter_builder_signature(
+        path,
+        line,
+        item_name,
+        &typed_inputs,
+        diagnostics,
+    ) {
+        return;
+    }
     if typed_inputs.len() < 3 {
         return;
     }
@@ -944,6 +1068,140 @@ fn analyze_builder_candidate_signature(
             typed_inputs.len()
         ),
     ));
+}
+
+fn analyze_defaulted_optional_parameter_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    typed_inputs: &[(Option<String>, &Type)],
+    block: &syn::Block,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    if typed_inputs.len() < 2 || !is_builderish_function_name(item_name) {
+        return false;
+    }
+
+    let defaulted_params = defaulted_optional_params(block, typed_inputs);
+    if defaulted_params.is_empty() {
+        return false;
+    }
+
+    let param_names = defaulted_params
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diagnostics.push(Diagnostic::policy(
+        Some(path.to_path_buf()),
+        Some(line),
+        "api_defaulted_optional_parameter",
+        format!(
+            "public entrypoint `{item_name}` immediately defaults optional positional parameters ({param_names}); prefer a `bon` builder so callers can omit defaulted values instead of passing `None`"
+        ),
+    ));
+    true
+}
+
+fn analyze_optional_parameter_builder_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    typed_inputs: &[(Option<String>, &Type)],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    if typed_inputs.len() < 2 || !is_builderish_function_name(item_name) {
+        return false;
+    }
+
+    let optional_params = typed_inputs
+        .iter()
+        .filter(|(_, ty)| type_is_option_surface(ty))
+        .filter_map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    if optional_params.is_empty() {
+        return false;
+    }
+
+    let param_names = optional_params
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diagnostics.push(Diagnostic::policy(
+        Some(path.to_path_buf()),
+        Some(line),
+        "api_optional_parameter_builder",
+        format!(
+            "public entrypoint `{item_name}` takes optional positional parameters ({param_names}); prefer a `bon` builder so callers can omit unset values instead of passing `None`"
+        ),
+    ));
+    true
+}
+
+fn defaulted_optional_params(
+    block: &syn::Block,
+    typed_inputs: &[(Option<String>, &Type)],
+) -> Vec<String> {
+    let option_params = typed_inputs
+        .iter()
+        .filter(|(_, ty)| type_is_option_surface(ty))
+        .filter_map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    if option_params.is_empty() {
+        return Vec::new();
+    }
+
+    let mut visitor = DefaultedOptionParamVisitor {
+        option_params: &option_params,
+        defaulted_params: BTreeSet::new(),
+    };
+    visitor.visit_block(block);
+    visitor.defaulted_params.into_iter().collect()
+}
+
+struct DefaultedOptionParamVisitor<'a> {
+    option_params: &'a BTreeSet<String>,
+    defaulted_params: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for DefaultedOptionParamVisitor<'_> {
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if matches!(
+            node.method.to_string().as_str(),
+            "unwrap_or" | "unwrap_or_else" | "unwrap_or_default" | "map_or"
+        ) && let Some(param_name) = expr_simple_path_ident(node.receiver.as_ref())
+            && self.option_params.contains(&param_name)
+        {
+            self.defaulted_params.insert(param_name);
+        }
+
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+fn repeated_parameter_cluster_signature(
+    item_name: &str,
+    typed_inputs: &[(Option<String>, &Type)],
+    output: &ReturnType,
+) -> Option<Vec<(String, String)>> {
+    if typed_inputs.len() < 3 {
+        return None;
+    }
+    if !is_builderish_function_name(item_name) && !output_returns_constructed_type(output) {
+        return None;
+    }
+    let has_weak_param = typed_inputs
+        .iter()
+        .any(|(_, ty)| is_weak_builder_param_type(ty));
+    if typed_inputs.len() < 4 && !has_weak_param {
+        return None;
+    }
+
+    typed_inputs
+        .iter()
+        .map(|(name, ty)| Some((name.clone()?, type_cluster_fingerprint(ty)?)))
+        .collect()
 }
 
 fn analyze_standalone_builder_surfaces(
@@ -1281,6 +1539,65 @@ fn analyze_public_stringly_model_scaffolds(
     ));
 }
 
+fn analyze_public_stringly_protocol_collection_const(
+    path: &Path,
+    item_const: &ItemConst,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_const.vis) {
+        return;
+    }
+
+    analyze_stringly_protocol_collection_binding(
+        path,
+        item_const.span().start().line,
+        &item_const.ident.to_string(),
+        &item_const.ty,
+        diagnostics,
+    );
+}
+
+fn analyze_public_stringly_protocol_collection_static(
+    path: &Path,
+    item_static: &ItemStatic,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_static.vis) {
+        return;
+    }
+
+    analyze_stringly_protocol_collection_binding(
+        path,
+        item_static.span().start().line,
+        &item_static.ident.to_string(),
+        &item_static.ty,
+        diagnostics,
+    );
+}
+
+fn analyze_stringly_protocol_collection_binding(
+    path: &Path,
+    line: usize,
+    binding_name: &str,
+    ty: &Type,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !type_is_string_collection_surface(ty)
+        || !collection_name_suggests_protocol_model(binding_name)
+    {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(line),
+        "api_stringly_protocol_collection",
+        format!(
+            "public collection `{binding_name}` stores protocol or state values as raw strings; prefer typed enums, newtypes, or a typed descriptor map and render strings only at the boundary"
+        ),
+    ));
+}
+
 fn enum_metadata_helper(method: &ImplItemFn) -> Option<MetadataHelperKind> {
     if !is_public(&method.vis) || method.sig.constness.is_some() || method.sig.inputs.len() != 1 {
         return None;
@@ -1504,10 +1821,61 @@ fn output_returns_constructed_type(output: &ReturnType) -> bool {
 
 fn is_weak_builder_param_type(ty: &Type) -> bool {
     type_is_bool(ty)
+        || type_is_option_surface(ty)
         || type_is_string_surface(ty)
         || type_is_string_field(ty)
         || borrowed_or_owned_type_leaf_ident(ty)
             .is_some_and(|type_name| is_obvious_scalar_type_name(&type_name))
+}
+
+fn type_is_option_surface(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(reference) => type_is_option_surface(&reference.elem),
+        Type::Path(_) => type_leaf_ident(ty).is_some_and(|ident| ident == "Option"),
+        _ => false,
+    }
+}
+
+fn type_cluster_fingerprint(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Reference(reference) => {
+            Some(format!("&{}", type_cluster_fingerprint(&reference.elem)?))
+        }
+        Type::Path(type_path) => {
+            let mut parts = Vec::new();
+            for segment in &type_path.path.segments {
+                let mut part = segment.ident.to_string();
+                if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                    let inners = args
+                        .args
+                        .iter()
+                        .filter_map(|arg| match arg {
+                            GenericArgument::Type(inner) => type_cluster_fingerprint(inner),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if !inners.is_empty() {
+                        part.push('<');
+                        part.push_str(&inners.join(","));
+                        part.push('>');
+                    }
+                }
+                parts.push(part);
+            }
+            Some(parts.join("::"))
+        }
+        Type::Tuple(tuple) => Some(format!(
+            "({})",
+            tuple
+                .elems
+                .iter()
+                .filter_map(type_cluster_fingerprint)
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
+        Type::Slice(slice) => Some(format!("[{}]", type_cluster_fingerprint(&slice.elem)?)),
+        _ => borrowed_or_owned_type_leaf_ident(ty),
+    }
 }
 
 fn repeated_simplified_type_names(typed_inputs: &[(Option<String>, &Type)]) -> Vec<String> {
@@ -1627,6 +1995,17 @@ fn block_single_expr(block: &syn::Block) -> Option<&Expr> {
         Stmt::Expr(expr, _) => Some(expr),
         _ => None,
     }
+}
+
+fn expr_simple_path_ident(expr: &Expr) -> Option<String> {
+    let Expr::Path(expr_path) = expr else {
+        return None;
+    };
+    if expr_path.path.segments.len() != 1 {
+        return None;
+    }
+
+    expr_path.path.get_ident().map(unraw_ident)
 }
 
 fn body_is_match_on_self(block: &syn::Block) -> bool {
@@ -1930,6 +2309,79 @@ fn type_is_string_field(ty: &Type) -> bool {
     }
 }
 
+fn type_is_string_collection_surface(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(reference) => type_is_string_collection_surface(&reference.elem),
+        Type::Slice(slice) => type_is_string_collection_member(&slice.elem),
+        Type::Array(array) => type_is_string_collection_member(&array.elem),
+        Type::Path(type_path) => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return false;
+            };
+            match segment.ident.to_string().as_str() {
+                "Vec" | "HashSet" | "BTreeSet" => {
+                    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+                        return false;
+                    };
+                    args.args.iter().any(|arg| match arg {
+                        GenericArgument::Type(inner) => type_is_string_collection_member(inner),
+                        _ => false,
+                    })
+                }
+                "HashMap" | "BTreeMap" => {
+                    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+                        return false;
+                    };
+                    args.args.iter().next().is_some_and(|arg| match arg {
+                        GenericArgument::Type(inner) => type_is_string_collection_member(inner),
+                        _ => false,
+                    })
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn type_is_string_collection_member(ty: &Type) -> bool {
+    type_is_string_surface(ty) || type_is_string_field(ty)
+}
+
+fn collection_name_suggests_protocol_model(name: &str) -> bool {
+    let tokens = split_segments(name)
+        .into_iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let protocol_tokens = [
+        "state",
+        "states",
+        "machine",
+        "machines",
+        "protocol",
+        "protocols",
+        "artifact",
+        "artifacts",
+        "transition",
+        "transitions",
+        "gate",
+        "gates",
+        "step",
+        "steps",
+        "phase",
+        "phases",
+    ];
+    let collection_context = ["legal", "allowed", "known", "supported", "available"];
+
+    tokens
+        .iter()
+        .any(|token| protocol_tokens.contains(&token.as_str()))
+        && (tokens
+            .iter()
+            .any(|token| collection_context.contains(&token.as_str()))
+            || tokens.iter().any(|token| token.ends_with('s')))
+}
+
 fn analyze_candidate_semantic_modules(
     path: &Path,
     items: &[Item],
@@ -1990,6 +2442,10 @@ fn analyze_candidate_semantic_modules(
             .map(|(line, _, _)| *line)
             .min()
             .expect("family has at least one member");
+        let module_candidate = head.to_ascii_lowercase();
+        if semantic_module_candidate_already_emitted(diagnostics, path, &module_candidate) {
+            continue;
+        }
         let original_members = members
             .iter()
             .map(|(_, binding_name, _)| format!("`{binding_name}`"))
@@ -2002,7 +2458,6 @@ fn analyze_candidate_semantic_modules(
             .into_iter()
             .collect::<Vec<_>>()
             .join(", ");
-        let module_candidate = head.to_ascii_lowercase();
 
         diagnostics.push(Diagnostic::advisory(
             Some(path.to_path_buf()),
@@ -2097,6 +2552,9 @@ fn analyze_candidate_semantic_modules(
             .map(|member| member.line)
             .min()
             .expect("family has at least one member");
+        if semantic_module_candidate_already_emitted(diagnostics, path, &module_candidate) {
+            continue;
+        }
         let original_members = members
             .iter()
             .map(|member| format!("`{}`", member.original_member))
@@ -2127,6 +2585,19 @@ fn analyze_candidate_semantic_modules(
     }
 
     suppressed_child_module_exports
+}
+
+fn semantic_module_candidate_already_emitted(
+    diagnostics: &[Diagnostic],
+    path: &Path,
+    module_candidate: &str,
+) -> bool {
+    let marker = format!("`{module_candidate}::");
+    diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && diag.file.as_deref() == Some(path)
+            && diag.message.contains(&marker)
+    })
 }
 
 fn public_use_module_binding(

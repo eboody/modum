@@ -268,12 +268,20 @@ These warn when public leaves are too generic for a weak parent, when the path r
   Warning for per-variant `strum` string attributes that could be replaced by one enum-level `serialize_all` rule without changing the external strings.
 - `api_builder_candidate`
   Warning for public constructors or workflow entrypoints that take several positional weak parameters and would read better as a builder or typed options struct. It skips functions already marked with a builder surface.
+- `api_repeated_parameter_cluster`
+  Warning for repeated public constructor or workflow signatures that reuse the same ordered named parameter cluster across entrypoints, when a shared options type or `bon` builder would avoid duplicating the call shape.
+- `api_optional_parameter_builder`
+  Warning for builder-shaped public entrypoints that take positional `Option<_>` parameters and would read better as a `bon` builder, so callers can omit unset values instead of passing `None`.
+- `api_defaulted_optional_parameter`
+  Warning for builder-shaped public entrypoints that immediately default positional `Option<_>` parameters, when a `bon` builder would let callers omit those values entirely.
 - `api_standalone_builder_surface`
   Advisory warning for families of public `with_*` or `set_*` free functions that collectively behave like a builder surface for one type.
 - `api_boolean_protocol_decision`
   Warning for public `bool` parameters or fields that encode a domain or protocol decision rather than a runtime toggle.
 - `api_forwarding_compat_wrapper`
   Warning for explicit conversion helpers such as `to_*` or `into_*` methods that only forward to an existing `From` conversion already present in the crate.
+- `api_stringly_protocol_collection`
+  Advisory warning for public const or static collections that enumerate protocol, state, transition, artifact, gate, or step values as raw strings instead of typed enums or descriptor maps.
 - `api_stringly_model_scaffold`
   Advisory warning for public structs that carry several semantic descriptor fields as raw strings, such as `state_path`, `kind_label`, and `next_machine`, when those concepts would read better as typed enums, newtypes, or a focused descriptor type.
 - `api_redundant_category_suffix`
