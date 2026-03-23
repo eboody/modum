@@ -5,10 +5,10 @@ use std::{
 };
 
 use syn::{
-    Expr, File, FnArg, GenericArgument, ImplItem, ImplItemFn, Item, ItemConst, ItemEnum, ItemFn,
-    ItemImpl, ItemMacro, ItemMod, ItemStatic, ItemStruct, ItemTrait, ItemTraitAlias, ItemType,
-    ItemUnion, ItemUse, Lit, LitStr, PathArguments, ReturnType, Stmt, Type, UseTree,
-    spanned::Spanned, visit::Visit,
+    BinOp, Expr, ExprBinary, File, FnArg, GenericArgument, ImplItem, ImplItemFn, Item, ItemConst,
+    ItemEnum, ItemFn, ItemImpl, ItemMacro, ItemMod, ItemStatic, ItemStruct, ItemTrait,
+    ItemTraitAlias, ItemType, ItemUnion, ItemUse, Lit, LitStr, PathArguments, ReturnType, Stmt,
+    Type, UseTree, spanned::Spanned, visit::Visit,
 };
 
 use super::{
@@ -56,6 +56,26 @@ struct StringFieldSignal {
 #[derive(Default)]
 struct TraitSurfaceCatalog {
     from_targets_by_source: BTreeMap<String, BTreeSet<String>>,
+    display_impl_lines: BTreeMap<String, usize>,
+    error_impl_lines: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BitMaskPatternKind {
+    Check,
+    Assembly,
+}
+
+struct FlagBitPatternUse {
+    boundary_name: String,
+    const_name: String,
+    kind: BitMaskPatternKind,
+    line: usize,
+}
+
+struct FlagBitPatternVisitor<'a> {
+    flag_constants: &'a BTreeSet<String>,
+    uses: Vec<FlagBitPatternUse>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -174,7 +194,13 @@ fn analyze_scope(
         suppressed_child_module_exports: &suppressed_child_module_exports,
     };
     analyze_stringly_public_surfaces(path, items, scope_flags.path_is_public, diagnostics);
-    analyze_modeling_api_surfaces(path, items, scope_flags.path_is_public, diagnostics);
+    analyze_modeling_api_surfaces(
+        path,
+        items,
+        scope_flags.path_is_public,
+        settings,
+        diagnostics,
+    );
 
     for item in items {
         match item {
@@ -200,7 +226,7 @@ fn analyze_scope(
                     );
                 }
             }
-            _ => analyze_public_item(
+            _ => analyze_item_shape(
                 path,
                 item,
                 items,
@@ -267,6 +293,44 @@ fn analyze_module_item(
                 "api_repeated_module_segment",
                 format!(
                     "nested module path repeats `{module_name}`; flatten or rename the redundant segment"
+                ),
+            ));
+        }
+    }
+
+    if !module_is_public {
+        if settings.catch_all_modules.contains(&normalized) {
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(line),
+                "internal_catch_all_module",
+                format!(
+                    "internal module `{module_name}` is a catch-all bucket; prefer a stable domain or facet"
+                ),
+            ));
+        }
+
+        if settings.organizational_modules.contains(&normalized) {
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(line),
+                "internal_organizational_submodule_flatten",
+                format!(
+                    "internal organizational module `{module_name}` should usually be flattened or renamed so the category does not carry the naming burden"
+                ),
+            ));
+        }
+
+        if module_path
+            .last()
+            .is_some_and(|parent| normalize_segment(parent) == normalized)
+        {
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(line),
+                "internal_repeated_module_segment",
+                format!(
+                    "internal nested module path repeats `{module_name}`; flatten or rename the redundant segment"
                 ),
             ));
         }
@@ -499,6 +563,52 @@ fn collect_scope_public_enum_names(items: &[Item]) -> BTreeSet<String> {
     enums
 }
 
+fn collect_scope_public_error_type_names(items: &[Item]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+
+    for item in items {
+        let Some((_, binding_name, is_public)) = public_item_leaf(item) else {
+            continue;
+        };
+        if is_public && looks_like_error_type_name(&binding_name) {
+            names.insert(binding_name);
+        }
+    }
+
+    names
+}
+
+fn collect_scope_flag_constant_names(items: &[Item]) -> BTreeSet<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Const(item_const)
+                if flag_const_name(&item_const.ident.to_string()).is_some()
+                    && type_is_bitflag_integer(&item_const.ty) =>
+            {
+                Some(item_const.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_impl_flag_constant_names(item_impl: &ItemImpl) -> BTreeSet<String> {
+    item_impl
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ImplItem::Const(item_const)
+                if flag_const_name(&item_const.ident.to_string()).is_some()
+                    && type_is_bitflag_integer(&item_const.ty) =>
+            {
+                Some(item_const.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn collect_scope_from_str_targets(items: &[Item]) -> BTreeSet<String> {
     let mut targets = BTreeSet::new();
 
@@ -590,6 +700,7 @@ fn analyze_modeling_api_surfaces(
     path: &Path,
     items: &[Item],
     path_is_public: bool,
+    settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if !path_is_public {
@@ -597,10 +708,21 @@ fn analyze_modeling_api_surfaces(
     }
 
     let public_enum_names = collect_scope_public_enum_names(items);
+    let public_error_type_names = collect_scope_public_error_type_names(items);
+    let scope_flag_constants = collect_scope_flag_constant_names(items);
     let trait_surfaces = collect_scope_trait_surfaces(items);
 
     analyze_standalone_builder_surfaces(path, items, diagnostics);
     analyze_repeated_parameter_clusters(path, items, diagnostics);
+    analyze_public_manual_flag_sets(path, items, diagnostics);
+    if !public_error_type_names.is_empty() {
+        analyze_public_manual_error_surfaces(
+            path,
+            &public_error_type_names,
+            &trait_surfaces,
+            diagnostics,
+        );
+    }
 
     for item in items {
         match item {
@@ -609,14 +731,79 @@ fn analyze_modeling_api_surfaces(
             }
             Item::Struct(item_struct) => {
                 analyze_public_struct_boolean_protocol_decisions(path, item_struct, diagnostics);
+                analyze_public_struct_boolean_flag_clusters(path, item_struct, diagnostics);
+                analyze_public_struct_flag_bit_fields(path, item_struct, diagnostics);
+                analyze_public_struct_string_error_fields(path, item_struct, diagnostics);
+                analyze_public_struct_anyhow_error_fields(path, item_struct, diagnostics);
+                analyze_public_struct_semantic_scalar_fields(
+                    path,
+                    item_struct,
+                    settings,
+                    diagnostics,
+                );
+                analyze_public_struct_numeric_scalar_fields(
+                    path,
+                    item_struct,
+                    settings,
+                    diagnostics,
+                );
+                analyze_public_struct_key_value_bag_fields(
+                    path,
+                    item_struct,
+                    settings,
+                    diagnostics,
+                );
+                analyze_public_struct_protocol_integer_fields(path, item_struct, diagnostics);
+                analyze_public_struct_raw_id_fields(path, item_struct, diagnostics);
             }
             Item::Fn(item_fn) => {
                 analyze_public_fn_boolean_protocol_decisions(path, item_fn, diagnostics);
+                analyze_public_fn_boolean_flag_clusters(path, item_fn, diagnostics);
+                analyze_public_fn_flag_bit_boundaries(
+                    path,
+                    item_fn,
+                    &scope_flag_constants,
+                    diagnostics,
+                );
                 analyze_public_fn_builder_candidate(path, item_fn, diagnostics);
+                analyze_public_stringly_protocol_parameters(path, item_fn, diagnostics);
+                analyze_public_fn_typed_error_surfaces(path, item_fn, diagnostics);
+                analyze_public_fn_semantic_scalar_boundaries(path, item_fn, settings, diagnostics);
+                analyze_public_fn_key_value_bag_surfaces(path, item_fn, settings, diagnostics);
+                analyze_public_fn_protocol_integer_boundaries(path, item_fn, diagnostics);
+                analyze_public_fn_raw_id_boundaries(path, item_fn, diagnostics);
+            }
+            Item::Type(item_type) => {
+                analyze_public_type_alias_error_surfaces(path, item_type, diagnostics);
+                analyze_public_type_alias_raw_id_surface(path, item_type, diagnostics);
+                analyze_public_type_alias_key_value_bag_surface(
+                    path,
+                    item_type,
+                    settings,
+                    diagnostics,
+                );
             }
             Item::Impl(item_impl) => {
                 analyze_public_impl_boolean_protocol_decisions(path, item_impl, diagnostics);
+                analyze_public_impl_boolean_flag_clusters(path, item_impl, diagnostics);
+                analyze_public_impl_flag_bit_boundaries(
+                    path,
+                    item_impl,
+                    &scope_flag_constants,
+                    diagnostics,
+                );
                 analyze_public_impl_builder_candidates(path, item_impl, diagnostics);
+                analyze_public_impl_stringly_protocol_parameters(path, item_impl, diagnostics);
+                analyze_public_impl_typed_error_surfaces(path, item_impl, diagnostics);
+                analyze_public_impl_semantic_scalar_boundaries(
+                    path,
+                    item_impl,
+                    settings,
+                    diagnostics,
+                );
+                analyze_public_impl_key_value_bag_surfaces(path, item_impl, settings, diagnostics);
+                analyze_public_impl_protocol_integer_boundaries(path, item_impl, diagnostics);
+                analyze_public_impl_raw_id_boundaries(path, item_impl, diagnostics);
                 analyze_forwarding_compat_wrappers(path, item_impl, &trait_surfaces, diagnostics);
 
                 if !public_enum_names.is_empty() {
@@ -743,22 +930,404 @@ fn collect_scope_trait_surfaces(items: &[Item]) -> TraitSurfaceCatalog {
             continue;
         };
 
+        let Some(target) = type_leaf_ident(&item_impl.self_ty) else {
+            continue;
+        };
+
         if trait_name.as_str() == "From" {
             let Some(source) = trait_first_generic_type_leaf_ident(trait_path) else {
-                continue;
-            };
-            let Some(target) = type_leaf_ident(&item_impl.self_ty) else {
                 continue;
             };
             catalog
                 .from_targets_by_source
                 .entry(source)
                 .or_default()
-                .insert(target);
+                .insert(target.clone());
+        }
+
+        if trait_path_is_display(trait_path) {
+            catalog
+                .display_impl_lines
+                .entry(target.clone())
+                .or_insert(item_impl.span().start().line);
+        }
+
+        if trait_path_is_error(trait_path) {
+            catalog
+                .error_impl_lines
+                .entry(target)
+                .or_insert(item_impl.span().start().line);
         }
     }
 
     catalog
+}
+
+fn trait_path_is_display(trait_path: &syn::Path) -> bool {
+    trait_path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Display")
+}
+
+fn trait_path_is_error(trait_path: &syn::Path) -> bool {
+    trait_path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Error")
+}
+
+fn analyze_public_manual_flag_sets(path: &Path, items: &[Item], diagnostics: &mut Vec<Diagnostic>) {
+    let flag_consts = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Const(item_const)
+                if is_public(&item_const.vis)
+                    && flag_const_name(&item_const.ident.to_string()).is_some()
+                    && type_is_bitflag_integer(&item_const.ty) =>
+            {
+                Some((item_const.span().start().line, item_const.ident.to_string()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if flag_consts.len() < 3 {
+        return;
+    }
+
+    let line = flag_consts
+        .iter()
+        .map(|(line, _)| *line)
+        .min()
+        .expect("flag consts present");
+    let names = flag_consts
+        .iter()
+        .map(|(_, name)| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(line),
+        "api_manual_flag_set",
+        format!(
+            "public integer flag constants {names} model a manual bit-set surface; prefer a typed flags boundary instead of raw integer bits"
+        ),
+    ));
+}
+
+fn analyze_public_manual_error_surfaces(
+    path: &Path,
+    public_error_type_names: &BTreeSet<String>,
+    trait_surfaces: &TraitSurfaceCatalog,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for error_name in public_error_type_names {
+        let Some(display_line) = trait_surfaces.display_impl_lines.get(error_name) else {
+            continue;
+        };
+        let Some(error_line) = trait_surfaces.error_impl_lines.get(error_name) else {
+            continue;
+        };
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some((*display_line).min(*error_line)),
+            "api_manual_error_surface",
+            format!(
+                "public error `{error_name}` manually implements both `Display` and `Error`; keep the caller-facing error surface focused and typed instead of pushing boundary failures through catch-all formatting"
+            ),
+        ));
+    }
+}
+
+fn analyze_public_struct_boolean_flag_clusters(
+    path: &Path,
+    item_struct: &ItemStruct,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+    let bool_fields = matching_public_named_fields(fields, |_| true, type_is_bool);
+    if bool_fields.len() < 2
+        || bool_fields
+            .iter()
+            .all(|name| looks_like_runtime_toggle_name(name))
+    {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_boolean_flag_cluster",
+        format!(
+            "public struct `{}` carries several boolean flags ({}); prefer a typed options or mode surface when those flags jointly shape behavior",
+            item_struct.ident,
+            render_name_list(&bool_fields),
+        ),
+    ));
+}
+
+fn analyze_public_struct_flag_bit_fields(
+    path: &Path,
+    item_struct: &ItemStruct,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+    let raw_fields =
+        matching_public_named_fields(fields, looks_like_flag_bits_name, type_is_bitflag_integer);
+    if raw_fields.is_empty() {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_manual_flag_set",
+        format!(
+            "public struct `{}` exposes raw bit-flag field(s) {}; prefer a typed flags boundary instead of manual `u32` or `u64` masks",
+            item_struct.ident,
+            render_name_list(&raw_fields),
+        ),
+    ));
+}
+
+fn analyze_public_struct_string_error_fields(
+    path: &Path,
+    item_struct: &ItemStruct,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+    let struct_name = item_struct.ident.to_string();
+    let error_fields = matching_public_named_fields(
+        fields,
+        |name| looks_like_error_field_name(&struct_name, name),
+        type_is_string_field,
+    );
+    if error_fields.is_empty() {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_string_error_surface",
+        format!(
+            "public struct `{}` stores boundary error text as raw string field(s) {}; prefer a typed error surface with named variants or focused error data",
+            item_struct.ident,
+            render_name_list(&error_fields),
+        ),
+    ));
+}
+
+fn analyze_public_struct_anyhow_error_fields(
+    path: &Path,
+    item_struct: &ItemStruct,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+    let anyhow_fields = matching_public_named_fields(fields, |_| true, type_is_anyhow_error_type);
+    if anyhow_fields.is_empty() {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_anyhow_error_surface",
+        format!(
+            "public struct `{}` exposes `anyhow::Error` field(s) {}; keep `anyhow` internal and expose a crate-owned typed error surface at the boundary",
+            item_struct.ident,
+            render_name_list(&anyhow_fields),
+        ),
+    ));
+}
+
+fn analyze_public_struct_semantic_scalar_fields(
+    path: &Path,
+    item_struct: &ItemStruct,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+    let raw_fields = matching_public_named_fields(
+        fields,
+        |name| looks_like_semantic_string_scalar_name(name, settings),
+        type_is_string_field,
+    );
+    if raw_fields.is_empty() {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_semantic_string_scalar",
+        format!(
+            "public struct `{}` carries semantic scalar field(s) {} as raw strings; prefer typed boundary values or focused newtypes",
+            item_struct.ident,
+            render_name_list(&raw_fields),
+        ),
+    ));
+}
+
+fn analyze_public_struct_numeric_scalar_fields(
+    path: &Path,
+    item_struct: &ItemStruct,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+    let raw_fields = matching_public_named_fields(
+        fields,
+        |name| looks_like_semantic_numeric_scalar_name(name, settings),
+        type_is_integer_scalar,
+    );
+    if raw_fields.is_empty() {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_semantic_numeric_scalar",
+        format!(
+            "public struct `{}` carries semantic scalar field(s) {} as raw integers; prefer typed duration, timestamp, port, or domain-specific scalar types",
+            item_struct.ident,
+            render_name_list(&raw_fields),
+        ),
+    ));
+}
+
+fn analyze_public_struct_key_value_bag_fields(
+    path: &Path,
+    item_struct: &ItemStruct,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+    let raw_fields = matching_public_named_fields(
+        fields,
+        |name| looks_like_key_value_bag_name(name, settings),
+        type_is_string_key_value_bag_surface,
+    );
+    if raw_fields.is_empty() {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_raw_key_value_bag",
+        format!(
+            "public struct `{}` exposes stringly key-value bag field(s) {}; prefer a typed metadata or options surface",
+            item_struct.ident,
+            render_name_list(&raw_fields),
+        ),
+    ));
+}
+
+fn analyze_public_struct_protocol_integer_fields(
+    path: &Path,
+    item_struct: &ItemStruct,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+    let raw_fields = matching_public_named_fields(
+        fields,
+        looks_like_protocol_integer_name,
+        type_is_integer_scalar,
+    );
+    if raw_fields.is_empty() {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_integer_protocol_parameter",
+        format!(
+            "public struct `{}` carries protocol field(s) {} as raw integers; prefer typed enums or newtypes for boundary-facing protocol concepts",
+            item_struct.ident,
+            render_name_list(&raw_fields),
+        ),
+    ));
+}
+
+fn analyze_public_struct_raw_id_fields(
+    path: &Path,
+    item_struct: &ItemStruct,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_struct.vis) {
+        return;
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return;
+    };
+    let raw_fields =
+        matching_public_named_fields(fields, looks_like_id_name, type_is_raw_id_scalar);
+    if raw_fields.is_empty() {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_struct.span().start().line),
+        "api_raw_id_surface",
+        format!(
+            "public struct `{}` keeps raw id field(s) {} as strings or primitive integers; prefer id newtypes at the boundary",
+            item_struct.ident,
+            render_name_list(&raw_fields),
+        ),
+    ));
 }
 
 fn analyze_public_enum_manual_display_surfaces(
@@ -965,6 +1534,82 @@ fn analyze_boolean_protocol_decisions_in_signature(
     }
 }
 
+fn analyze_public_fn_boolean_flag_clusters(
+    path: &Path,
+    item_fn: &ItemFn,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    analyze_boolean_flag_cluster_in_signature(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.inputs,
+        diagnostics,
+    );
+}
+
+fn analyze_public_impl_boolean_flag_clusters(
+    path: &Path,
+    item_impl: &ItemImpl,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+
+        analyze_boolean_flag_cluster_in_signature(
+            path,
+            method.span().start().line,
+            &format!("{self_type}::{}", method.sig.ident),
+            &method.sig.inputs,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_boolean_flag_cluster_in_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let bool_params = matching_named_inputs(inputs, |_| true, type_is_bool);
+    if bool_params.len() < 2
+        || bool_params
+            .iter()
+            .all(|name| looks_like_runtime_toggle_name(name))
+    {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(line),
+        "api_boolean_flag_cluster",
+        format!(
+            "public boundary `{item_name}` takes several boolean flags ({}); prefer typed modes, decisions, or an options surface when those flags jointly shape behavior",
+            render_name_list(&bool_params),
+        ),
+    ));
+}
+
 fn analyze_public_fn_builder_candidate(
     path: &Path,
     item_fn: &ItemFn,
@@ -983,6 +1628,925 @@ fn analyze_public_fn_builder_candidate(
         Some(&item_fn.block),
         diagnostics,
     );
+}
+
+fn analyze_public_stringly_protocol_parameters(
+    path: &Path,
+    item_fn: &ItemFn,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    analyze_stringly_protocol_parameters_in_signature(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.inputs,
+        diagnostics,
+    );
+}
+
+fn analyze_public_impl_stringly_protocol_parameters(
+    path: &Path,
+    item_impl: &ItemImpl,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+
+        analyze_stringly_protocol_parameters_in_signature(
+            path,
+            method.span().start().line,
+            &format!("{self_type}::{}", method.sig.ident),
+            &method.sig.inputs,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_stringly_protocol_parameters_in_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let stringly_params = inputs
+        .iter()
+        .filter_map(|input| match input {
+            FnArg::Typed(arg)
+                if typed_arg_name(arg)
+                    .as_deref()
+                    .is_some_and(looks_like_protocol_descriptor_name)
+                    && (type_is_string_input(&arg.ty) || type_is_string_field(&arg.ty)) =>
+            {
+                typed_arg_name(arg)
+            }
+            FnArg::Typed(_) | FnArg::Receiver(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if stringly_params.is_empty() {
+        return;
+    }
+
+    let rendered = stringly_params
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(line),
+        "api_stringly_protocol_parameter",
+        format!(
+            "public boundary `{item_name}` takes stringly protocol or state parameter(s) {rendered}; prefer typed enums or newtypes at the boundary"
+        ),
+    ));
+}
+
+fn analyze_public_fn_flag_bit_boundaries(
+    path: &Path,
+    item_fn: &ItemFn,
+    flag_constants: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    let emitted_signature = analyze_flag_bit_signature(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.inputs,
+        &item_fn.sig.output,
+        diagnostics,
+    );
+    if !emitted_signature {
+        analyze_manual_flag_bit_patterns_in_block(
+            path,
+            item_fn.span().start().line,
+            &item_fn.sig.ident.to_string(),
+            &item_fn.block,
+            flag_constants,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_public_impl_flag_bit_boundaries(
+    path: &Path,
+    item_impl: &ItemImpl,
+    scope_flag_constants: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+    let mut flag_constants = scope_flag_constants.clone();
+    flag_constants.extend(collect_impl_flag_constant_names(item_impl));
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+
+        let item_name = format!("{self_type}::{}", method.sig.ident);
+        let emitted_signature = analyze_flag_bit_signature(
+            path,
+            method.span().start().line,
+            &item_name,
+            &method.sig.inputs,
+            &method.sig.output,
+            diagnostics,
+        );
+        if !emitted_signature {
+            analyze_manual_flag_bit_patterns_in_block(
+                path,
+                method.span().start().line,
+                &item_name,
+                &method.block,
+                &flag_constants,
+                diagnostics,
+            );
+        }
+    }
+}
+
+fn analyze_flag_bit_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    output: &ReturnType,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    let mut emitted = false;
+    let raw_bits =
+        matching_named_inputs(inputs, looks_like_flag_bits_name, type_is_bitflag_integer);
+    if !raw_bits.is_empty() {
+        emitted = true;
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_manual_flag_set",
+            format!(
+                "public boundary `{item_name}` uses raw bit-flag value(s) {}; prefer a typed flags boundary instead of manual `u32` or `u64` masks",
+                render_name_list(&raw_bits),
+            ),
+        ));
+    } else if looks_like_flag_bits_name(item_name)
+        && return_type(output).is_some_and(type_is_bitflag_integer)
+    {
+        emitted = true;
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_manual_flag_set",
+            format!(
+                "public boundary `{item_name}` returns a raw bit-mask surface; prefer a typed flags boundary"
+            ),
+        ));
+    }
+
+    emitted
+}
+
+fn analyze_manual_flag_bit_patterns_in_block(
+    path: &Path,
+    default_line: usize,
+    item_name: &str,
+    block: &syn::Block,
+    flag_constants: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if flag_constants.len() < 2 {
+        return;
+    }
+
+    let uses = collect_flag_bit_pattern_uses(block, flag_constants);
+    if uses.is_empty() {
+        return;
+    }
+
+    let mut grouped =
+        BTreeMap::<String, (usize, BTreeSet<String>, BTreeSet<BitMaskPatternKind>)>::new();
+    for usage in uses {
+        let entry = grouped
+            .entry(usage.boundary_name)
+            .or_insert_with(|| (usage.line, BTreeSet::new(), BTreeSet::new()));
+        entry.0 = entry.0.min(usage.line);
+        entry.1.insert(usage.const_name);
+        entry.2.insert(usage.kind);
+    }
+
+    for (boundary_name, (line, const_names, kinds)) in grouped {
+        if const_names.len() < 2 {
+            continue;
+        }
+
+        let action = match (
+            kinds.contains(&BitMaskPatternKind::Check),
+            kinds.contains(&BitMaskPatternKind::Assembly),
+        ) {
+            (true, true) => "checks and assembles",
+            (true, false) => "checks",
+            (false, true) => "assembles",
+            (false, false) => "manipulates",
+        };
+        let rendered_consts = const_names
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line.max(default_line)),
+            "api_manual_flag_set",
+            format!(
+                "public boundary `{item_name}` {action} raw bit flags on `{boundary_name}` with named flags {rendered_consts}; prefer a typed flags boundary instead of manual bitmask logic"
+            ),
+        ));
+    }
+}
+
+fn collect_flag_bit_pattern_uses(
+    block: &syn::Block,
+    flag_constants: &BTreeSet<String>,
+) -> Vec<FlagBitPatternUse> {
+    let mut visitor = FlagBitPatternVisitor {
+        flag_constants,
+        uses: Vec::new(),
+    };
+    visitor.visit_block(block);
+    visitor.uses
+}
+
+impl<'ast> Visit<'ast> for FlagBitPatternVisitor<'_> {
+    fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
+        if let Some(kind) = bitmask_pattern_kind(&node.op) {
+            let boundaries = collect_bitmask_boundary_names(node.left.as_ref())
+                .into_iter()
+                .chain(collect_bitmask_boundary_names(node.right.as_ref()))
+                .collect::<BTreeSet<_>>();
+            let const_names =
+                collect_bitmask_flag_constant_names(node.left.as_ref(), self.flag_constants)
+                    .into_iter()
+                    .chain(collect_bitmask_flag_constant_names(
+                        node.right.as_ref(),
+                        self.flag_constants,
+                    ))
+                    .collect::<BTreeSet<_>>();
+
+            if !boundaries.is_empty() && !const_names.is_empty() {
+                let line = node.span().start().line;
+                for boundary_name in boundaries {
+                    for const_name in &const_names {
+                        self.uses.push(FlagBitPatternUse {
+                            boundary_name: boundary_name.clone(),
+                            const_name: const_name.clone(),
+                            kind,
+                            line,
+                        });
+                    }
+                }
+            }
+        }
+
+        syn::visit::visit_expr_binary(self, node);
+    }
+}
+
+fn bitmask_pattern_kind(op: &BinOp) -> Option<BitMaskPatternKind> {
+    match op {
+        BinOp::BitAnd(_) | BinOp::BitAndAssign(_) => Some(BitMaskPatternKind::Check),
+        BinOp::BitOr(_) | BinOp::BitOrAssign(_) => Some(BitMaskPatternKind::Assembly),
+        _ => None,
+    }
+}
+
+fn collect_bitmask_boundary_names(expr: &Expr) -> BTreeSet<String> {
+    match expr {
+        Expr::Binary(binary) if bitmask_pattern_kind(&binary.op).is_some() => {
+            collect_bitmask_boundary_names(binary.left.as_ref())
+                .into_iter()
+                .chain(collect_bitmask_boundary_names(binary.right.as_ref()))
+                .collect()
+        }
+        Expr::Field(field) => match &field.member {
+            syn::Member::Named(ident) => {
+                let name = unraw_ident(ident);
+                looks_like_flag_bits_name(&name)
+                    .then_some(name)
+                    .into_iter()
+                    .collect()
+            }
+            syn::Member::Unnamed(_) => BTreeSet::new(),
+        },
+        _ => expr_path_leaf_ident(expr)
+            .filter(|name| looks_like_flag_bits_name(name))
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn collect_bitmask_flag_constant_names(
+    expr: &Expr,
+    flag_constants: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    match expr {
+        Expr::Binary(binary) if bitmask_pattern_kind(&binary.op).is_some() => {
+            collect_bitmask_flag_constant_names(binary.left.as_ref(), flag_constants)
+                .into_iter()
+                .chain(collect_bitmask_flag_constant_names(
+                    binary.right.as_ref(),
+                    flag_constants,
+                ))
+                .collect()
+        }
+        _ => expr_path_leaf_ident(expr)
+            .filter(|name| flag_constants.contains(name))
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn analyze_public_fn_typed_error_surfaces(
+    path: &Path,
+    item_fn: &ItemFn,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    analyze_typed_error_output(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.output,
+        diagnostics,
+    );
+}
+
+fn analyze_public_impl_typed_error_surfaces(
+    path: &Path,
+    item_impl: &ItemImpl,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+
+        analyze_typed_error_output(
+            path,
+            method.span().start().line,
+            &format!("{self_type}::{}", method.sig.ident),
+            &method.sig.output,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_typed_error_output(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    output: &ReturnType,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(output_ty) = return_type(output) else {
+        return;
+    };
+
+    if type_is_result_string_error(output_ty) {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_string_error_surface",
+            format!(
+                "public boundary `{item_name}` returns `Result<_, String>` or another raw string error surface; prefer a typed error boundary"
+            ),
+        ));
+    }
+
+    if type_is_anyhow_result_or_error(output_ty) {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_anyhow_error_surface",
+            format!(
+                "public boundary `{item_name}` exposes `anyhow` in its error surface; keep `anyhow` internal and return a crate-owned typed error boundary"
+            ),
+        ));
+    }
+}
+
+fn analyze_public_fn_semantic_scalar_boundaries(
+    path: &Path,
+    item_fn: &ItemFn,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    analyze_semantic_scalar_signature(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.inputs,
+        &item_fn.sig.output,
+        settings,
+        diagnostics,
+    );
+}
+
+fn analyze_public_impl_semantic_scalar_boundaries(
+    path: &Path,
+    item_impl: &ItemImpl,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+
+        analyze_semantic_scalar_signature(
+            path,
+            method.span().start().line,
+            &format!("{self_type}::{}", method.sig.ident),
+            &method.sig.inputs,
+            &method.sig.output,
+            settings,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_semantic_scalar_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    output: &ReturnType,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let string_scalars = matching_named_inputs(
+        inputs,
+        |name| {
+            looks_like_semantic_string_scalar_name(name, settings)
+                && !looks_like_protocol_descriptor_name(name)
+        },
+        type_is_string_input,
+    );
+    if !string_scalars.is_empty() {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_semantic_string_scalar",
+            format!(
+                "public boundary `{item_name}` uses semantic scalar(s) {} as raw strings; prefer typed boundary values or focused newtypes",
+                render_name_list(&string_scalars),
+            ),
+        ));
+    } else if looks_like_semantic_string_scalar_name(item_name, settings)
+        && !looks_like_render_or_format_helper(item_name)
+        && return_type(output).is_some_and(type_is_string_surface)
+    {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_semantic_string_scalar",
+            format!(
+                "public boundary `{item_name}` returns a semantic scalar as a raw string; prefer a typed boundary value or focused newtype"
+            ),
+        ));
+    }
+
+    let numeric_scalars = matching_named_inputs(
+        inputs,
+        |name| looks_like_semantic_numeric_scalar_name(name, settings),
+        type_is_integer_scalar,
+    );
+    if !numeric_scalars.is_empty() {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_semantic_numeric_scalar",
+            format!(
+                "public boundary `{item_name}` uses semantic scalar(s) {} as raw integers; prefer typed duration, timestamp, port, or domain-specific scalar types",
+                render_name_list(&numeric_scalars),
+            ),
+        ));
+    } else if looks_like_semantic_numeric_scalar_name(item_name, settings)
+        && !looks_like_render_or_format_helper(item_name)
+        && return_type(output).is_some_and(type_is_integer_scalar)
+    {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_semantic_numeric_scalar",
+            format!(
+                "public boundary `{item_name}` returns a semantic scalar as a raw integer; prefer a typed duration, timestamp, port, or domain-specific scalar type"
+            ),
+        ));
+    }
+}
+
+fn analyze_public_fn_key_value_bag_surfaces(
+    path: &Path,
+    item_fn: &ItemFn,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    analyze_key_value_bag_signature(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.inputs,
+        &item_fn.sig.output,
+        settings,
+        diagnostics,
+    );
+}
+
+fn analyze_public_impl_key_value_bag_surfaces(
+    path: &Path,
+    item_impl: &ItemImpl,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+
+        analyze_key_value_bag_signature(
+            path,
+            method.span().start().line,
+            &format!("{self_type}::{}", method.sig.ident),
+            &method.sig.inputs,
+            &method.sig.output,
+            settings,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_key_value_bag_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    output: &ReturnType,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let bag_params = matching_named_inputs(
+        inputs,
+        |name| looks_like_key_value_bag_name(name, settings),
+        type_is_string_key_value_bag_surface,
+    );
+    if !bag_params.is_empty() {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_raw_key_value_bag",
+            format!(
+                "public boundary `{item_name}` exposes stringly key-value bag(s) {}; prefer a typed metadata or options surface",
+                render_name_list(&bag_params),
+            ),
+        ));
+    } else if looks_like_key_value_bag_name(item_name, settings)
+        && !looks_like_render_or_format_helper(item_name)
+        && return_type(output).is_some_and(type_is_string_key_value_bag_surface)
+    {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_raw_key_value_bag",
+            format!(
+                "public boundary `{item_name}` returns a stringly key-value bag; prefer a typed metadata or options surface"
+            ),
+        ));
+    }
+}
+
+fn analyze_public_fn_protocol_integer_boundaries(
+    path: &Path,
+    item_fn: &ItemFn,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    analyze_protocol_integer_signature(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.inputs,
+        &item_fn.sig.output,
+        diagnostics,
+    );
+}
+
+fn analyze_public_impl_protocol_integer_boundaries(
+    path: &Path,
+    item_impl: &ItemImpl,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+
+        analyze_protocol_integer_signature(
+            path,
+            method.span().start().line,
+            &format!("{self_type}::{}", method.sig.ident),
+            &method.sig.inputs,
+            &method.sig.output,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_protocol_integer_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    output: &ReturnType,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let params = matching_named_inputs(
+        inputs,
+        looks_like_protocol_integer_name,
+        type_is_integer_scalar,
+    );
+    if !params.is_empty() {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_integer_protocol_parameter",
+            format!(
+                "public boundary `{item_name}` uses protocol parameter(s) {} as raw integers; prefer typed enums or newtypes for boundary-facing protocol concepts",
+                render_name_list(&params),
+            ),
+        ));
+    } else if looks_like_protocol_integer_name(item_name)
+        && return_type(output).is_some_and(type_is_integer_scalar)
+    {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_integer_protocol_parameter",
+            format!(
+                "public boundary `{item_name}` returns a protocol concept as a raw integer; prefer a typed enum or newtype"
+            ),
+        ));
+    }
+}
+
+fn analyze_public_fn_raw_id_boundaries(
+    path: &Path,
+    item_fn: &ItemFn,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_fn.vis) {
+        return;
+    }
+
+    analyze_raw_id_signature(
+        path,
+        item_fn.span().start().line,
+        &item_fn.sig.ident.to_string(),
+        &item_fn.sig.inputs,
+        &item_fn.sig.output,
+        diagnostics,
+    );
+}
+
+fn analyze_public_impl_raw_id_boundaries(
+    path: &Path,
+    item_impl: &ItemImpl,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if item_impl.trait_.is_some() {
+        return;
+    }
+
+    let Some(self_type) = type_leaf_ident(&item_impl.self_ty) else {
+        return;
+    };
+
+    for item in &item_impl.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        if !is_public(&method.vis) {
+            continue;
+        }
+
+        analyze_raw_id_signature(
+            path,
+            method.span().start().line,
+            &format!("{self_type}::{}", method.sig.ident),
+            &method.sig.inputs,
+            &method.sig.output,
+            diagnostics,
+        );
+    }
+}
+
+fn analyze_raw_id_signature(
+    path: &Path,
+    line: usize,
+    item_name: &str,
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    output: &ReturnType,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let raw_ids = matching_named_inputs(inputs, looks_like_id_name, type_is_raw_id_scalar);
+    if !raw_ids.is_empty() {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_raw_id_surface",
+            format!(
+                "public boundary `{item_name}` uses raw id value(s) {}; prefer typed id newtypes at the boundary",
+                render_name_list(&raw_ids),
+            ),
+        ));
+    } else if looks_like_id_name(item_name)
+        && return_type(output).is_some_and(type_is_raw_id_scalar)
+    {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_raw_id_surface",
+            format!(
+                "public boundary `{item_name}` returns a raw id value; prefer a typed id newtype at the boundary"
+            ),
+        ));
+    }
+}
+
+fn analyze_public_type_alias_error_surfaces(
+    path: &Path,
+    item_type: &ItemType,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_type.vis) {
+        return;
+    }
+
+    if type_is_result_string_error(item_type.ty.as_ref()) {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(item_type.span().start().line),
+            "api_string_error_surface",
+            format!(
+                "public type alias `{}` keeps a raw string error surface; prefer a typed error boundary",
+                item_type.ident
+            ),
+        ));
+    }
+
+    if type_is_anyhow_result_or_error(item_type.ty.as_ref()) {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(item_type.span().start().line),
+            "api_anyhow_error_surface",
+            format!(
+                "public type alias `{}` exposes `anyhow` in the caller-facing error surface; keep `anyhow` internal and expose a typed crate-owned error boundary",
+                item_type.ident
+            ),
+        ));
+    }
+}
+
+fn analyze_public_type_alias_raw_id_surface(
+    path: &Path,
+    item_type: &ItemType,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_type.vis)
+        || !looks_like_id_name(&item_type.ident.to_string())
+        || !type_is_raw_id_scalar(item_type.ty.as_ref())
+    {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_type.span().start().line),
+        "api_raw_id_surface",
+        format!(
+            "public type alias `{}` keeps an id as a raw string or primitive integer; prefer a typed id newtype",
+            item_type.ident
+        ),
+    ));
+}
+
+fn analyze_public_type_alias_key_value_bag_surface(
+    path: &Path,
+    item_type: &ItemType,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_public(&item_type.vis)
+        || !looks_like_key_value_bag_name(&item_type.ident.to_string(), settings)
+        || !type_is_string_key_value_bag_surface(item_type.ty.as_ref())
+    {
+        return;
+    }
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(item_type.span().start().line),
+        "api_raw_key_value_bag",
+        format!(
+            "public type alias `{}` keeps a stringly key-value bag at the boundary; prefer a typed metadata or options surface",
+            item_type.ident
+        ),
+    ));
 }
 
 fn analyze_public_impl_builder_candidates(
@@ -1384,7 +2948,13 @@ fn analyze_public_enum_impl_string_helpers(
         .filter(|(_, is_string)| *is_string)
         .count();
     let typed_helpers = metadata_helpers.len() - string_helpers;
-    if metadata_helpers.len() >= 3 && (string_helpers >= 2 || typed_helpers >= 1) {
+    let strong_metadata_helpers = metadata_helpers
+        .iter()
+        .filter(|(name, _)| looks_like_enum_metadata_helper_name(name))
+        .count();
+    if (metadata_helpers.len() >= 2 && strong_metadata_helpers >= 2)
+        || (metadata_helpers.len() >= 3 && (string_helpers >= 2 || typed_helpers >= 1))
+    {
         let helpers = metadata_helpers
             .iter()
             .map(|(name, _)| format!("`{name}`"))
@@ -1621,6 +3191,9 @@ fn enum_metadata_helper(method: &ImplItemFn) -> Option<MetadataHelperKind> {
     if !matches!(method.sig.inputs.first(), Some(FnArg::Receiver(_))) {
         return None;
     }
+    if !looks_like_enum_metadata_helper_name(&method.sig.ident.to_string()) {
+        return None;
+    }
     if !body_is_match_on_self(&method.block) {
         return None;
     }
@@ -1630,6 +3203,16 @@ fn enum_metadata_helper(method: &ImplItemFn) -> Option<MetadataHelperKind> {
     }
 
     returns_metadata_surface(&method.sig.output).then_some(MetadataHelperKind::TypedSurface)
+}
+
+fn looks_like_enum_metadata_helper_name(name: &str) -> bool {
+    let tokens = name_tokens(name);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "code" | "label" | "description" | "color" | "icon" | "tag" | "name" | "status"
+        )
+    })
 }
 
 fn manual_enum_parse_helper_name(method: &ImplItemFn, enum_name: &str) -> Option<String> {
@@ -1740,6 +3323,41 @@ fn type_is_bool(ty: &Type) -> bool {
     borrowed_or_owned_type_leaf_ident(ty).is_some_and(|ident| ident == "bool")
 }
 
+fn type_is_integer_scalar(ty: &Type) -> bool {
+    borrowed_or_owned_type_leaf_ident(ty).is_some_and(|ident| {
+        matches!(
+            ident.as_str(),
+            "u8" | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+        )
+    })
+}
+
+fn type_is_bitflag_integer(ty: &Type) -> bool {
+    borrowed_or_owned_type_leaf_ident(ty)
+        .is_some_and(|ident| matches!(ident.as_str(), "u32" | "u64"))
+}
+
+fn type_is_raw_id_scalar(ty: &Type) -> bool {
+    type_is_string_input(ty) || type_is_string_field(ty) || type_is_integer_scalar(ty)
+}
+
+fn return_type(output: &ReturnType) -> Option<&Type> {
+    match output {
+        ReturnType::Default => None,
+        ReturnType::Type(_, ty) => Some(ty.as_ref()),
+    }
+}
+
 fn single_public_enum_input(
     inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
     public_enum_names: &BTreeSet<String>,
@@ -1811,6 +3429,47 @@ fn typed_arg_name(arg: &syn::PatType) -> Option<String> {
     };
 
     Some(unraw_ident(&ident.ident))
+}
+
+fn matching_named_inputs(
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+    name_pred: impl Fn(&str) -> bool,
+    type_pred: impl Fn(&Type) -> bool,
+) -> Vec<String> {
+    inputs
+        .iter()
+        .filter_map(|input| match input {
+            FnArg::Typed(arg) => {
+                let name = typed_arg_name(arg)?;
+                (name_pred(&name) && type_pred(&arg.ty)).then_some(name)
+            }
+            FnArg::Receiver(_) => None,
+        })
+        .collect()
+}
+
+fn matching_public_named_fields(
+    fields: &syn::FieldsNamed,
+    name_pred: impl Fn(&str) -> bool,
+    type_pred: impl Fn(&Type) -> bool,
+) -> Vec<String> {
+    fields
+        .named
+        .iter()
+        .filter(|field| is_public(&field.vis))
+        .filter_map(|field| {
+            let name = field.ident.as_ref().map(unraw_ident)?;
+            (name_pred(&name) && type_pred(&field.ty)).then_some(name)
+        })
+        .collect()
+}
+
+fn render_name_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn is_builderish_function_name(name: &str) -> bool {
@@ -1934,30 +3593,10 @@ fn standalone_builder_subject_type(item_fn: &ItemFn) -> Option<String> {
 }
 
 fn looks_like_protocol_decision_bool(item_name: &str, bool_name: &str) -> bool {
-    let item_tokens = split_segments(item_name)
-        .into_iter()
-        .map(|segment| segment.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let bool_tokens = split_segments(bool_name)
-        .into_iter()
-        .map(|segment| segment.to_ascii_lowercase())
-        .collect::<Vec<_>>();
+    let item_tokens = name_tokens(item_name);
+    let bool_tokens = name_tokens(bool_name);
 
-    let toggle_tokens = [
-        "verbose",
-        "pretty",
-        "recursive",
-        "follow",
-        "force",
-        "color",
-        "dry",
-        "strict",
-        "debug",
-    ];
-    if bool_tokens
-        .iter()
-        .any(|token| toggle_tokens.contains(&token.as_str()))
-    {
+    if looks_like_runtime_toggle_name(bool_name) {
         return false;
     }
 
@@ -2022,6 +3661,23 @@ fn expr_simple_path_ident(expr: &Expr) -> Option<String> {
     }
 
     expr_path.path.get_ident().map(unraw_ident)
+}
+
+fn expr_path_leaf_ident(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(expr_path) => expr_path
+            .path
+            .segments
+            .last()
+            .map(|segment| unraw_ident(&segment.ident)),
+        Expr::Group(group) => expr_path_leaf_ident(&group.expr),
+        Expr::Paren(paren) => expr_path_leaf_ident(&paren.expr),
+        Expr::Reference(reference) => expr_path_leaf_ident(&reference.expr),
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+            expr_path_leaf_ident(&unary.expr)
+        }
+        _ => None,
+    }
 }
 
 fn body_is_match_on_self(block: &syn::Block) -> bool {
@@ -2260,6 +3916,184 @@ fn is_obvious_scalar_type_name(type_name: &str) -> bool {
     )
 }
 
+fn type_is_result_string_error(ty: &Type) -> bool {
+    result_error_type(ty).is_some_and(type_is_string_surface)
+}
+
+fn type_is_anyhow_result_or_error(ty: &Type) -> bool {
+    type_is_anyhow_error_type(ty) || result_error_type(ty).is_some_and(type_is_anyhow_error_type)
+}
+
+fn result_error_type(ty: &Type) -> Option<&Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Result" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args
+        .iter()
+        .filter_map(|arg| match arg {
+            GenericArgument::Type(inner) => Some(inner),
+            _ => None,
+        })
+        .nth(1)
+}
+
+fn type_is_anyhow_error_type(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .iter()
+        .any(|segment| segment.ident == "anyhow")
+        && type_path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| matches!(segment.ident.to_string().as_str(), "Error" | "Result"))
+}
+
+fn looks_like_error_type_name(name: &str) -> bool {
+    name == "Error" || name.ends_with("Error")
+}
+
+fn flag_const_name(name: &str) -> Option<String> {
+    (name.starts_with("FLAG_")
+        || name.ends_with("_FLAG")
+        || name.contains("_FLAG_")
+        || name.ends_with("_FLAGS"))
+    .then(|| name.to_string())
+}
+
+fn item_name_leaf(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+fn name_tokens(name: &str) -> Vec<String> {
+    split_segments(item_name_leaf(name))
+        .into_iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect()
+}
+
+fn name_matches_configured_token_family(name: &str, configured: &BTreeSet<String>) -> bool {
+    name_tokens(name)
+        .iter()
+        .any(|token| configured.contains(token))
+}
+
+fn looks_like_error_surface_type_name(name: &str) -> bool {
+    let tokens = name_tokens(name);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "error"
+                | "errors"
+                | "failure"
+                | "failures"
+                | "rejection"
+                | "rejections"
+                | "reject"
+                | "rejected"
+                | "invalid"
+                | "denied"
+                | "forbidden"
+                | "unauthorized"
+        )
+    })
+}
+
+fn looks_like_error_field_name(type_name: &str, field_name: &str) -> bool {
+    let tokens = name_tokens(field_name);
+    let has_strong_error_token = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "error" | "errors" | "message"));
+    if has_strong_error_token {
+        return true;
+    }
+
+    let has_soft_error_token = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "reason" | "detail"));
+    has_soft_error_token && looks_like_error_surface_type_name(type_name)
+}
+
+fn looks_like_semantic_string_scalar_name(name: &str, settings: &NamespaceSettings) -> bool {
+    let tokens = name_tokens(name);
+    name_matches_configured_token_family(name, &settings.semantic_string_scalars)
+        && !tokens.iter().any(|token| token == "id")
+}
+
+fn looks_like_semantic_numeric_scalar_name(name: &str, settings: &NamespaceSettings) -> bool {
+    name_matches_configured_token_family(name, &settings.semantic_numeric_scalars)
+}
+
+fn looks_like_key_value_bag_name(name: &str, settings: &NamespaceSettings) -> bool {
+    name_matches_configured_token_family(name, &settings.key_value_bag_names)
+}
+
+fn looks_like_runtime_toggle_name(name: &str) -> bool {
+    let tokens = name_tokens(name);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "verbose"
+                | "pretty"
+                | "recursive"
+                | "follow"
+                | "force"
+                | "color"
+                | "dry"
+                | "strict"
+                | "debug"
+                | "compact"
+                | "quiet"
+        )
+    })
+}
+
+fn looks_like_render_or_format_helper(name: &str) -> bool {
+    matches!(
+        name_tokens(name).first().map(String::as_str),
+        Some("render" | "format" | "display" | "view" | "as" | "to")
+    )
+}
+
+fn looks_like_flag_bits_name(name: &str) -> bool {
+    let tokens = name_tokens(name);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "flag" | "flags" | "permission" | "permissions" | "mask" | "bits"
+        )
+    })
+}
+
+fn looks_like_protocol_integer_name(name: &str) -> bool {
+    let tokens = name_tokens(name);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "status" | "kind" | "mode" | "phase" | "step" | "state" | "variant"
+        )
+    })
+}
+
+fn looks_like_id_name(name: &str) -> bool {
+    let tokens = name_tokens(name);
+    name == "id"
+        || name.ends_with("_id")
+        || name.ends_with("Id")
+        || tokens.iter().any(|token| token == "id")
+}
+
 fn string_field_signal(field: &syn::Field) -> Option<StringFieldSignal> {
     let name = field.ident.as_ref().map(unraw_ident)?;
     if !type_is_string_field(&field.ty) {
@@ -2360,6 +4194,57 @@ fn type_is_string_collection_surface(ty: &Type) -> bool {
     }
 }
 
+fn type_is_string_key_value_bag_surface(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(reference) => type_is_string_key_value_bag_surface(&reference.elem),
+        Type::Path(type_path) => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return false;
+            };
+            match segment.ident.to_string().as_str() {
+                "HashMap" | "BTreeMap" => {
+                    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+                        return false;
+                    };
+                    let mut types = args.args.iter().filter_map(|arg| match arg {
+                        GenericArgument::Type(inner) => Some(inner),
+                        _ => None,
+                    });
+                    let Some(key) = types.next() else {
+                        return false;
+                    };
+                    let Some(value) = types.next() else {
+                        return false;
+                    };
+                    type_is_string_collection_member(key) && type_is_string_collection_member(value)
+                }
+                "Vec" => {
+                    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+                        return false;
+                    };
+                    args.args.iter().any(|arg| match arg {
+                        GenericArgument::Type(inner) => type_is_two_string_tuple(inner),
+                        _ => false,
+                    })
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn type_is_two_string_tuple(ty: &Type) -> bool {
+    let Type::Tuple(tuple) = ty else {
+        return false;
+    };
+    if tuple.elems.len() != 2 {
+        return false;
+    }
+
+    tuple.elems.iter().all(type_is_string_collection_member)
+}
+
 fn type_is_string_collection_member(ty: &Type) -> bool {
     type_is_string_surface(ty) || type_is_string_field(ty)
 }
@@ -2396,6 +4281,32 @@ fn collection_name_suggests_protocol_model(name: &str) -> bool {
             .iter()
             .any(|token| collection_context.contains(&token.as_str()))
             || tokens.iter().any(|token| token.ends_with('s')))
+}
+
+fn looks_like_protocol_descriptor_name(name: &str) -> bool {
+    let tokens = split_segments(name)
+        .into_iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let strong_tokens = [
+        "state",
+        "status",
+        "mode",
+        "phase",
+        "step",
+        "gate",
+        "transition",
+        "artifact",
+        "machine",
+        "protocol",
+        "kind",
+        "variant",
+        "path",
+    ];
+
+    tokens
+        .iter()
+        .any(|token| strong_tokens.contains(&token.as_str()))
 }
 
 fn analyze_candidate_semantic_modules(
@@ -2880,7 +4791,7 @@ fn resolve_local_module_path(module_path: &[String], use_path: &[String]) -> Opt
     None
 }
 
-fn analyze_public_item(
+fn analyze_item_shape(
     path: &Path,
     item: &Item,
     scope_items: &[Item],
@@ -2892,19 +4803,23 @@ fn analyze_public_item(
     let Some((line, leaf_name, is_item_public)) = public_item_leaf(item) else {
         return;
     };
-    if !(path_is_public && is_item_public) {
+    if !is_internal_shape_candidate_item(item) {
         return;
     }
 
-    analyze_public_leaf(
-        path,
-        line,
-        scope_items,
-        module_path,
-        &leaf_name,
-        settings,
-        diagnostics,
-    );
+    if path_is_public && is_item_public {
+        analyze_public_leaf(
+            path,
+            line,
+            scope_items,
+            module_path,
+            &leaf_name,
+            settings,
+            diagnostics,
+        );
+    } else {
+        analyze_internal_leaf(path, line, module_path, &leaf_name, settings, diagnostics);
+    }
 }
 
 fn analyze_public_leaf(
@@ -2980,6 +4895,71 @@ fn analyze_public_leaf(
                 "`{}` repeats the `{parent_module}` context; prefer `{}`",
                 render_public_path(module_path, leaf_name),
                 render_preferred_public_path(module_path, &shorter_leaf, settings)
+            ),
+        ));
+    }
+}
+
+fn analyze_internal_leaf(
+    path: &Path,
+    line: usize,
+    module_path: &[String],
+    leaf_name: &str,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(parent_module) = module_path.last() else {
+        return;
+    };
+    let parent_normalized = normalize_segment(parent_module);
+
+    if settings.weak_modules.contains(&parent_normalized)
+        && settings.generic_nouns.contains(leaf_name)
+    {
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "internal_weak_module_generic_leaf",
+            format!(
+                "internal item `{}` is too generic for weak module `{parent_module}`; keep the domain in the leaf or choose a stronger module",
+                render_public_path(module_path, leaf_name),
+            ),
+        ));
+        return;
+    }
+
+    if let Some(shorter_leaf) = redundant_category_suffix_leaf(parent_module, leaf_name, settings) {
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "internal_redundant_category_suffix",
+            format!(
+                "internal item `{}` repeats the `{parent_module}` category; prefer `{}`",
+                render_public_path(module_path, leaf_name),
+                render_public_path(module_path, &shorter_leaf),
+            ),
+        ));
+        return;
+    }
+
+    if settings.weak_modules.contains(&parent_normalized)
+        || settings.catch_all_modules.contains(&parent_normalized)
+    {
+        return;
+    }
+
+    if let Some(shorter_leaf) = redundant_leaf_context_candidate(parent_module, leaf_name) {
+        if internal_shorter_leaf_is_too_generic(&shorter_leaf) {
+            return;
+        }
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            "internal_redundant_leaf_context",
+            format!(
+                "internal item `{}` repeats the `{parent_module}` context; prefer `{}`",
+                render_public_path(module_path, leaf_name),
+                render_public_path(module_path, &shorter_leaf),
             ),
         ));
     }
@@ -3443,6 +5423,18 @@ fn public_item_leaf(item: &Item) -> Option<(usize, String, bool)> {
     }
 }
 
+fn is_internal_shape_candidate_item(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Struct(_)
+            | Item::Enum(_)
+            | Item::Trait(_)
+            | Item::TraitAlias(_)
+            | Item::Type(_)
+            | Item::Union(_)
+    )
+}
+
 fn redundant_category_suffix_leaf(
     parent_module: &str,
     leaf_name: &str,
@@ -3507,6 +5499,20 @@ fn redundant_leaf_context_candidate(parent_module: &str, leaf_name: &str) -> Opt
     }
 
     None
+}
+
+fn internal_shorter_leaf_is_too_generic(shorter_leaf: &str) -> bool {
+    let weak_tokens = [
+        "ext", "ctx", "config", "kind", "input", "output", "items", "status", "shared", "global",
+        "attrs", "attr", "param", "params", "name", "names", "doc", "docs", "default", "parsing",
+        "gen", "member", "message", "state", "origin", "error", "request", "response", "outcome",
+    ];
+    let tokens = name_tokens(shorter_leaf);
+
+    !tokens.is_empty()
+        && tokens
+            .iter()
+            .all(|token| weak_tokens.contains(&token.as_str()))
 }
 
 fn render_public_path(module_path: &[String], leaf_name: &str) -> String {

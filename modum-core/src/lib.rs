@@ -14,8 +14,8 @@ mod diagnostic;
 mod namespace;
 
 pub use diagnostic::{
-    Diagnostic, DiagnosticClass, DiagnosticFix, DiagnosticFixKind, DiagnosticLevel,
-    DiagnosticSelection,
+    Diagnostic, DiagnosticClass, DiagnosticCodeInfo, DiagnosticFix, DiagnosticFixKind,
+    DiagnosticLevel, DiagnosticSelection, LintProfile, diagnostic_code_info,
 };
 
 const DEFAULT_GENERIC_NOUNS: &[&str] = &[
@@ -66,6 +66,24 @@ const DEFAULT_NAMESPACE_PRESERVING_MODULES: &[&str] = &[
     "transport",
     "infra",
     "write_back",
+];
+
+const DEFAULT_SEMANTIC_STRING_SCALARS: &[&str] =
+    &["email", "url", "uri", "path", "locale", "currency", "ip"];
+
+const DEFAULT_SEMANTIC_NUMERIC_SCALARS: &[&str] =
+    &["duration", "timeout", "ttl", "timestamp", "port"];
+
+const DEFAULT_KEY_VALUE_BAG_NAMES: &[&str] = &[
+    "metadata",
+    "attribute",
+    "attributes",
+    "header",
+    "headers",
+    "param",
+    "params",
+    "tag",
+    "tags",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +161,26 @@ impl WorkspaceReport {
             diagnostics,
         }
     }
+
+    pub fn filtered_by_profile(&self, profile: LintProfile) -> Self {
+        let diagnostics = self
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.included_in_profile(profile))
+            .cloned()
+            .collect::<Vec<_>>();
+        let files_with_violations = diagnostics
+            .iter()
+            .filter_map(|diag| diag.file.as_ref())
+            .collect::<BTreeSet<_>>()
+            .len();
+
+        Self {
+            scanned_files: self.scanned_files,
+            files_with_violations,
+            diagnostics,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +221,12 @@ pub struct ScanSettings {
     pub exclude: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AnalysisSettings {
+    pub scan: ScanSettings,
+    pub profile: Option<LintProfile>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NamespaceSettings {
     generic_nouns: BTreeSet<String>,
@@ -190,6 +234,21 @@ struct NamespaceSettings {
     catch_all_modules: BTreeSet<String>,
     organizational_modules: BTreeSet<String>,
     namespace_preserving_modules: BTreeSet<String>,
+    semantic_string_scalars: BTreeSet<String>,
+    semantic_numeric_scalars: BTreeSet<String>,
+    key_value_bag_names: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageSettings {
+    namespace: NamespaceSettings,
+    profile: Option<LintProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSettings {
+    namespace: NamespaceSettings,
+    profile: LintProfile,
 }
 
 impl Default for NamespaceSettings {
@@ -215,12 +274,45 @@ impl Default for NamespaceSettings {
                 .iter()
                 .map(|module| (*module).to_string())
                 .collect(),
+            semantic_string_scalars: DEFAULT_SEMANTIC_STRING_SCALARS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            semantic_numeric_scalars: DEFAULT_SEMANTIC_NUMERIC_SCALARS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            key_value_bag_names: DEFAULT_KEY_VALUE_BAG_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
         }
     }
 }
 
 pub fn parse_check_mode(raw: &str) -> Result<CheckMode, String> {
     CheckMode::parse(raw)
+}
+
+pub fn parse_lint_profile(raw: &str) -> Result<LintProfile, String> {
+    raw.parse()
+}
+
+pub fn render_diagnostic_explanation(code: &str) -> Option<String> {
+    let info = diagnostic_code_info(code)?;
+    let mut rendered = format!(
+        "{code}\nprofile: {}\nsummary: {}",
+        info.profile.as_str(),
+        info.summary,
+    );
+
+    if let Some(details) = diagnostic_explanation_details(code) {
+        for detail in details {
+            let _ = write!(rendered, "\n{detail}");
+        }
+    }
+
+    Some(rendered)
 }
 
 pub fn run_check(root: &Path, include_globs: &[String], mode: CheckMode) -> CheckOutcome {
@@ -239,6 +331,21 @@ pub fn run_check_with_scan_settings(
     scan_settings: &ScanSettings,
     mode: CheckMode,
 ) -> CheckOutcome {
+    run_check_with_settings(
+        root,
+        &AnalysisSettings {
+            scan: scan_settings.clone(),
+            profile: None,
+        },
+        mode,
+    )
+}
+
+pub fn run_check_with_settings(
+    root: &Path,
+    settings: &AnalysisSettings,
+    mode: CheckMode,
+) -> CheckOutcome {
     if mode == CheckMode::Off {
         return CheckOutcome {
             report: WorkspaceReport {
@@ -250,7 +357,7 @@ pub fn run_check_with_scan_settings(
         };
     }
 
-    let report = analyze_workspace_with_scan_settings(root, scan_settings);
+    let report = analyze_workspace_with_settings(root, settings);
     let exit_code = check_exit_code(&report, mode);
     CheckOutcome { report, exit_code }
 }
@@ -314,10 +421,24 @@ pub fn analyze_workspace_with_scan_settings(
     root: &Path,
     cli_scan_settings: &ScanSettings,
 ) -> WorkspaceReport {
+    analyze_workspace_with_settings(
+        root,
+        &AnalysisSettings {
+            scan: cli_scan_settings.clone(),
+            profile: None,
+        },
+    )
+}
+
+pub fn analyze_workspace_with_settings(
+    root: &Path,
+    cli_settings: &AnalysisSettings,
+) -> WorkspaceReport {
     let mut diagnostics = Vec::new();
     let workspace_defaults = load_workspace_settings(root, &mut diagnostics);
+    let repo_profile = load_repo_profile(root, &mut diagnostics);
     let repo_scan_settings = load_repo_scan_settings(root, &mut diagnostics);
-    let effective_scan_settings = effective_scan_settings(&repo_scan_settings, cli_scan_settings);
+    let effective_scan_settings = effective_scan_settings(&repo_scan_settings, &cli_settings.scan);
     let rust_files = match collect_rust_files(
         root,
         &effective_scan_settings.include,
@@ -366,10 +487,15 @@ pub fn analyze_workspace_with_scan_settings(
             root,
             file,
             &workspace_defaults,
+            repo_profile,
+            cli_settings.profile,
             &mut package_cache,
             &mut diagnostics,
         );
-        let analysis = analyze_file_with_settings(file, &src, &settings);
+        let mut analysis = analyze_file_with_settings(file, &src, &settings.namespace);
+        analysis
+            .diagnostics
+            .retain(|diag| diag.included_in_profile(settings.profile));
         if !analysis.diagnostics.is_empty() {
             files_with_violations.insert(file.clone());
         }
@@ -424,6 +550,7 @@ fn load_workspace_settings(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Na
             .and_then(|workspace| workspace.get("metadata"))
             .and_then(toml::Value::as_table)
             .and_then(|metadata| metadata.get("modum")),
+        &NamespaceSettings::default(),
         &manifest_path,
         diagnostics,
     )
@@ -469,34 +596,86 @@ fn load_repo_scan_settings(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Sc
     .unwrap_or_default()
 }
 
+fn load_repo_profile(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<LintProfile> {
+    let manifest_path = root.join("Cargo.toml");
+    let Ok(manifest_src) = fs::read_to_string(&manifest_path) else {
+        return None;
+    };
+
+    let manifest: toml::Value = match toml::from_str(&manifest_src) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            diagnostics.push(Diagnostic::error(
+                Some(manifest_path),
+                None,
+                format!("failed to parse Cargo.toml for modum settings: {err}"),
+            ));
+            return None;
+        }
+    };
+
+    parse_profile_from_manifest(
+        manifest
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|workspace| workspace.get("metadata"))
+            .and_then(toml::Value::as_table)
+            .and_then(|metadata| metadata.get("modum"))
+            .or_else(|| {
+                manifest
+                    .get("package")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|package| package.get("metadata"))
+                    .and_then(toml::Value::as_table)
+                    .and_then(|metadata| metadata.get("modum"))
+            }),
+        &manifest_path,
+        diagnostics,
+    )
+}
+
 fn settings_for_file(
     root: &Path,
     file: &Path,
     workspace_defaults: &NamespaceSettings,
-    cache: &mut BTreeMap<PathBuf, NamespaceSettings>,
+    repo_profile: Option<LintProfile>,
+    cli_profile: Option<LintProfile>,
+    cache: &mut BTreeMap<PathBuf, PackageSettings>,
     diagnostics: &mut Vec<Diagnostic>,
-) -> NamespaceSettings {
+) -> FileSettings {
     let Some(package_root) = find_package_root(root, file) else {
-        return workspace_defaults.clone();
+        return FileSettings {
+            namespace: workspace_defaults.clone(),
+            profile: resolve_profile(cli_profile, None, repo_profile),
+        };
     };
 
     if let Some(settings) = cache.get(&package_root) {
-        return settings.clone();
+        return FileSettings {
+            namespace: settings.namespace.clone(),
+            profile: resolve_profile(cli_profile, settings.profile, repo_profile),
+        };
     }
 
     let settings = load_package_settings(&package_root, workspace_defaults, diagnostics);
     cache.insert(package_root, settings.clone());
-    settings
+    FileSettings {
+        namespace: settings.namespace,
+        profile: resolve_profile(cli_profile, settings.profile, repo_profile),
+    }
 }
 
 fn load_package_settings(
     root: &Path,
     workspace_defaults: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
-) -> NamespaceSettings {
+) -> PackageSettings {
     let manifest_path = root.join("Cargo.toml");
     let Ok(manifest_src) = fs::read_to_string(&manifest_path) else {
-        return workspace_defaults.clone();
+        return PackageSettings {
+            namespace: workspace_defaults.clone(),
+            profile: None,
+        };
     };
 
     let manifest = match toml::from_str::<toml::Value>(&manifest_src) {
@@ -507,30 +686,47 @@ fn load_package_settings(
                 None,
                 format!("failed to parse Cargo.toml for modum settings: {err}"),
             ));
-            return workspace_defaults.clone();
+            return PackageSettings {
+                namespace: workspace_defaults.clone(),
+                profile: None,
+            };
         }
     };
 
-    parse_settings_from_manifest(
-        manifest
-            .get("package")
-            .and_then(toml::Value::as_table)
-            .and_then(|package| package.get("metadata"))
-            .and_then(toml::Value::as_table)
-            .and_then(|metadata| metadata.get("modum")),
-        &manifest_path,
-        diagnostics,
-    )
-    .unwrap_or_else(|| workspace_defaults.clone())
+    let metadata = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get("metadata"))
+        .and_then(toml::Value::as_table)
+        .and_then(|metadata| metadata.get("modum"));
+
+    let namespace =
+        parse_settings_from_manifest(metadata, workspace_defaults, &manifest_path, diagnostics)
+            .unwrap_or_else(|| workspace_defaults.clone());
+    let profile = parse_profile_from_manifest(metadata, &manifest_path, diagnostics);
+
+    PackageSettings { namespace, profile }
+}
+
+fn resolve_profile(
+    cli_profile: Option<LintProfile>,
+    package_profile: Option<LintProfile>,
+    repo_profile: Option<LintProfile>,
+) -> LintProfile {
+    cli_profile
+        .or(package_profile)
+        .or(repo_profile)
+        .unwrap_or_default()
 }
 
 fn parse_settings_from_manifest(
     value: Option<&toml::Value>,
+    base: &NamespaceSettings,
     manifest_path: &Path,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<NamespaceSettings> {
     let table = value?.as_table()?;
-    let mut settings = NamespaceSettings::default();
+    let mut settings = base.clone();
 
     if let Some(values) = parse_string_set_field(table, "generic_nouns", manifest_path, diagnostics)
     {
@@ -558,6 +754,30 @@ fn parse_settings_from_manifest(
     ) {
         settings.namespace_preserving_modules = values;
     }
+    apply_token_family_overrides(
+        &mut settings.semantic_string_scalars,
+        table,
+        "extra_semantic_string_scalars",
+        "ignored_semantic_string_scalars",
+        manifest_path,
+        diagnostics,
+    );
+    apply_token_family_overrides(
+        &mut settings.semantic_numeric_scalars,
+        table,
+        "extra_semantic_numeric_scalars",
+        "ignored_semantic_numeric_scalars",
+        manifest_path,
+        diagnostics,
+    );
+    apply_token_family_overrides(
+        &mut settings.key_value_bag_names,
+        table,
+        "extra_key_value_bag_names",
+        "ignored_key_value_bag_names",
+        manifest_path,
+        diagnostics,
+    );
 
     Some(settings)
 }
@@ -578,6 +798,45 @@ fn parse_scan_settings_from_manifest(
     }
 
     Some(settings)
+}
+
+fn parse_profile_from_manifest(
+    value: Option<&toml::Value>,
+    manifest_path: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<LintProfile> {
+    let table = value?.as_table()?;
+    let raw = parse_string_field(table, "profile", manifest_path, diagnostics)?;
+    match raw.parse() {
+        Ok(profile) => Some(profile),
+        Err(err) => {
+            diagnostics.push(Diagnostic::error(
+                Some(manifest_path.to_path_buf()),
+                None,
+                format!("`metadata.modum.profile` {err}"),
+            ));
+            None
+        }
+    }
+}
+
+fn parse_string_field(
+    table: &toml::value::Table,
+    key: &str,
+    manifest_path: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<String> {
+    let value = table.get(key)?;
+    let Some(value) = value.as_str() else {
+        diagnostics.push(Diagnostic::error(
+            Some(manifest_path.to_path_buf()),
+            None,
+            format!("`metadata.modum.{key}` must be a string"),
+        ));
+        return None;
+    };
+
+    Some(value.to_string())
 }
 
 fn parse_string_set_field(
@@ -632,6 +891,91 @@ fn parse_string_values_field(
     }
 
     Some(values)
+}
+
+fn parse_normalized_string_set_field(
+    table: &toml::value::Table,
+    key: &str,
+    manifest_path: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<BTreeSet<String>> {
+    Some(
+        parse_string_values_field(table, key, manifest_path, diagnostics)?
+            .into_iter()
+            .map(|value| normalize_segment(&value))
+            .collect(),
+    )
+}
+
+fn apply_token_family_overrides(
+    target: &mut BTreeSet<String>,
+    table: &toml::value::Table,
+    extra_key: &str,
+    ignored_key: &str,
+    manifest_path: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Some(values) =
+        parse_normalized_string_set_field(table, extra_key, manifest_path, diagnostics)
+    {
+        target.extend(values);
+    }
+    if let Some(values) =
+        parse_normalized_string_set_field(table, ignored_key, manifest_path, diagnostics)
+    {
+        for value in values {
+            target.remove(&value);
+        }
+    }
+}
+
+fn diagnostic_explanation_details(code: &str) -> Option<&'static [&'static str]> {
+    match code {
+        "namespace_prelude_glob_import" => Some(&[
+            "why: prelude globs make it harder to see which module gives a name its meaning.",
+            "typical fixes: import the specific items you need or keep the preserving module visible at call sites.",
+        ]),
+        "namespace_glob_preserve_module" => Some(&[
+            "why: broad globs from modules like `http`, `error`, or `query` erase context that often helps readers scan call sites.",
+            "typical fixes: import only the concrete items you need or keep the module qualifier in local code.",
+        ]),
+        "api_anyhow_error_surface" => Some(&[
+            "why: `anyhow` works well internally, but caller-facing boundaries usually read better when the crate owns the error type and variants.",
+            "typical fixes: return a crate-owned error enum or newtype and convert internal failures into that boundary type.",
+        ]),
+        "api_string_error_surface" => Some(&[
+            "why: raw string errors lose structure, variant names, and machine-readable context at the boundary.",
+            "typical fixes: model the boundary error as an enum, a focused struct, or another typed error value with named data.",
+        ]),
+        "api_semantic_string_scalar" => Some(&[
+            "why: names like `email`, `url`, `path`, or `locale` usually carry domain rules that a plain `String` cannot express.",
+            "typical fixes: parse at the boundary into a domain newtype or another focused typed value.",
+            "repo tuning: use `metadata.modum.extra_semantic_string_scalars` or `metadata.modum.ignored_semantic_string_scalars` to adjust the token family.",
+        ]),
+        "api_semantic_numeric_scalar" => Some(&[
+            "why: names like `duration`, `timestamp`, or `port` often want units or domain semantics, not a bare integer.",
+            "typical fixes: use a typed duration, timestamp, port, or small domain newtype at the boundary.",
+            "repo tuning: use `metadata.modum.extra_semantic_numeric_scalars` or `metadata.modum.ignored_semantic_numeric_scalars` to adjust the token family.",
+        ]),
+        "api_raw_key_value_bag" => Some(&[
+            "why: bags like `metadata`, `headers`, or `params` often accrete hidden contracts that are easier to understand once they are typed.",
+            "typical fixes: introduce a focused options struct, metadata type, or dedicated collection wrapper.",
+            "repo tuning: use `metadata.modum.extra_key_value_bag_names` or `metadata.modum.ignored_key_value_bag_names` to adjust the token family.",
+        ]),
+        "api_boolean_flag_cluster" => Some(&[
+            "why: several booleans together usually encode modes or policy choices that are easier to name explicitly.",
+            "typical fixes: group the behavior into a typed options struct, an enum, or a smaller decision object.",
+        ]),
+        "api_manual_flag_set" => Some(&[
+            "why: parallel flag constants and repeated raw bitmask checks usually mean the boundary is modeling a flags type by hand.",
+            "typical fixes: introduce a focused typed flags surface or small domain wrapper instead of exposing raw integer masks.",
+        ]),
+        "api_raw_id_surface" => Some(&[
+            "why: ids often carry validation, formatting, or cross-system meaning that is easy to lose when they stay as bare strings or integers.",
+            "typical fixes: introduce a small id newtype and parse or validate at the boundary.",
+        ]),
+        _ => None,
+    }
 }
 
 fn find_package_root(root: &Path, file: &Path) -> Option<PathBuf> {
@@ -741,15 +1085,21 @@ fn render_diagnostic_section<'a>(
             DiagnosticLevel::Warning => "warning",
             DiagnosticLevel::Error => "error",
         };
-        let code = diag
-            .code()
-            .map(|code| format!(" ({code})"))
+        let code = match (diag.code(), diag.profile()) {
+            (Some(code), Some(profile)) => format!(" ({code}, {})", profile.as_str()),
+            (Some(code), None) => format!(" ({code})"),
+            (None, _) => String::new(),
+        };
+        let fix = diag
+            .fix
+            .as_ref()
+            .map(|fix| format!(" [fix: {}]", fix.replacement))
             .unwrap_or_default();
         match (&diag.file, diag.line) {
             (Some(file), Some(line)) => {
                 let _ = writeln!(
                     out,
-                    "- [{level}{code}] {}:{line}: {}",
+                    "- [{level}{code}] {}:{line}: {}{fix}",
                     file.display(),
                     diag.message
                 );
@@ -757,13 +1107,13 @@ fn render_diagnostic_section<'a>(
             (Some(file), None) => {
                 let _ = writeln!(
                     out,
-                    "- [{level}{code}] {}: {}",
+                    "- [{level}{code}] {}: {}{fix}",
                     file.display(),
                     diag.message
                 );
             }
             (None, _) => {
-                let _ = writeln!(out, "- [{level}{code}] {}", diag.message);
+                let _ = writeln!(out, "- [{level}{code}] {}{fix}", diag.message);
             }
         }
     }
@@ -1189,8 +1539,8 @@ pub(crate) fn replace_path_fix(replacement: impl Into<String>) -> DiagnosticFix 
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckMode, Diagnostic, DiagnosticSelection, NamespaceSettings, WorkspaceReport,
-        check_exit_code, parse_check_mode, split_segments,
+        CheckMode, Diagnostic, DiagnosticSelection, LintProfile, NamespaceSettings,
+        WorkspaceReport, check_exit_code, parse_check_mode, parse_lint_profile, split_segments,
     };
 
     #[test]
@@ -1219,6 +1569,19 @@ mod tests {
     fn rejects_invalid_check_mode() {
         let err = parse_check_mode("strict").unwrap_err();
         assert!(err.contains("expected off|warn|deny"));
+    }
+
+    #[test]
+    fn lint_profile_supports_standard_parsing() {
+        assert_eq!(parse_lint_profile("core"), Ok(LintProfile::Core));
+        assert_eq!(parse_lint_profile("surface"), Ok(LintProfile::Surface));
+        assert_eq!(parse_lint_profile("strict"), Ok(LintProfile::Strict));
+    }
+
+    #[test]
+    fn rejects_invalid_lint_profile() {
+        let err = parse_lint_profile("default").unwrap_err();
+        assert!(err.contains("expected core|surface|strict"));
     }
 
     #[test]
@@ -1318,5 +1681,60 @@ mod tests {
         assert_eq!(advisory_only.error_count(), 1);
         assert_eq!(advisory_only.policy_warning_count(), 0);
         assert_eq!(advisory_only.advisory_warning_count(), 1);
+    }
+
+    #[test]
+    fn workspace_report_can_filter_diagnostics_by_profile() {
+        let report = WorkspaceReport {
+            scanned_files: 3,
+            files_with_violations: 3,
+            diagnostics: vec![
+                Diagnostic::policy(
+                    Some("src/core.rs".into()),
+                    Some(1),
+                    "namespace_flat_use",
+                    "core",
+                ),
+                Diagnostic::policy(
+                    Some("src/surface.rs".into()),
+                    Some(2),
+                    "api_missing_parent_surface_export",
+                    "surface",
+                ),
+                Diagnostic::advisory(
+                    Some("src/strict.rs".into()),
+                    Some(3),
+                    "api_candidate_semantic_module",
+                    "strict",
+                ),
+                Diagnostic::error(Some("Cargo.toml".into()), None, "config"),
+            ],
+        };
+
+        let core = report.filtered_by_profile(LintProfile::Core);
+        assert_eq!(core.files_with_violations, 2);
+        assert_eq!(core.diagnostics.len(), 2);
+        assert!(
+            core.diagnostics
+                .iter()
+                .any(|diag| diag.code() == Some("namespace_flat_use"))
+        );
+        assert!(core.diagnostics.iter().any(|diag| diag.code().is_none()));
+
+        let surface = report.filtered_by_profile(LintProfile::Surface);
+        assert_eq!(surface.files_with_violations, 3);
+        assert_eq!(surface.diagnostics.len(), 3);
+        assert!(
+            surface
+                .diagnostics
+                .iter()
+                .any(|diag| diag.code() == Some("api_missing_parent_surface_export"))
+        );
+        assert!(
+            !surface
+                .diagnostics
+                .iter()
+                .any(|diag| diag.code() == Some("api_candidate_semantic_module"))
+        );
     }
 }

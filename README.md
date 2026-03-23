@@ -1,6 +1,6 @@
 <div align="center">
   <img alt="modum logo" src="https://raw.githubusercontent.com/eboody/modum/main/modum-logo.svg" width="360">
-  <p>Modum checks source-level module naming, import style, and public API path heuristics across a Rust workspace.</p>
+  <p>Modum checks source-level namespace shape, alias hygiene, module naming, and surface-path heuristics across a Rust workspace.</p>
   <p>
     <a href="https://github.com/eboody/modum/actions/workflows/ci.yml"><img src="https://github.com/eboody/modum/actions/workflows/ci.yml/badge.svg?branch=main&event=push" alt="build status" /></a>
     <a href="https://crates.io/crates/modum"><img src="https://img.shields.io/crates/v/modum.svg?logo=rust" alt="crates.io" /></a>
@@ -15,7 +15,7 @@ It analyzes parsed Rust source files. It does not expand macros, resolve `includ
 
 ## Why It Exists
 
-`modum` exists to catch two common Rust API-shape problems:
+`modum` exists to catch two common Rust namespace-shape problems:
 
 - flattened imports that hide useful context at call sites
 - redundant leaf names that repeat context the module path already provides
@@ -105,6 +105,8 @@ When semantic-module family inference would depend on those constructs, `modum` 
 cargo install modum
 cargo modum check --root .
 cargo modum check --root . --mode warn
+cargo modum check --root . --profile core
+cargo modum --explain namespace_flat_use
 cargo modum check --root . --show advisory
 cargo modum check --root . --exclude examples/high-coverage
 cargo modum check --root . --format json
@@ -183,10 +185,22 @@ Text output groups diagnostics into `Errors`, `Policy Diagnostics`, and `Advisor
 
 Use `--show policy` or `--show advisory` when you want to focus one side of the report without changing exit behavior. The exit code still reflects the full report.
 
+Use `--profile core`, `--profile surface`, or `--profile strict` to choose how opinionated the lint set should be. `strict` is the default.
+
+Text output includes the diagnostic code profile, and direct rewrite-style fixes show a short `fix:` hint inline.
+
 JSON output keeps the full diagnostic list and includes:
 
+- `profile`: the minimum lint profile that includes the diagnostic
 - `policy`: whether the diagnostic counts as a policy violation
 - `fix`: optional autofix metadata when the rewrite is a direct path replacement, such as `response::Response` to `Response`
+
+You can explain any code without running analysis:
+
+```bash
+modum --explain namespace_flat_use
+cargo modum --explain api_candidate_semantic_module
+```
 
 ## CI Usage
 
@@ -209,6 +223,7 @@ Configure the lints in any workspace with Cargo metadata:
 
 ```toml
 [workspace.metadata.modum]
+profile = "strict"
 include = ["src", "crates/*/src"]
 exclude = ["examples/high-coverage"]
 generic_nouns = ["Id", "Repository", "Service", "Error", "Command", "Request", "Response", "Outcome"]
@@ -216,17 +231,41 @@ weak_modules = ["storage", "transport", "infra", "common", "misc", "helpers", "h
 catch_all_modules = ["common", "misc", "helpers", "helper", "types", "util", "utils"]
 organizational_modules = ["error", "errors", "request", "response"]
 namespace_preserving_modules = ["auth", "command", "components", "email", "error", "http", "page", "partials", "policy", "query", "repo", "store", "storage", "transport", "infra"]
+extra_semantic_string_scalars = ["mime"]
+ignored_semantic_string_scalars = ["url"]
+extra_semantic_numeric_scalars = ["epoch"]
+ignored_semantic_numeric_scalars = ["port"]
+extra_key_value_bag_names = ["labels"]
+ignored_key_value_bag_names = ["tags"]
 ```
 
-Use `[package.metadata.modum]` inside a member crate to override workspace defaults for that package.
+Use `[package.metadata.modum]` inside a member crate to override workspace defaults for that package. Package settings inherit the workspace defaults first, then apply only the keys you set locally.
 
 `include` and `exclude` are optional scan defaults. CLI `--include` overrides metadata `include`, and CLI `--exclude` adds to metadata `exclude`.
+
+Profile guide:
+
+- `core`: internal namespace readability, including private type naming, type-alias hygiene, internal module-boundary rules, and glob/prelude pressure when imports flatten preserved namespaces
+- `surface`: `core` plus caller-facing path shaping and typed boundary nudges for public and shared crate-visible surfaces, including semantic scalar boundaries and `anyhow` leakage
+- `strict`: `surface` plus the heavier advisory heuristics, including semantic-module family suggestions, raw string error surfaces, raw ids, raw key-value bags, bool clusters, manual flag sets, and API-shape taste rules
+
+Profile precedence:
+
+- CLI `--profile` overrides package and workspace metadata
+- `[package.metadata.modum] profile = "..."` overrides workspace metadata for that crate
+- `[workspace.metadata.modum] profile = "..."` sets the workspace default
+- if no profile is set anywhere, `strict` is used
 
 Tuning guide:
 
 - `generic_nouns`: generic leaves like `Repository`, `Error`, or `Request`
 - `namespace_preserving_modules`: modules that should stay visible at call sites, such as `http`, `email`, `partials`, or `components`
 - `organizational_modules`: modules that should not leak into the public API surface, such as `error`, `request`, or `response`
+- `extra_semantic_string_scalars` / `ignored_semantic_string_scalars`: token families for string-like boundary names such as `email`, `url`, `path`, or your own repo-specific additions like `mime`
+- `extra_semantic_numeric_scalars` / `ignored_semantic_numeric_scalars`: token families for numeric boundary names such as `duration`, `timestamp`, `ttl`, or repo-specific numeric concepts
+- `extra_key_value_bag_names` / `ignored_key_value_bag_names`: token families for string bag names such as `metadata`, `headers`, `params`, or repo-specific names like `labels`
+
+These tuning keys work on lowercase name tokens, not full paths.
 
 ## Lint Categories
 
@@ -242,6 +281,10 @@ These warn when imports or re-exports flatten a namespace that should stay visib
   Warning for flattened imports or actionable rename-heavy aliases whose leaf repeats parent context. For plain imports, this only fires when the shorter leaf would be an actionable generic noun such as `Repository`, `Error`, or `Id`. For rename aliases, this only fires when the qualified form would still preserve real context, such as `http::StatusCode` or `page::Event`.
 - `namespace_redundant_qualified_generic`
   Warning for qualified call-site paths whose module only repeats a generic category already named by the leaf, such as `response::Response` or `error::Error`.
+- `namespace_prelude_glob_import`
+  Warning for `use ...::prelude::*` imports that hide the real source modules and flatten call-site context.
+- `namespace_glob_preserve_module`
+  Warning for glob imports from configured namespace-preserving modules such as `http::*`, when the import erases context the module name should carry at call sites.
 - `namespace_parent_surface`
 - `namespace_flat_pub_use`
 - `namespace_flat_pub_use_preserve_module`
@@ -255,6 +298,8 @@ Examples:
 - `response::Response`
 - `use crate::error::Error;` inside a crate whose root surface already exposes `Error`
 - `pub use auth::{login, logout};`
+- `use http::prelude::*;`
+- `use http::*;`
 
 Canonical parent-surface re-exports are allowed. `pub use error::{Error, Result};` is valid when that is how a module intentionally exposes `module::Error` and `module::Result`. The same applies to broader UI surfaces such as exposing both `components::Button` and `partials::Button`.
 
@@ -264,13 +309,15 @@ A semantic child module namespace can also stay flat when it is already doing th
 
 These warn when public leaves are too generic for a weak parent, when the path repeats context it already has, or when a flat family suggests a semantic module surface.
 
+For these surface-shape rules, shared crate-visible surfaces such as `pub(crate)` items and re-exports are treated the same way as fully public ones.
+
 - `api_missing_parent_surface_export`
   Warning for public child modules that should also surface a readable parent alias, such as `components::Button` over `components::button::Button`, or `outcome::Toxicity` over `outcome::toxicity::Outcome`.
 - `api_weak_module_generic_leaf`
 - `api_redundant_leaf_context`
   Warning for public leaves that repeat semantic module context already carried by the path, such as `user::UserRepository`, or that bake a sibling semantic module into a flat public leaf when `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`. This is a parsed-source heuristic, not a macro-expanded or cfg-pruned source of truth.
+  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`. It works on parsed source only and does not see macro expansion or cfg-pruned items.
 - `api_candidate_semantic_module_unsupported_construct`
   Advisory warning for scopes where semantic-module family inference was skipped because the parsed source includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`.
 - `api_manual_enum_string_helper`
@@ -313,6 +360,31 @@ Examples:
 - `user::error::InvalidEmailError`
 
 Private organizational child modules are allowed to flatten their family items back to the parent surface. For example, `mod auth_shell; pub use auth_shell::{AuthShell, AuthShellVariant};` is treated as a valid parent-surface export shape.
+
+### Boundary Modeling
+
+These advisories push caller-facing types and signatures away from raw strings, raw integers, raw key-value bags, manual flag bits, and catch-all error surfaces.
+
+- `api_anyhow_error_surface`
+  Advisory warning for public or shared surfaces that expose `anyhow::Error` or `anyhow::Result` instead of a crate-owned typed error boundary.
+- `api_string_error_surface`
+  Advisory warning for public or shared surfaces that return `Result<_, String>` or store error text in raw string fields.
+- `api_manual_error_surface`
+  Advisory warning for public error types that manually expose both `Display` and `Error`, when the boundary may want a smaller focused error surface instead of more formatting boilerplate.
+- `api_semantic_string_scalar`
+  Advisory warning for caller-facing names like `email`, `url`, `path`, `locale`, or `currency` when they stay raw `String` or `&str`.
+- `api_semantic_numeric_scalar`
+  Advisory warning for caller-facing names like `duration`, `timestamp`, or `port` when they stay raw primitive integers.
+- `api_raw_key_value_bag`
+  Advisory warning for caller-facing `HashMap<String, String>`, `BTreeMap<String, String>`, or `Vec<(String, String)>` bags such as `metadata`, `headers`, `params`, or `tags`.
+- `api_boolean_flag_cluster`
+  Advisory warning for public structs or entrypoints that carry several booleans which jointly shape behavior.
+- `api_integer_protocol_parameter`
+  Advisory warning for protocol-like names such as `status`, `kind`, `mode`, or `phase` when they stay raw integers.
+- `api_raw_id_surface`
+  Advisory warning for raw id aliases, fields, parameters, or returns such as `UserId = String` or `request_id: u64`.
+- `api_manual_flag_set`
+  Advisory warning for parallel public `FLAG_*` integer constants, raw `flags` and `permissions` bit-mask boundaries, or repeated named bitmask checks and assembly in caller-facing code that suggest a typed flags surface.
 
 ### Module Boundaries
 

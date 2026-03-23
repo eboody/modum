@@ -182,6 +182,117 @@ exclude = ["src", 1]
     temp
 }
 
+fn write_invalid_profile_metadata_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+profile = "default"
+"#,
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), "pub struct UserRepository;\n").expect("write source");
+    temp
+}
+
+fn write_invalid_semantic_scalar_metadata_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+ignored_semantic_string_scalars = [1]
+"#,
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), "pub fn connect(url: String) {}\n").expect("write source");
+    temp
+}
+
+fn write_surface_and_strict_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/components")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .expect("write manifest");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+
+pub mod components;
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/components.rs"), "pub mod button;\n").expect("write components");
+    fs::write(
+        root.join("src/components/button.rs"),
+        "pub struct Button;\n",
+    )
+    .expect("write button");
+    temp
+}
+
+fn write_profile_metadata_fixture(profile: &str) -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/components")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+profile = "{profile}"
+"#
+        ),
+    )
+    .expect("write manifest");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+
+pub mod components;
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/components.rs"), "pub mod button;\n").expect("write components");
+    fs::write(
+        root.join("src/components/button.rs"),
+        "pub struct Button;\n",
+    )
+    .expect("write button");
+    temp
+}
+
 #[test]
 fn cli_help_shows_lint_only_surface() {
     let check_help = Command::new(env!("CARGO_BIN_EXE_modum"))
@@ -193,6 +304,8 @@ fn cli_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("Usage:"));
     assert!(check_help_out.contains("MODUM=off|warn|deny"));
     assert!(check_help_out.contains("modum check"));
+    assert!(check_help_out.contains("--profile core|surface|strict"));
+    assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_modum"))
         .arg("--help")
@@ -202,6 +315,7 @@ fn cli_help_shows_lint_only_surface() {
     let top_help_out = String::from_utf8_lossy(&top_help.stdout);
     assert!(top_help_out.contains("Commands:"));
     assert!(top_help_out.contains("check"));
+    assert!(top_help_out.contains("--explain <code>"));
     assert!(!top_help_out.contains("fix"));
 }
 
@@ -216,6 +330,8 @@ fn cargo_subcommand_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("Usage:"));
     assert!(check_help_out.contains("MODUM=off|warn|deny"));
     assert!(check_help_out.contains("cargo modum check"));
+    assert!(check_help_out.contains("--profile core|surface|strict"));
+    assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_cargo-modum"))
         .args(["modum", "--help"])
@@ -225,6 +341,7 @@ fn cargo_subcommand_help_shows_lint_only_surface() {
     let top_help_out = String::from_utf8_lossy(&top_help.stdout);
     assert!(top_help_out.contains("Commands:"));
     assert!(top_help_out.contains("check"));
+    assert!(top_help_out.contains("--explain <code>"));
     assert!(!top_help_out.contains("fix"));
 }
 
@@ -250,6 +367,10 @@ fn cli_json_output_reports_policy_diagnostics() {
     assert_eq!(
         json["report"]["diagnostics"][0]["code"].as_str(),
         Some("namespace_flat_use")
+    );
+    assert_eq!(
+        json["report"]["diagnostics"][0]["profile"].as_str(),
+        Some("core")
     );
 }
 
@@ -297,7 +418,12 @@ fn cli_json_output_includes_fix_metadata_for_direct_path_rewrites() {
     assert_eq!(output.status.code(), Some(2));
 
     let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
-    let diag = &json["report"]["diagnostics"][0];
+    let diag = json["report"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .find(|diag| diag["code"].as_str() == Some("namespace_redundant_qualified_generic"))
+        .expect("qualified generic diagnostic");
     assert_eq!(
         diag["code"].as_str(),
         Some("namespace_redundant_qualified_generic")
@@ -330,6 +456,143 @@ fn cli_text_output_can_filter_to_advisories() {
     assert!(stdout.contains("api_candidate_semantic_module"));
     assert!(!stdout.contains("Policy Diagnostics:"));
     assert!(!stdout.contains("namespace_redundant_qualified_generic"));
+}
+
+#[test]
+fn cli_text_output_shows_profile_and_fix_hint() {
+    let temp = write_qualified_generic_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args(["check", "--root", root.to_str().expect("utf8 root")])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("namespace_redundant_qualified_generic, core"));
+    assert!(stdout.contains("[fix: Response]"));
+}
+
+#[test]
+fn cli_explain_prints_profile_and_summary() {
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args(["--explain", "namespace_flat_use"])
+        .output()
+        .expect("run modum --explain");
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("namespace_flat_use"));
+    assert!(stdout.contains("profile: core"));
+    assert!(stdout.contains("Flattened imports hide useful namespace context"));
+}
+
+#[test]
+fn cli_explain_semantic_string_scalar_includes_fix_and_tuning_guidance() {
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args(["--explain", "api_semantic_string_scalar"])
+        .output()
+        .expect("run modum --explain");
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("api_semantic_string_scalar"));
+    assert!(stdout.contains("typed boundary"));
+    assert!(stdout.contains("extra_semantic_string_scalars"));
+    assert!(stdout.contains("ignored_semantic_string_scalars"));
+    assert!(!stdout.contains("thiserror"));
+}
+
+#[test]
+fn cli_profile_core_hides_strict_advisories() {
+    let temp = write_policy_and_advisory_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--profile",
+            "core",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(2));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let diagnostics = json["report"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diag| diag["code"].as_str() == Some("namespace_redundant_qualified_generic"))
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diag| diag["code"].as_str() == Some("api_candidate_semantic_module"))
+    );
+}
+
+#[test]
+fn cli_profile_surface_includes_surface_and_hides_strict_advisories() {
+    let temp = write_surface_and_strict_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--profile",
+            "surface",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(2));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let diagnostics = json["report"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diag| diag["code"].as_str() == Some("api_missing_parent_surface_export"))
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diag| diag["code"].as_str() == Some("api_candidate_semantic_module"))
+    );
+}
+
+#[test]
+fn cli_invalid_profile_reports_error() {
+    let temp = write_json_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--profile",
+            "default",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--profile invalid profile `default`; expected core|surface|strict"));
 }
 
 #[test]
@@ -458,4 +721,96 @@ fn cli_invalid_scan_default_metadata_reports_error() {
                 })
             })
     );
+}
+
+#[test]
+fn cli_invalid_profile_metadata_reports_error() {
+    let temp = write_invalid_profile_metadata_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(json["exit_code"].as_u64(), Some(1));
+    assert!(
+        json["report"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diag| {
+                diag["message"].as_str().is_some_and(|message| {
+                    message.contains(
+                        "`metadata.modum.profile` invalid profile `default`; expected core|surface|strict"
+                    )
+                })
+            })
+    );
+}
+
+#[test]
+fn cli_invalid_semantic_scalar_metadata_reports_error() {
+    let temp = write_invalid_semantic_scalar_metadata_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(json["exit_code"].as_u64(), Some(1));
+    assert!(
+        json["report"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diag| {
+                diag["message"].as_str().is_some_and(|message| {
+                    message.contains(
+                        "`metadata.modum.ignored_semantic_string_scalars[0]` must be a string",
+                    )
+                })
+            })
+    );
+}
+
+#[test]
+fn cli_package_metadata_profile_sets_default_filter() {
+    let temp = write_profile_metadata_fixture("core");
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(0));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let diagnostics = json["report"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics");
+    assert!(diagnostics.is_empty());
 }

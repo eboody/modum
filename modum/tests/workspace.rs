@@ -1,6 +1,9 @@
 use std::fs;
 
-use modum::{DiagnosticLevel, analyze_workspace};
+use modum::{
+    AnalysisSettings, DiagnosticLevel, LintProfile, ScanSettings, analyze_workspace,
+    analyze_workspace_with_settings,
+};
 use tempfile::tempdir;
 
 fn write_manifest(root: &std::path::Path, extra: &str) {
@@ -49,6 +52,496 @@ mod app {
         diag.level() == DiagnosticLevel::Warning
             && diag.is_policy_violation()
             && diag.code() == Some("namespace_flat_use")
+    }));
+}
+
+#[test]
+fn analyze_workspace_uses_workspace_profile_defaults() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("member/src/components")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+resolver = "2"
+members = ["member"]
+
+[workspace.metadata.modum]
+profile = "surface"
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("member/Cargo.toml"),
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .expect("write member manifest");
+    fs::write(
+        root.join("member/src/lib.rs"),
+        r#"
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+
+pub mod components;
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("member/src/components.rs"), "pub mod button;\n")
+        .expect("write components");
+    fs::write(
+        root.join("member/src/components/button.rs"),
+        "pub struct Button;\n",
+    )
+    .expect("write button");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_missing_parent_surface_export"))
+    );
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_semantic_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_package_profile_overrides_workspace_profile() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("member/src/components")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+resolver = "2"
+members = ["member"]
+
+[workspace.metadata.modum]
+profile = "core"
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("member/Cargo.toml"),
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+profile = "surface"
+"#,
+    )
+    .expect("write member manifest");
+    fs::write(
+        root.join("member/src/lib.rs"),
+        r#"
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+
+pub mod components;
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("member/src/components.rs"), "pub mod button;\n")
+        .expect("write components");
+    fs::write(
+        root.join("member/src/components/button.rs"),
+        "pub struct Button;\n",
+    )
+    .expect("write button");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_missing_parent_surface_export"))
+    );
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_semantic_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_package_token_family_overrides_inherit_workspace_defaults() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("member/src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+resolver = "2"
+members = ["member"]
+
+[workspace.metadata.modum]
+extra_semantic_string_scalars = ["mime"]
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("member/Cargo.toml"),
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+ignored_semantic_string_scalars = ["url"]
+"#,
+    )
+    .expect("write member manifest");
+    fs::write(
+        root.join("member/src/lib.rs"),
+        r#"
+pub fn connect(mime: String, url: String) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_semantic_string_scalar") && diag.message.contains("mime")
+    }));
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_semantic_string_scalar") && diag.message.contains("url")
+    }));
+}
+
+#[test]
+fn analyze_workspace_cli_profile_overrides_metadata_profile() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/components")).expect("create src");
+    write_manifest(
+        root,
+        r#"[package.metadata.modum]
+profile = "strict"
+"#,
+    );
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+
+pub mod components;
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/components.rs"), "pub mod button;\n").expect("write components");
+    fs::write(
+        root.join("src/components/button.rs"),
+        "pub struct Button;\n",
+    )
+    .expect("write button");
+
+    let report = analyze_workspace_with_settings(
+        root,
+        &AnalysisSettings {
+            scan: ScanSettings::default(),
+            profile: Some(LintProfile::Core),
+        },
+    );
+    assert!(report.diagnostics.is_empty());
+}
+
+#[test]
+fn analyze_workspace_flags_internal_redundant_leaf_context() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod user {
+    pub(super) struct Repository;
+    struct UserRepository;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_redundant_leaf_context")
+            && diag.message.contains("user::UserRepository")
+            && diag.message.contains("user::Repository")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_internal_redundant_leaf_context_for_weak_shorter_leaves() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod report {
+    trait ReportExt {}
+}
+
+mod bootstrap {
+    struct BootstrapConfig;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_redundant_leaf_context"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_internal_weak_module_generic_leaf() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod helpers {
+    struct Repository;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_catch_all_module"))
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_weak_module_generic_leaf"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_internal_repeated_module_segment() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod user {
+    mod user {
+        struct Repository;
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_repeated_module_segment"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_internal_organizational_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod response {
+    struct Payload;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_organizational_submodule_flatten"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_flattening_type_aliases() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod user {
+    pub struct Repository;
+}
+
+type Repository = user::Repository;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("namespace_flat_type_alias"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_namespace_preserving_type_aliases() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod http {
+    pub struct Client;
+}
+
+type Client = http::Client;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("namespace_flat_type_alias_preserve_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_redundant_type_alias_context() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod user {
+    pub struct Repository;
+}
+
+type UserRepository = user::Repository;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_type_alias_redundant_leaf_context")
+            && diag.message.contains("user::Repository")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_missing_parent_surface_export_for_crate_visible_child_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/components")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub(crate) mod components;\n").expect("write lib");
+    fs::write(root.join("src/components.rs"), "pub(crate) mod button;\n")
+        .expect("write components");
+    fs::write(
+        root.join("src/components/button.rs"),
+        "pub(crate) struct Button;\n",
+    )
+    .expect("write button");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_missing_parent_surface_export")
+            && diag.message.contains("components::Button")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_candidate_semantic_module_for_crate_visible_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub(crate) struct UserRepository;
+pub(crate) struct UserService;
+pub(crate) struct UserId;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_semantic_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_stringly_protocol_parameters() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn transition(next_state: &str, gate_kind: String) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_stringly_protocol_parameter")
+            && diag.message.contains("next_state")
+            && diag.message.contains("gate_kind")
     }));
 }
 
@@ -1961,6 +2454,777 @@ pub fn render(pretty: bool) {}
             .iter()
             .any(|diag| { diag.code() == Some("api_boolean_protocol_decision") })
     );
+}
+
+#[test]
+fn analyze_workspace_flags_prelude_glob_imports() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use http::prelude::*;
+
+pub fn handle() {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_prelude_glob_import")
+            && diag.message.contains("http::prelude::*")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_relative_prelude_glob_imports() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use crate::util::prelude::*;
+
+mod util {
+    pub mod prelude {
+        pub struct Helper;
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("namespace_prelude_glob_import"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_glob_imports_that_flatten_preserved_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use http::*;
+
+pub fn handle() {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_glob_preserve_module") && diag.message.contains("http::*")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_raw_string_error_surfaces() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Report {
+    pub error: String,
+}
+
+pub fn parse() -> Result<(), String> {
+    Ok(())
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_string_error_surface")
+            && (diag.message.contains("Report") || diag.message.contains("parse"))
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_treat_generic_detail_fields_as_error_surfaces() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Draft {
+    pub detail: String,
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_string_error_surface"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_reason_fields_on_error_like_structs() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Rejected {
+    pub reason: String,
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_string_error_surface") && diag.message.contains("Rejected")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_anyhow_error_leakage() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Failure {
+    pub source: anyhow::Error,
+}
+
+pub fn load() -> anyhow::Result<()> {
+    Ok(())
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_anyhow_error_surface")
+            && (diag.message.contains("Failure") || diag.message.contains("load"))
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_semantic_string_scalar_boundaries() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn connect(email: &str, url: String, locale: String) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_semantic_string_scalar")
+            && diag.message.contains("email")
+            && diag.message.contains("url")
+    }));
+}
+
+#[test]
+fn analyze_workspace_prefers_protocol_parameter_warning_over_semantic_scalar_for_file_paths() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn load(file_path: &str) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_stringly_protocol_parameter"))
+    );
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_semantic_string_scalar"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_render_helpers_for_semantic_string_returns() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn format_url() -> String {
+    String::new()
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_semantic_string_scalar"))
+    );
+}
+
+#[test]
+fn analyze_workspace_extra_semantic_string_scalars_extend_defaults() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(
+        root,
+        r#"[package.metadata.modum]
+extra_semantic_string_scalars = ["mime"]
+"#,
+    );
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn parse(mime: String) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_semantic_string_scalar") && diag.message.contains("mime")
+    }));
+}
+
+#[test]
+fn analyze_workspace_ignored_semantic_string_scalars_remove_defaults() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(
+        root,
+        r#"[package.metadata.modum]
+ignored_semantic_string_scalars = ["url"]
+"#,
+    );
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn connect(url: String, email: String) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_semantic_string_scalar") && diag.message.contains("email")
+    }));
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_semantic_string_scalar") && diag.message.contains("url")
+    }));
+}
+
+#[test]
+fn analyze_workspace_surface_profile_keeps_surface_scalar_lints_and_hides_strict_id_lints() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub type UserId = String;
+
+pub fn connect(email: String) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace_with_settings(
+        root,
+        &AnalysisSettings {
+            scan: ScanSettings::default(),
+            profile: Some(LintProfile::Surface),
+        },
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_semantic_string_scalar"))
+    );
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_raw_id_surface"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_semantic_numeric_scalar_boundaries() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn schedule(duration: u64, timestamp: i64, port: u16) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_semantic_numeric_scalar")
+            && diag.message.contains("duration")
+            && diag.message.contains("port")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_raw_key_value_bag_surfaces() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use std::collections::{BTreeMap, HashMap};
+
+pub struct Request {
+    pub headers: HashMap<String, String>,
+}
+
+pub fn update(metadata: BTreeMap<String, String>) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_raw_key_value_bag")
+            && (diag.message.contains("headers") || diag.message.contains("metadata"))
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_treat_labels_as_key_value_bags_by_default() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use std::collections::HashMap;
+
+pub fn labels() -> HashMap<String, String> {
+    HashMap::new()
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_raw_key_value_bag"))
+    );
+}
+
+#[test]
+fn analyze_workspace_extra_key_value_bag_names_extend_defaults() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(
+        root,
+        r#"[package.metadata.modum]
+extra_key_value_bag_names = ["labels"]
+"#,
+    );
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use std::collections::HashMap;
+
+pub fn labels() -> HashMap<String, String> {
+    HashMap::new()
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_raw_key_value_bag") && diag.message.contains("labels")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_boolean_flag_clusters() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Options {
+    pub include_archived: bool,
+    pub include_deleted: bool,
+}
+
+pub fn render(include_archived: bool, include_deleted: bool) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_boolean_flag_cluster")
+            && (diag.message.contains("Options") || diag.message.contains("render"))
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_runtime_toggle_boolean_clusters() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct RenderOptions {
+    pub pretty: bool,
+    pub color: bool,
+}
+
+pub fn render(pretty: bool, color: bool) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_boolean_flag_cluster"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_integer_protocol_boundaries() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn transition(status: u8, gate_kind: i32, phase: usize) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_integer_protocol_parameter")
+            && diag.message.contains("status")
+            && diag.message.contains("gate_kind")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_raw_id_surfaces() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub type UserId = String;
+
+pub struct Session {
+    pub request_id: u64,
+}
+
+pub fn load(user_id: String) -> u64 {
+    1
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_raw_id_surface")
+            && (diag.message.contains("UserId")
+                || diag.message.contains("request_id")
+                || diag.message.contains("user_id"))
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_manual_flag_sets() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub const FLAG_READ: u32 = 1;
+pub const FLAG_WRITE: u32 = 2;
+pub const FLAG_EXECUTE: u32 = 4;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_manual_flag_set")
+            && diag.message.contains("FLAG_READ")
+            && diag.message.contains("FLAG_WRITE")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_raw_bitmask_boundaries() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Access {
+    pub permissions: u32,
+}
+
+pub fn update(flags: u64) {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_manual_flag_set")
+            && (diag.message.contains("permissions") || diag.message.contains("flags"))
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_repeated_named_flag_checks_in_public_methods() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Access {
+    permissions: u32,
+}
+
+impl Access {
+    const FLAG_READ: u32 = 1;
+    const FLAG_WRITE: u32 = 2;
+
+    pub fn allows_read_and_write(&self) -> bool {
+        self.permissions & Self::FLAG_READ != 0 && self.permissions & Self::FLAG_WRITE != 0
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_manual_flag_set")
+            && diag.message.contains("Access::allows_read_and_write")
+            && diag.message.contains("FLAG_READ")
+            && diag.message.contains("FLAG_WRITE")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_repeated_named_flag_assembly_in_public_methods() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Access {
+    permissions: u32,
+}
+
+const FLAG_READ: u32 = 1;
+const FLAG_WRITE: u32 = 2;
+
+impl Access {
+    pub fn elevated(&self) -> u32 {
+        self.permissions | FLAG_READ | FLAG_WRITE
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_manual_flag_set")
+            && diag.message.contains("Access::elevated")
+            && diag.message.contains("FLAG_READ")
+            && diag.message.contains("FLAG_WRITE")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_single_named_flag_check_in_public_methods() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Access {
+    permissions: u32,
+}
+
+impl Access {
+    const FLAG_READ: u32 = 1;
+
+    pub fn allows_read(&self) -> bool {
+        self.permissions & Self::FLAG_READ != 0
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_manual_flag_set") && diag.message.contains("Access::allows_read")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_manual_error_surfaces() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct RequestError {
+    pub message: String,
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RequestError {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_manual_error_surface") && diag.message.contains("RequestError")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_parallel_enum_metadata_helpers_with_two_strong_helpers() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Outcome {
+    Accepted,
+    Rejected,
+}
+
+impl Outcome {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn color(&self) -> &'static str {
+        match self {
+            Self::Accepted => "green",
+            Self::Rejected => "red",
+        }
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_parallel_enum_metadata_helper")
+            && diag.message.contains("code")
+            && diag.message.contains("color")
+    }));
 }
 
 #[test]
