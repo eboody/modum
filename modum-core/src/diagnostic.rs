@@ -2,18 +2,13 @@ use std::path::PathBuf;
 
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LintProfile {
     Core,
     Surface,
+    #[default]
     Strict,
-}
-
-impl Default for LintProfile {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 impl LintProfile {
