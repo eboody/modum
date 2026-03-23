@@ -6,9 +6,9 @@ use std::{
 
 use syn::{
     Expr, File, FnArg, GenericArgument, ImplItem, ImplItemFn, Item, ItemConst, ItemEnum, ItemFn,
-    ItemImpl, ItemMod, ItemStatic, ItemStruct, ItemTrait, ItemTraitAlias, ItemType, ItemUnion,
-    ItemUse, Lit, LitStr, PathArguments, ReturnType, Stmt, Type, UseTree, spanned::Spanned,
-    visit::Visit,
+    ItemImpl, ItemMacro, ItemMod, ItemStatic, ItemStruct, ItemTrait, ItemTraitAlias, ItemType,
+    ItemUnion, ItemUse, Lit, LitStr, PathArguments, ReturnType, Stmt, Type, UseTree,
+    spanned::Spanned, visit::Visit,
 };
 
 use super::{
@@ -81,6 +81,22 @@ struct ScopeSurfaceContext<'a> {
 struct ScopeFlags {
     path_is_public: bool,
     allow_candidate_semantic_modules: bool,
+}
+
+#[derive(Clone)]
+struct SemanticInferenceObservationGap {
+    line: usize,
+    constructs: BTreeSet<String>,
+}
+
+struct SemanticChildModuleBindings {
+    bindings: BTreeMap<String, BTreeSet<String>>,
+    observation_gap: Option<SemanticInferenceObservationGap>,
+}
+
+struct ChildModulePublicBindings {
+    bindings: BTreeSet<String>,
+    observation_gap_constructs: BTreeSet<String>,
 }
 
 pub(super) fn analyze_api_shape_rules(
@@ -2398,6 +2414,28 @@ fn analyze_candidate_semantic_modules(
 
     let child_modules = semantic_child_module_bindings(path, items, module_path, settings);
     let public_leaves = collect_scope_public_leaf_bindings(items);
+    let mut observation_gap = semantic_module_inference_gap_for_scope_items(items);
+    merge_semantic_inference_gap(&mut observation_gap, child_modules.observation_gap);
+    if let Some(gap) = observation_gap
+        && scope_has_candidate_semantic_module_inputs(
+            items,
+            &public_leaves,
+            public_bindings,
+            settings,
+        )
+    {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(gap.line),
+            "api_candidate_semantic_module_unsupported_construct",
+            format!(
+                "skipped semantic module family inference in this scope because source-level analysis saw {}; `api_candidate_semantic_module` only runs on direct parsed items without cfg pruning or macro expansion",
+                render_semantic_inference_constructs(&gap.constructs),
+            ),
+        ));
+        return suppressed_child_module_exports;
+    }
+    let child_modules = child_modules.bindings;
     let mut families = BTreeMap::<String, Vec<(usize, String, String)>>::new();
 
     for binding in &public_leaves {
@@ -2987,7 +3025,7 @@ fn semantic_module_surface_candidate(
 ) -> Option<String> {
     let child_module_bindings =
         semantic_child_module_bindings(path, scope_items, module_path, settings);
-    if child_module_bindings.is_empty() {
+    if child_module_bindings.bindings.is_empty() {
         return None;
     }
 
@@ -3002,7 +3040,7 @@ fn semantic_module_surface_candidate(
         .collect::<Vec<_>>();
     let style = detect_name_style(leaf_name);
 
-    for (module_name, bindings) in child_module_bindings {
+    for (module_name, bindings) in child_module_bindings.bindings {
         let module_segments = split_segments(&module_name)
             .into_iter()
             .map(|segment| normalize_segment(&segment))
@@ -3064,8 +3102,9 @@ fn semantic_child_module_bindings(
     scope_items: &[Item],
     module_path: &[String],
     settings: &NamespaceSettings,
-) -> BTreeMap<String, BTreeSet<String>> {
-    let mut out = BTreeMap::new();
+) -> SemanticChildModuleBindings {
+    let mut bindings = BTreeMap::new();
+    let mut observation_gap = None;
 
     for item in scope_items {
         let Item::Mod(item_mod) = item else {
@@ -3096,14 +3135,24 @@ fn semantic_child_module_bindings(
                 .as_ref()
                 .map(|(_, nested)| nested.as_slice()),
         );
-        if child_bindings.is_empty() {
+        for construct in child_bindings.observation_gap_constructs {
+            note_semantic_inference_construct(
+                &mut observation_gap,
+                item_mod.span().start().line,
+                construct,
+            );
+        }
+        if child_bindings.bindings.is_empty() {
             continue;
         }
 
-        out.insert(module_name, child_bindings);
+        bindings.insert(module_name, child_bindings.bindings);
     }
 
-    out
+    SemanticChildModuleBindings {
+        bindings,
+        observation_gap,
+    }
 }
 
 fn is_weak_semantic_head(head: &str) -> bool {
@@ -3154,13 +3203,19 @@ fn public_bindings_for_child_module(
     module_path: &[String],
     module_name: &str,
     inline_items: Option<&[Item]>,
-) -> BTreeSet<String> {
+) -> ChildModulePublicBindings {
     if let Some(items) = inline_items {
-        return collect_scope_public_bindings(items);
+        return ChildModulePublicBindings {
+            bindings: collect_scope_public_bindings(items),
+            observation_gap_constructs: semantic_module_inference_constructs_in_items(items),
+        };
     }
 
     let Some(src_root) = source_root(current_file) else {
-        return BTreeSet::new();
+        return ChildModulePublicBindings {
+            bindings: BTreeSet::new(),
+            observation_gap_constructs: BTreeSet::new(),
+        };
     };
 
     let mut full_module_path = module_path.to_vec();
@@ -3173,10 +3228,184 @@ fn public_bindings_for_child_module(
         let Ok(parsed) = syn::parse_file(&src) else {
             continue;
         };
-        return collect_scope_public_bindings(&parsed.items);
+        return ChildModulePublicBindings {
+            bindings: collect_scope_public_bindings(&parsed.items),
+            observation_gap_constructs: semantic_module_inference_constructs_in_items(
+                &parsed.items,
+            ),
+        };
     }
 
-    BTreeSet::new()
+    ChildModulePublicBindings {
+        bindings: BTreeSet::new(),
+        observation_gap_constructs: BTreeSet::new(),
+    }
+}
+
+fn semantic_module_inference_gap_for_scope_items(
+    items: &[Item],
+) -> Option<SemanticInferenceObservationGap> {
+    let mut gap = None;
+
+    for item in items {
+        for construct in semantic_module_inference_constructs_for_item(item) {
+            note_semantic_inference_construct(&mut gap, item.span().start().line, construct);
+        }
+    }
+
+    gap
+}
+
+fn semantic_module_inference_constructs_in_items(items: &[Item]) -> BTreeSet<String> {
+    let mut constructs = BTreeSet::new();
+
+    for item in items {
+        constructs.extend(semantic_module_inference_constructs_for_item(item));
+    }
+
+    constructs
+}
+
+fn semantic_module_inference_constructs_for_item(item: &Item) -> BTreeSet<String> {
+    let mut constructs = BTreeSet::new();
+
+    if item_participates_in_public_surface(item) {
+        for attr in item_attrs(item) {
+            if attr.path().is_ident("cfg") {
+                constructs.insert("#[cfg]".to_string());
+            }
+            if attr.path().is_ident("cfg_attr") {
+                constructs.insert("#[cfg_attr]".to_string());
+            }
+        }
+    }
+
+    if let Item::Macro(item_macro) = item {
+        constructs.insert(item_macro_observation_construct(item_macro).to_string());
+    }
+
+    constructs
+}
+
+fn scope_has_candidate_semantic_module_inputs(
+    items: &[Item],
+    public_leaves: &[PublicLeafBinding],
+    public_bindings: &BTreeSet<String>,
+    settings: &NamespaceSettings,
+) -> bool {
+    public_leaves.iter().any(|binding| {
+        matches!(detect_name_style(&binding.binding_name), NameStyle::Pascal)
+            && split_segments(&binding.binding_name).len() >= 2
+    }) || items.iter().any(|item| matches!(item, Item::Macro(_)))
+        || (public_bindings
+            .iter()
+            .any(|binding| settings.generic_nouns.contains(binding))
+            && scope_has_public_candidate_child_module(items, settings))
+}
+
+fn scope_has_public_candidate_child_module(items: &[Item], settings: &NamespaceSettings) -> bool {
+    items.iter().any(|item| {
+        let Item::Mod(item_mod) = item else {
+            return false;
+        };
+        if !is_public(&item_mod.vis) || module_is_hidden_or_internal(item_mod) {
+            return false;
+        }
+
+        let normalized = normalize_segment(&item_mod.ident.to_string());
+        !(settings.weak_modules.contains(&normalized)
+            || settings.catch_all_modules.contains(&normalized)
+            || settings.organizational_modules.contains(&normalized))
+    })
+}
+
+fn item_participates_in_public_surface(item: &Item) -> bool {
+    match item {
+        Item::Const(item_const) => is_public(&item_const.vis),
+        Item::Enum(item_enum) => is_public(&item_enum.vis),
+        Item::Fn(item_fn) => is_public(&item_fn.vis),
+        Item::Mod(item_mod) => is_public(&item_mod.vis),
+        Item::Static(item_static) => is_public(&item_static.vis),
+        Item::Struct(item_struct) => is_public(&item_struct.vis),
+        Item::Trait(item_trait) => is_public(&item_trait.vis),
+        Item::TraitAlias(item_trait_alias) => is_public(&item_trait_alias.vis),
+        Item::Type(item_type) => is_public(&item_type.vis),
+        Item::Union(item_union) => is_public(&item_union.vis),
+        Item::Use(item_use) => is_public(&item_use.vis),
+        Item::Macro(_) => true,
+        _ => false,
+    }
+}
+
+fn item_attrs(item: &Item) -> &[syn::Attribute] {
+    match item {
+        Item::Const(item_const) => &item_const.attrs,
+        Item::Enum(item_enum) => &item_enum.attrs,
+        Item::ExternCrate(item_extern_crate) => &item_extern_crate.attrs,
+        Item::Fn(item_fn) => &item_fn.attrs,
+        Item::ForeignMod(item_foreign_mod) => &item_foreign_mod.attrs,
+        Item::Impl(item_impl) => &item_impl.attrs,
+        Item::Macro(item_macro) => &item_macro.attrs,
+        Item::Mod(item_mod) => &item_mod.attrs,
+        Item::Static(item_static) => &item_static.attrs,
+        Item::Struct(item_struct) => &item_struct.attrs,
+        Item::Trait(item_trait) => &item_trait.attrs,
+        Item::TraitAlias(item_trait_alias) => &item_trait_alias.attrs,
+        Item::Type(item_type) => &item_type.attrs,
+        Item::Union(item_union) => &item_union.attrs,
+        Item::Use(item_use) => &item_use.attrs,
+        _ => &[],
+    }
+}
+
+fn item_macro_observation_construct(item_macro: &ItemMacro) -> &'static str {
+    if item_macro.mac.path.is_ident("include") {
+        "include!"
+    } else if item_macro.mac.path.is_ident("macro_rules") {
+        "macro_rules!"
+    } else {
+        "item macro"
+    }
+}
+
+fn note_semantic_inference_construct(
+    gap: &mut Option<SemanticInferenceObservationGap>,
+    line: usize,
+    construct: String,
+) {
+    match gap {
+        Some(existing) => {
+            existing.line = existing.line.min(line);
+            existing.constructs.insert(construct);
+        }
+        None => {
+            let mut constructs = BTreeSet::new();
+            constructs.insert(construct);
+            *gap = Some(SemanticInferenceObservationGap { line, constructs });
+        }
+    }
+}
+
+fn merge_semantic_inference_gap(
+    target: &mut Option<SemanticInferenceObservationGap>,
+    gap: Option<SemanticInferenceObservationGap>,
+) {
+    let Some(gap) = gap else {
+        return;
+    };
+
+    let line = gap.line;
+    for construct in gap.constructs {
+        note_semantic_inference_construct(target, line, construct);
+    }
+}
+
+fn render_semantic_inference_constructs(constructs: &BTreeSet<String>) -> String {
+    constructs
+        .iter()
+        .map(|construct| format!("`{construct}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn public_item_leaf(item: &Item) -> Option<(usize, String, bool)> {

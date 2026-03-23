@@ -1,6 +1,6 @@
 <div align="center">
   <img alt="modum logo" src="https://raw.githubusercontent.com/eboody/modum/main/modum-logo.svg" width="360">
-  <p>Modum enforces consistent module naming, import style, and public API paths across a Rust workspace.</p>
+  <p>Modum checks source-level module naming, import style, and public API path heuristics across a Rust workspace.</p>
   <p>
     <a href="https://github.com/eboody/modum/actions/workflows/ci.yml"><img src="https://github.com/eboody/modum/actions/workflows/ci.yml/badge.svg?branch=main&event=push" alt="build status" /></a>
     <a href="https://crates.io/crates/modum"><img src="https://img.shields.io/crates/v/modum.svg?logo=rust" alt="crates.io" /></a>
@@ -11,6 +11,7 @@
 # modum
 
 It is a lint tool. It reports diagnostics. It does not rewrite code.
+It analyzes parsed Rust source files. It does not expand macros, resolve `include!`, or prune `#[cfg]`.
 
 ## Why It Exists
 
@@ -75,7 +76,19 @@ So the rule is:
 - strong semantic parent: prefer `user::Repository`
 - weak or technical parent: prefer the more descriptive leaf
 
-`modum` enforces that style across an entire workspace.
+`modum` checks that style across an entire workspace at the parsed-source level.
+
+## Observation Model
+
+`modum` reads Rust source files with `syn` and reports source-level heuristics from the parsed AST.
+
+It does not observe:
+
+- cfg-pruned items
+- macro-expanded items
+- `include!`-generated items
+
+When semantic-module family inference would depend on those constructs, `modum` skips `api_candidate_semantic_module` and emits `api_candidate_semantic_module_unsupported_construct` instead.
 
 ## Mental Model
 
@@ -257,7 +270,9 @@ These warn when public leaves are too generic for a weak parent, when the path r
 - `api_redundant_leaf_context`
   Warning for public leaves that repeat semantic module context already carried by the path, such as `user::UserRepository`, or that bake a sibling semantic module into a flat public leaf when `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`.
+  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`. This is a parsed-source heuristic, not a macro-expanded or cfg-pruned source of truth.
+- `api_candidate_semantic_module_unsupported_construct`
+  Advisory warning for scopes where semantic-module family inference was skipped because the parsed source includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`.
 - `api_manual_enum_string_helper`
   Advisory warning for public enum string surfaces that are spelled manually, including bespoke non-const methods such as `label()` or `as_str()`, free helpers such as `scenario_label(&Scenario)`, and manual `Display` impls that only map variants to string literals.
 - `api_ad_hoc_parse_helper`
@@ -324,7 +339,7 @@ Example:
 
 ## What It Does Not Check
 
-Some naming-guide rules stay advisory because they are too semantic to lint reliably without compiler-grade context.
+Some naming-guide rules stay advisory because they are too semantic to lint reliably without compiler-grade context. `api_candidate_semantic_module` is also source-level only; if a scope relies on `#[cfg]`, item macros, or `include!`, `modum` emits `api_candidate_semantic_module_unsupported_construct` instead of pretending the inferred family is complete.
 
 Examples:
 

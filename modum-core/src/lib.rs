@@ -362,7 +362,13 @@ pub fn analyze_workspace_with_scan_settings(
             }
         };
 
-        let settings = settings_for_file(root, file, &workspace_defaults, &mut package_cache);
+        let settings = settings_for_file(
+            root,
+            file,
+            &workspace_defaults,
+            &mut package_cache,
+            &mut diagnostics,
+        );
         let analysis = analyze_file_with_settings(file, &src, &settings);
         if !analysis.diagnostics.is_empty() {
             files_with_violations.insert(file.clone());
@@ -468,24 +474,41 @@ fn settings_for_file(
     file: &Path,
     workspace_defaults: &NamespaceSettings,
     cache: &mut BTreeMap<PathBuf, NamespaceSettings>,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> NamespaceSettings {
     let Some(package_root) = find_package_root(root, file) else {
         return workspace_defaults.clone();
     };
 
-    cache
-        .entry(package_root.clone())
-        .or_insert_with(|| load_package_settings(&package_root, workspace_defaults))
-        .clone()
+    if let Some(settings) = cache.get(&package_root) {
+        return settings.clone();
+    }
+
+    let settings = load_package_settings(&package_root, workspace_defaults, diagnostics);
+    cache.insert(package_root, settings.clone());
+    settings
 }
 
-fn load_package_settings(root: &Path, workspace_defaults: &NamespaceSettings) -> NamespaceSettings {
+fn load_package_settings(
+    root: &Path,
+    workspace_defaults: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> NamespaceSettings {
     let manifest_path = root.join("Cargo.toml");
     let Ok(manifest_src) = fs::read_to_string(&manifest_path) else {
         return workspace_defaults.clone();
     };
-    let Ok(manifest) = toml::from_str::<toml::Value>(&manifest_src) else {
-        return workspace_defaults.clone();
+
+    let manifest = match toml::from_str::<toml::Value>(&manifest_src) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            diagnostics.push(Diagnostic::error(
+                Some(manifest_path),
+                None,
+                format!("failed to parse Cargo.toml for modum settings: {err}"),
+            ));
+            return workspace_defaults.clone();
+        }
     };
 
     parse_settings_from_manifest(
@@ -496,7 +519,7 @@ fn load_package_settings(root: &Path, workspace_defaults: &NamespaceSettings) ->
             .and_then(toml::Value::as_table)
             .and_then(|metadata| metadata.get("modum")),
         &manifest_path,
-        &mut Vec::new(),
+        diagnostics,
     )
     .unwrap_or_else(|| workspace_defaults.clone())
 }
@@ -563,26 +586,23 @@ fn parse_string_set_field(
     manifest_path: &Path,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<BTreeSet<String>> {
-    let value = table.get(key)?;
-    let Some(array) = value.as_array() else {
-        diagnostics.push(Diagnostic::error(
-            Some(manifest_path.to_path_buf()),
-            None,
-            format!("`metadata.modum.{key}` must be an array of strings"),
-        ));
-        return None;
-    };
-
     Some(
-        array
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .map(|value| value.to_string())
+        parse_string_values_field(table, key, manifest_path, diagnostics)?
+            .into_iter()
             .collect(),
     )
 }
 
 fn parse_string_list_field(
+    table: &toml::value::Table,
+    key: &str,
+    manifest_path: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Vec<String>> {
+    parse_string_values_field(table, key, manifest_path, diagnostics)
+}
+
+fn parse_string_values_field(
     table: &toml::value::Table,
     key: &str,
     manifest_path: &Path,
@@ -598,13 +618,20 @@ fn parse_string_list_field(
         return None;
     };
 
-    Some(
-        array
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .map(|value| value.to_string())
-            .collect(),
-    )
+    let mut values = Vec::with_capacity(array.len());
+    for (index, value) in array.iter().enumerate() {
+        let Some(value) = value.as_str() else {
+            diagnostics.push(Diagnostic::error(
+                Some(manifest_path.to_path_buf()),
+                None,
+                format!("`metadata.modum.{key}[{index}]` must be a string"),
+            ));
+            return None;
+        };
+        values.push(value.to_string());
+    }
+
+    Some(values)
 }
 
 fn find_package_root(root: &Path, file: &Path) -> Option<PathBuf> {
@@ -758,8 +785,15 @@ fn collect_rust_files(
             collect_rust_files_for_entry(root, entry, &mut files)?;
         }
     }
-    files.retain(|path| !is_excluded_path(root, path, exclude_globs).unwrap_or(false));
-    Ok(files.into_iter().collect())
+
+    let mut filtered = Vec::with_capacity(files.len());
+    for path in files {
+        if !is_excluded_path(root, &path, exclude_globs)? {
+            filtered.push(path);
+        }
+    }
+
+    Ok(filtered)
 }
 
 fn collect_rust_files_for_entry(

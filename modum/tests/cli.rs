@@ -142,6 +142,46 @@ edition = "2024"
     temp
 }
 
+fn write_invalid_generic_nouns_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+generic_nouns = [1]
+"#,
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), "pub struct UserRepository;\n").expect("write source");
+    temp
+}
+
+fn write_invalid_scan_defaults_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+exclude = ["src", 1]
+"#,
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), "pub struct UserRepository;\n").expect("write source");
+    temp
+}
+
 #[test]
 fn cli_help_shows_lint_only_surface() {
     let check_help = Command::new(env!("CARGO_BIN_EXE_modum"))
@@ -320,4 +360,102 @@ fn cli_respects_workspace_metadata_exclude_defaults() {
         .expect("diagnostic file");
     assert!(file.ends_with("/app/src/lib.rs"));
     assert!(!file.contains("examples/high-coverage"));
+}
+
+#[test]
+fn cli_invalid_exclude_pattern_reports_error() {
+    let temp = write_json_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--exclude",
+            "[",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(json["exit_code"].as_u64(), Some(1));
+    assert!(
+        json["report"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diag| {
+                diag["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("invalid exclude pattern `[`"))
+            })
+    );
+}
+
+#[test]
+fn cli_invalid_generic_nouns_metadata_reports_error() {
+    let temp = write_invalid_generic_nouns_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(json["exit_code"].as_u64(), Some(1));
+    assert!(
+        json["report"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diag| {
+                diag["message"].as_str().is_some_and(|message| {
+                    message.contains("`metadata.modum.generic_nouns[0]` must be a string")
+                })
+            })
+    );
+}
+
+#[test]
+fn cli_invalid_scan_default_metadata_reports_error() {
+    let temp = write_invalid_scan_defaults_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(json["exit_code"].as_u64(), Some(1));
+    assert!(
+        json["report"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diag| {
+                diag["message"].as_str().is_some_and(|message| {
+                    message.contains("`metadata.modum.exclude[1]` must be a string")
+                })
+            })
+    );
 }

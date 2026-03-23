@@ -1520,6 +1520,115 @@ pub mod __private {
 }
 
 #[test]
+fn analyze_workspace_skips_candidate_semantic_module_for_cfg_guarded_public_items() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[cfg(any())]
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module_unsupported_construct")
+            && diag.message.contains("`#[cfg]`")
+    }));
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_skips_candidate_semantic_module_for_macro_generated_public_items() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+macro_rules! declare_user_family {
+    () => {
+        pub struct UserRepository;
+        pub struct UserService;
+        pub struct UserId;
+    };
+}
+
+declare_user_family!();
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module_unsupported_construct")
+            && diag.message.contains("`macro_rules!`")
+            && diag.message.contains("`item macro`")
+    }));
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_skips_candidate_semantic_module_when_public_child_module_uses_include() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    let terminal_file = root.join("src/terminal.rs");
+    fs::create_dir_all(root.join("src/terminal")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod terminal;\n").expect("write lib");
+    fs::write(
+        &terminal_file,
+        r#"
+pub struct CompletedOutcome;
+pub struct RejectedOutcome;
+pub mod toxicity;
+pub struct Outcome;
+"#,
+    )
+    .expect("write terminal");
+    fs::write(
+        root.join("src/terminal/toxicity.rs"),
+        "include!(\"toxicity_generated.rs\");\n",
+    )
+    .expect("write toxicity");
+    fs::write(
+        root.join("src/terminal/toxicity_generated.rs"),
+        "pub struct Outcome;\n",
+    )
+    .expect("write generated");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module_unsupported_construct")
+            && diag.file.as_deref() == Some(terminal_file.as_path())
+            && diag.message.contains("`include!`")
+    }));
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
 fn analyze_workspace_does_not_treat_hidden_module_as_semantic_surface() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();

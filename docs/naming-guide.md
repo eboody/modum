@@ -168,7 +168,9 @@ Codex should default to these behaviors:
 - `api_redundant_leaf_context`
   Warning. Flags paths such as `user::UserRepository` or `page::ErrorPage` where the leaf repeats the parent context, and also flags flat public leaves such as `UserRepository` when a sibling semantic module surface like `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when at least three shared-head items suggest a semantic module surface like `user::{Repository, Service, Id}`, and also flags families such as `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome` when their shared generic tail suggests a semantic module surface like `outcome::{Completed, Rejected, Toxicity}`. It skips weak promoted heads like `to`, `has`, `open`, and `rolled`, and it skips hidden or internal module scopes.
+  Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when at least three shared-head items suggest a semantic module surface like `user::{Repository, Service, Id}`, and also flags families such as `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome` when their shared generic tail suggests a semantic module surface like `outcome::{Completed, Rejected, Toxicity}`. It skips weak promoted heads like `to`, `has`, `open`, and `rolled`, and it skips hidden or internal module scopes. This is a parsed-source heuristic, not a macro-expanded or cfg-pruned authority surface.
+- `api_candidate_semantic_module_unsupported_construct`
+  Advisory warning. Flags scopes where semantic-module family inference was skipped because the parsed source includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`. `modum` emits this instead of `api_candidate_semantic_module` when the raw source is too weak to justify that heuristic.
 - `api_manual_enum_string_helper`
   Advisory warning. Flags public enum string surfaces that are spelled manually, including non-const methods like `label()` or `as_str()`, free helpers like `scenario_label(&Scenario)`, and manual `Display` impls that only map variants to string literals.
 - `api_ad_hoc_parse_helper`
@@ -220,3 +222,8 @@ The rest of the guide remains advisory. `modum` does not try to prove:
 - configurable coverage for module boundaries that should stay visible via `namespace_preserving_modules`
 
 That second list should be extended per workspace for domain modules the defaults cannot infer, such as `user`, `billing`, or `tenant`. The defaults intentionally favor semantic surfaces like `partials`, `page`, and `components` over broader container namespaces like `views`.
+
+Observation model:
+- `modum` reads parsed Rust source files.
+- It does not expand macros, resolve `include!`, or prune `#[cfg]`.
+- When those constructs would weaken semantic-module family inference, it emits `api_candidate_semantic_module_unsupported_construct` instead of presenting `api_candidate_semantic_module` as complete.
