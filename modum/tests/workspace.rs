@@ -2241,6 +2241,64 @@ pub struct WriteBackSubmitted;
 }
 
 #[test]
+fn analyze_workspace_prefers_nested_candidate_semantic_module_for_shared_head_and_tail_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct CaseInboxLaunch;
+pub struct CaseDetailLaunch;
+pub struct CaseAuditLaunch;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && diag
+                .message
+                .contains("share the `Case` head and `Launch` tail")
+            && diag
+                .message
+                .contains("case::launch::{Audit, Detail, Inbox}")
+            && !diag.message.contains("case::{AuditLaunch")
+    }));
+}
+
+#[test]
+fn analyze_workspace_keeps_bare_head_tail_member_alongside_nested_candidate_semantic_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct GovernanceLaunch;
+pub struct GovernanceBoardLaunch;
+pub struct GovernanceHistoryLaunch;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && diag
+                .message
+                .contains("share the `Governance` head and `Launch` tail")
+            && diag
+                .message
+                .contains("governance::{Launch, launch::{Board, History}}")
+            && !diag.message.contains("governance::{BoardLaunch")
+    }));
+}
+
+#[test]
 fn analyze_workspace_skips_candidate_semantic_module_for_compile_test_scaffolding() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();

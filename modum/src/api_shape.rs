@@ -41,6 +41,11 @@ struct TailSemanticFamilyMember {
     child_module_name: Option<String>,
 }
 
+struct SharedHeadSemanticModuleSuggestion {
+    shared_tail: Option<String>,
+    surface: String,
+}
+
 #[derive(Clone)]
 struct ChildModuleSurfaceExport {
     parent_binding: String,
@@ -4524,40 +4529,29 @@ fn analyze_candidate_semantic_modules(
             .map(|(_, binding_name)| format!("`{binding_name}`"))
             .collect::<Vec<_>>()
             .join(", ");
-        let inferred_members = members
-            .iter()
-            .map(|(_, binding_name)| {
-                let segments = split_segments(binding_name);
-                render_segments(
-                    &segments[shared_head_segments.len()..],
-                    detect_name_style(binding_name),
-                )
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if inferred_members
-            .iter()
-            .all(|shorter_leaf| candidate_semantic_module_shorter_leaf_is_too_generic(shorter_leaf))
-        {
-            continue;
-        }
-        let Some(suggested_members) = merged_semantic_module_suggested_members(
+        let Some(suggestion) = shared_head_semantic_module_suggestion(
             &child_modules,
             &module_candidate,
-            inferred_members,
+            &shared_head_segments,
+            &members,
         ) else {
             continue;
         };
-        let suggested_members = suggested_members.join(", ");
 
         diagnostics.push(Diagnostic::advisory(
             Some(path.to_path_buf()),
             Some(line),
             "api_candidate_semantic_module",
-            format!(
-                "public siblings {original_members} share the `{head}` head; consider a semantic `{module_candidate}::{{{suggested_members}}}` surface"
-            ),
+            match suggestion.shared_tail {
+                Some(tail) => format!(
+                    "public siblings {original_members} share the `{head}` head and `{tail}` tail; consider a semantic `{}` surface",
+                    suggestion.surface,
+                ),
+                None => format!(
+                    "public siblings {original_members} share the `{head}` head; consider a semantic `{}` surface",
+                    suggestion.surface,
+                ),
+            },
         ));
     }
 
@@ -4721,6 +4715,106 @@ fn merged_semantic_module_suggested_members(
     }
 
     adds_new_member.then(|| merged_members.into_values().collect())
+}
+
+fn shared_head_semantic_module_suggestion(
+    child_modules: &BTreeMap<String, BTreeSet<String>>,
+    module_candidate: &str,
+    shared_head_segments: &[String],
+    members: &[(usize, String)],
+) -> Option<SharedHeadSemanticModuleSuggestion> {
+    let member_segments = members
+        .iter()
+        .map(|(_, binding_name)| split_segments(binding_name))
+        .collect::<Vec<_>>();
+    let trimmed_member_segments = member_segments
+        .iter()
+        .map(|segments| segments[shared_head_segments.len()..].to_vec())
+        .collect::<Vec<_>>();
+
+    if let Some(shared_tail_segments) =
+        candidate_semantic_module_shared_tail_segments(&trimmed_member_segments)
+    {
+        let tail_len = shared_tail_segments.len();
+        let mut root_members = BTreeMap::<String, String>::new();
+        let mut nested_members = BTreeMap::<String, String>::new();
+
+        if let Some(existing_members) =
+            semantic_child_module_members(child_modules, module_candidate)
+        {
+            for member in existing_members {
+                root_members.insert(normalize_segment(member), member.clone());
+            }
+        }
+
+        for ((_, binding_name), trimmed_segments) in
+            members.iter().zip(trimmed_member_segments.iter())
+        {
+            let middle_segments = &trimmed_segments[..trimmed_segments.len() - tail_len];
+            if middle_segments.is_empty() {
+                let leaf = render_segments(&shared_tail_segments, detect_name_style(binding_name));
+                root_members.insert(normalize_segment(&leaf), leaf);
+                continue;
+            }
+
+            let leaf = render_segments(middle_segments, detect_name_style(binding_name));
+            nested_members.insert(normalize_segment(&leaf), leaf);
+        }
+
+        if !nested_members.is_empty()
+            && !nested_members
+                .values()
+                .all(|leaf| candidate_semantic_module_shorter_leaf_is_too_generic(leaf))
+        {
+            let tail = render_segments(&shared_tail_segments, NameStyle::Pascal);
+            let tail_module = render_segments(&shared_tail_segments, NameStyle::Snake);
+            let nested_surface = format!(
+                "{tail_module}::{{{}}}",
+                nested_members.into_values().collect::<Vec<_>>().join(", ")
+            );
+            let surface = if root_members.is_empty() {
+                format!("{module_candidate}::{nested_surface}")
+            } else {
+                let mut outer_members = root_members.into_values().collect::<Vec<_>>();
+                outer_members.push(nested_surface);
+                format!("{module_candidate}::{{{}}}", outer_members.join(", "))
+            };
+
+            return Some(SharedHeadSemanticModuleSuggestion {
+                shared_tail: Some(tail),
+                surface,
+            });
+        }
+    }
+
+    let inferred_members = members
+        .iter()
+        .zip(member_segments)
+        .map(|((_, binding_name), segments)| {
+            render_segments(
+                &segments[shared_head_segments.len()..],
+                detect_name_style(binding_name),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if inferred_members
+        .iter()
+        .all(|shorter_leaf| candidate_semantic_module_shorter_leaf_is_too_generic(shorter_leaf))
+    {
+        return None;
+    }
+    let suggested_members = merged_semantic_module_suggested_members(
+        child_modules,
+        module_candidate,
+        inferred_members,
+    )?;
+
+    Some(SharedHeadSemanticModuleSuggestion {
+        shared_tail: None,
+        surface: format!("{module_candidate}::{{{}}}", suggested_members.join(", ")),
+    })
 }
 
 fn semantic_child_module_members<'a>(
@@ -5376,6 +5470,30 @@ fn candidate_semantic_module_shared_head_segments(
             .iter()
             .all(|segments| segments.len() > shared_prefix_len))
     .then(|| first[..shared_prefix_len].to_vec())
+}
+
+fn candidate_semantic_module_shared_tail_segments(
+    member_segments: &[Vec<String>],
+) -> Option<Vec<String>> {
+    let first = member_segments.first()?;
+    let shared_suffix_len =
+        member_segments
+            .iter()
+            .skip(1)
+            .fold(first.len(), |current, segments| {
+                current.min(
+                    first
+                        .iter()
+                        .rev()
+                        .zip(segments.iter().rev())
+                        .take_while(|(left, right)| {
+                            normalize_segment(left) == normalize_segment(right)
+                        })
+                        .count(),
+                )
+            });
+
+    (shared_suffix_len > 0).then(|| first[first.len() - shared_suffix_len..].to_vec())
 }
 
 fn candidate_semantic_module_shorter_leaf_is_too_generic(shorter_leaf: &str) -> bool {

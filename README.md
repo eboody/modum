@@ -348,7 +348,7 @@ For these surface-shape rules, shared crate-visible surfaces such as `pub(crate)
 - `api_redundant_leaf_context`
   Warning for public leaves that repeat semantic module context already carried by the path, such as `user::UserRepository`, or that bake a sibling semantic module into a flat public leaf when `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`. It works on parsed source only and does not see macro expansion or cfg-pruned items.
+  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, through a shared head plus tail that points to a nested surface like `case::launch::{Inbox, Detail, Audit}`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`. It works on parsed source only and does not see macro expansion or cfg-pruned items.
 - `api_candidate_semantic_module_unsupported_construct`
   Advisory warning for scopes where semantic-module family inference was skipped because the parsed source includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`.
 - `api_manual_enum_string_helper`
