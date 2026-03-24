@@ -4484,9 +4484,6 @@ fn analyze_candidate_semantic_modules(
             || settings.catch_all_modules.contains(&module_candidate)
             || settings.organizational_modules.contains(&module_candidate)
             || is_weak_semantic_head(&module_candidate)
-            || child_modules
-                .keys()
-                .any(|module_name| normalize_segment(module_name) == normalize_segment(&head))
         {
             continue;
         }
@@ -4522,17 +4519,12 @@ fn analyze_candidate_semantic_modules(
         if semantic_module_candidate_already_emitted(diagnostics, path, &module_candidate) {
             continue;
         }
-        if child_modules.keys().any(|module_name| {
-            normalize_segment(module_name) == normalize_segment(&module_candidate)
-        }) {
-            continue;
-        }
         let original_members = members
             .iter()
             .map(|(_, binding_name)| format!("`{binding_name}`"))
             .collect::<Vec<_>>()
             .join(", ");
-        let suggested_members = members
+        let inferred_members = members
             .iter()
             .map(|(_, binding_name)| {
                 let segments = split_segments(binding_name);
@@ -4544,12 +4536,19 @@ fn analyze_candidate_semantic_modules(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        if suggested_members
+        if inferred_members
             .iter()
             .all(|shorter_leaf| candidate_semantic_module_shorter_leaf_is_too_generic(shorter_leaf))
         {
             continue;
         }
+        let Some(suggested_members) = merged_semantic_module_suggested_members(
+            &child_modules,
+            &module_candidate,
+            inferred_members,
+        ) else {
+            continue;
+        };
         let suggested_members = suggested_members.join(", ");
 
         diagnostics.push(Diagnostic::advisory(
@@ -4571,9 +4570,6 @@ fn analyze_candidate_semantic_modules(
         if settings.weak_modules.contains(&module_candidate)
             || settings.catch_all_modules.contains(&module_candidate)
             || settings.organizational_modules.contains(&module_candidate)
-            || child_modules
-                .keys()
-                .any(|module_name| normalize_segment(module_name) == normalize_segment(tail))
         {
             continue;
         }
@@ -4653,13 +4649,20 @@ fn analyze_candidate_semantic_modules(
             .map(|member| format!("`{}`", member.original_member))
             .collect::<Vec<_>>()
             .join(", ");
-        let suggested_members = members
+        let inferred_members = members
             .iter()
             .map(|member| member.suggested_leaf.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Vec<_>>();
+        let Some(suggested_members) = merged_semantic_module_suggested_members(
+            &child_modules,
+            &module_candidate,
+            inferred_members,
+        ) else {
+            continue;
+        };
+        let suggested_members = suggested_members.join(", ");
 
         diagnostics.push(Diagnostic::advisory(
             Some(path.to_path_buf()),
@@ -4690,6 +4693,42 @@ fn semantic_module_candidate_already_emitted(
         diag.code() == Some("api_candidate_semantic_module")
             && diag.file.as_deref() == Some(path)
             && diag.message.contains(&marker)
+    })
+}
+
+fn merged_semantic_module_suggested_members(
+    child_modules: &BTreeMap<String, BTreeSet<String>>,
+    module_candidate: &str,
+    inferred_members: Vec<String>,
+) -> Option<Vec<String>> {
+    let existing_members = semantic_child_module_members(child_modules, module_candidate);
+    let mut merged_members = BTreeMap::<String, String>::new();
+
+    if let Some(existing_members) = existing_members {
+        for member in existing_members {
+            merged_members.insert(normalize_segment(member), member.clone());
+        }
+    }
+
+    let mut adds_new_member = false;
+    for member in inferred_members {
+        let normalized = normalize_segment(&member);
+        if merged_members.contains_key(&normalized) {
+            continue;
+        }
+        merged_members.insert(normalized, member);
+        adds_new_member = true;
+    }
+
+    adds_new_member.then(|| merged_members.into_values().collect())
+}
+
+fn semantic_child_module_members<'a>(
+    child_modules: &'a BTreeMap<String, BTreeSet<String>>,
+    module_candidate: &str,
+) -> Option<&'a BTreeSet<String>> {
+    child_modules.iter().find_map(|(module_name, bindings)| {
+        (normalize_segment(module_name) == normalize_segment(module_candidate)).then_some(bindings)
     })
 }
 

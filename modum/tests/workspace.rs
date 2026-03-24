@@ -1343,6 +1343,53 @@ pub enum Outcome {
 }
 
 #[test]
+fn analyze_workspace_flags_tail_family_candidate_semantic_module_for_partial_existing_namespace() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/terminal")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod terminal;\n").expect("write lib");
+    fs::write(
+        root.join("src/terminal.rs"),
+        r#"
+pub mod outcome;
+pub mod toxicity;
+pub struct CompletedOutcome;
+pub struct RejectedOutcome;
+pub enum Outcome {
+    Completed(CompletedOutcome),
+    Pending(outcome::Pending),
+    Rejected(RejectedOutcome),
+    Toxicity(toxicity::Outcome),
+}
+"#,
+    )
+    .expect("write terminal");
+    fs::write(
+        root.join("src/terminal/outcome.rs"),
+        "pub struct Pending;\n",
+    )
+    .expect("write outcome");
+    fs::write(
+        root.join("src/terminal/toxicity.rs"),
+        "pub struct Outcome;\n",
+    )
+    .expect("write toxicity");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && !diag.is_policy_violation()
+            && diag.message.contains("CompletedOutcome")
+            && diag.message.contains("RejectedOutcome")
+            && diag.message.contains("toxicity::Outcome")
+            && diag
+                .message
+                .contains("outcome::{Completed, Pending, Rejected, Toxicity}")
+    }));
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_missing_parent_surface_export_for_generic_child_when_module_has_multiple_public_items()
  {
     let temp = tempdir().expect("create temp dir");
@@ -2122,6 +2169,45 @@ pub struct UserId;
             && diag.message.contains("UserService")
             && diag.message.contains("UserId")
             && diag.message.contains("user::{Id, Repository, Service}")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_candidate_semantic_module_for_partial_existing_head_namespace() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod user;
+
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/user.rs"),
+        r#"
+pub struct Profile;
+pub struct Repository;
+"#,
+    )
+    .expect("write user");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && !diag.is_policy_violation()
+            && diag.message.contains("UserRepository")
+            && diag.message.contains("UserService")
+            && diag.message.contains("UserId")
+            && diag
+                .message
+                .contains("user::{Id, Profile, Repository, Service}")
     }));
 }
 
