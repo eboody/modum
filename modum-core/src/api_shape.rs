@@ -321,7 +321,7 @@ fn analyze_module_item(
             ));
         }
 
-        if settings.organizational_modules.contains(&normalized) {
+        if settings.organizational_modules.contains(&normalized) && !module_path.is_empty() {
             diagnostics.push(Diagnostic::policy(
                 Some(path.to_path_buf()),
                 Some(line),
@@ -4435,7 +4435,10 @@ fn analyze_candidate_semantic_modules(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> BTreeSet<String> {
     let mut suppressed_child_module_exports = BTreeSet::new();
-    if !scope_flags.path_is_public || !scope_flags.allow_candidate_semantic_modules {
+    if !scope_flags.path_is_public
+        || !scope_flags.allow_candidate_semantic_modules
+        || module_path_is_synthetic_scaffolding(module_path)
+    {
         return suppressed_child_module_exports;
     }
 
@@ -4688,6 +4691,19 @@ fn semantic_module_candidate_already_emitted(
             && diag.file.as_deref() == Some(path)
             && diag.message.contains(&marker)
     })
+}
+
+fn module_path_is_synthetic_scaffolding(module_path: &[String]) -> bool {
+    module_path
+        .iter()
+        .any(|segment| module_name_is_synthetic_scaffolding(segment))
+}
+
+fn module_name_is_synthetic_scaffolding(module_name: &str) -> bool {
+    matches!(
+        normalize_segment(module_name).as_str(),
+        "compile_test" | "compile_tests" | "fixture" | "fixtures"
+    )
 }
 
 fn public_use_module_binding(
@@ -5093,14 +5109,30 @@ fn analyze_internal_leaf(
         if internal_shorter_leaf_is_too_generic(&shorter_leaf) {
             return;
         }
-        diagnostics.push(Diagnostic::policy(
+        if internal_leaf_context_is_human_facing_machinery(module_path, leaf_name) {
+            return;
+        }
+
+        let path_text = render_public_path(module_path, leaf_name);
+        let preferred_path = render_public_path(module_path, &shorter_leaf);
+        if internal_leaf_context_is_adapter_policy(parent_module, &shorter_leaf) {
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(line),
+                "internal_adapter_redundant_leaf_context",
+                format!(
+                    "internal adapter `{path_text}` repeats the `{parent_module}` implementation context; prefer `{preferred_path}`",
+                ),
+            ));
+            return;
+        }
+
+        diagnostics.push(Diagnostic::advisory(
             Some(path.to_path_buf()),
             Some(line),
             "internal_redundant_leaf_context",
             format!(
-                "internal item `{}` repeats the `{parent_module}` context; prefer `{}`",
-                render_public_path(module_path, leaf_name),
-                render_public_path(module_path, &shorter_leaf),
+                "internal item `{path_text}` repeats the `{parent_module}` context; prefer `{preferred_path}`",
             ),
         ));
     }
@@ -5759,6 +5791,76 @@ fn internal_shorter_leaf_is_too_generic(shorter_leaf: &str) -> bool {
         && tokens
             .iter()
             .all(|token| weak_tokens.contains(&token.as_str()))
+}
+
+fn internal_leaf_context_is_adapter_policy(parent_module: &str, shorter_leaf: &str) -> bool {
+    let adapter_context_tokens = [
+        "adapter",
+        "grpc",
+        "http",
+        "https",
+        "memory",
+        "mock",
+        "mysql",
+        "postgres",
+        "postgresql",
+        "redis",
+        "sqlite",
+    ];
+    let adapter_role_tokens = [
+        "adapter",
+        "backend",
+        "client",
+        "connector",
+        "gateway",
+        "repository",
+        "store",
+        "transport",
+    ];
+    let parent_tokens = name_tokens(parent_module);
+    let shorter_tokens = name_tokens(shorter_leaf);
+
+    parent_tokens
+        .iter()
+        .any(|token| adapter_context_tokens.contains(&token.as_str()))
+        && shorter_tokens
+            .last()
+            .is_some_and(|token| adapter_role_tokens.contains(&token.as_str()))
+}
+
+fn internal_leaf_context_is_human_facing_machinery(
+    module_path: &[String],
+    leaf_name: &str,
+) -> bool {
+    let path_tokens = module_path
+        .iter()
+        .flat_map(|segment| name_tokens(segment))
+        .collect::<Vec<_>>();
+    if path_tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "replay" | "trace"))
+    {
+        return true;
+    }
+
+    let typestate_tokens = [
+        "flow",
+        "gate",
+        "graph",
+        "machine",
+        "protocol",
+        "state",
+        "transition",
+        "typestate",
+    ];
+    let leaf_tokens = name_tokens(leaf_name);
+
+    path_tokens
+        .iter()
+        .any(|token| typestate_tokens.contains(&token.as_str()))
+        && leaf_tokens
+            .iter()
+            .any(|token| typestate_tokens.contains(&token.as_str()))
 }
 
 fn render_public_path(module_path: &[String], leaf_name: &str) -> String {

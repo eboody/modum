@@ -667,12 +667,12 @@ fn cli_write_baseline_then_apply_it() {
     assert_eq!(write_output.status.code(), Some(2));
     assert!(baseline_path.is_file());
     let stderr = String::from_utf8_lossy(&write_output.stderr);
-    assert!(stderr.contains("wrote baseline .modum/baseline.json (3 coded diagnostics)"));
+    assert!(stderr.contains("wrote baseline .modum/baseline.json (2 coded diagnostics)"));
 
     let baseline: Value =
         serde_json::from_slice(&fs::read(&baseline_path).expect("read baseline")).expect("json");
     assert_eq!(baseline["version"].as_u64(), Some(1));
-    assert_eq!(baseline["diagnostics"].as_array().map(Vec::len), Some(3));
+    assert_eq!(baseline["diagnostics"].as_array().map(Vec::len), Some(2));
 
     let apply_output = Command::new(env!("CARGO_BIN_EXE_modum"))
         .args([

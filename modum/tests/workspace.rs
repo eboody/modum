@@ -374,8 +374,34 @@ mod user {
     let report = analyze_workspace(root, &[]);
     assert!(report.diagnostics.iter().any(|diag| {
         diag.code() == Some("internal_redundant_leaf_context")
+            && diag.is_advisory_warning()
             && diag.message.contains("user::UserRepository")
             && diag.message.contains("user::Repository")
+    }));
+}
+
+#[test]
+fn analyze_workspace_keeps_adapter_context_internal_leaf_rule_as_policy() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod sqlite {
+    struct SqliteAuditLogStore;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_adapter_redundant_leaf_context")
+            && diag.is_policy_violation()
+            && diag.message.contains("sqlite::SqliteAuditLogStore")
+            && diag.message.contains("sqlite::AuditLogStore")
     }));
 }
 
@@ -405,6 +431,45 @@ mod bootstrap {
             .diagnostics
             .iter()
             .any(|diag| diag.code() == Some("internal_redundant_leaf_context"))
+    );
+}
+
+#[test]
+fn analyze_workspace_suppresses_internal_redundant_leaf_context_for_replay_and_trace_machinery() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod replay {
+    mod machine {
+        struct ReplayMachine;
+    }
+}
+
+mod trace {
+    mod model {
+        struct ModelEncoding;
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_redundant_leaf_context"))
+    );
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_adapter_redundant_leaf_context"))
     );
 }
 
@@ -505,7 +570,7 @@ mod user {
 }
 
 #[test]
-fn analyze_workspace_flags_internal_organizational_module() {
+fn analyze_workspace_suppresses_internal_organizational_module_at_private_crate_root() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
     fs::create_dir_all(root.join("src")).expect("create src");
@@ -515,6 +580,33 @@ fn analyze_workspace_flags_internal_organizational_module() {
         r#"
 mod response {
     struct Payload;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_organizational_submodule_flatten"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_internal_organizational_module_when_nested() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod adapter {
+    mod response {
+        struct Payload;
+    }
 }
 "#,
     )
@@ -2060,6 +2152,32 @@ pub struct WriteBackSubmitted;
                 .contains("write_back::{Prepared, Ready, Submitted}")
             && !diag.message.contains("write::{Back")
     }));
+}
+
+#[test]
+fn analyze_workspace_skips_candidate_semantic_module_for_compile_test_scaffolding() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod compile_test;\n").expect("write lib");
+    fs::write(
+        root.join("src/compile_test.rs"),
+        r#"
+pub struct ReleaseCandidate;
+pub struct ReleaseApproved;
+pub struct ReleaseReleased;
+"#,
+    )
+    .expect("write compile test");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_semantic_module"))
+    );
 }
 
 #[test]

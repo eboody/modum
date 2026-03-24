@@ -320,6 +320,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
             LintProfile::Core,
             "An internal item leaf repeats context the parent module already provides.",
         ),
+        "internal_adapter_redundant_leaf_context" => (
+            LintProfile::Core,
+            "An internal adapter leaf repeats implementation context the parent module already provides.",
+        ),
         "internal_redundant_category_suffix" => (
             LintProfile::Core,
             "An internal item leaf repeats the parent category in a redundant suffix.",
