@@ -255,9 +255,103 @@ pub mod components;
         &AnalysisSettings {
             scan: ScanSettings::default(),
             profile: Some(LintProfile::Core),
+            ignored_diagnostic_codes: Vec::new(),
+            baseline: None,
         },
     );
     assert!(report.diagnostics.is_empty());
+}
+
+#[test]
+fn analyze_workspace_package_ignored_diagnostic_codes_suppress_matching_lints() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(
+        root,
+        r#"[package.metadata.modum]
+ignored_diagnostic_codes = ["api_candidate_semantic_module"]
+"#,
+    );
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_semantic_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_ignored_namespace_preserving_modules_remove_defaults() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(
+        root,
+        r#"[package.metadata.modum]
+ignored_namespace_preserving_modules = ["components"]
+"#,
+    );
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use components::Button;
+
+mod components {
+    pub struct Button;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("namespace_flat_use_preserve_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_extra_namespace_preserving_modules_extend_defaults() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(
+        root,
+        r#"[package.metadata.modum]
+extra_namespace_preserving_modules = ["widgets"]
+"#,
+    );
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use widgets::Button;
+
+mod widgets {
+    pub struct Button;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use_preserve_module")
+            && diag.message.contains("widgets::Button")
+    }));
 }
 
 #[test]
@@ -300,6 +394,44 @@ mod report {
 
 mod bootstrap {
     struct BootstrapConfig;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_redundant_leaf_context"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_internal_redundant_leaf_context_for_meta_shorter_leaves() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod transition {
+    struct TransitionFn;
+    struct TransitionImpl;
+}
+
+mod introspection {
+    struct MachineIntrospection;
+}
+
+mod state {
+    struct StateModulePath;
+}
+
+mod builder {
+    struct SignatureForBuilder;
 }
 "#,
     )
@@ -1902,6 +2034,35 @@ pub struct UserId;
 }
 
 #[test]
+fn analyze_workspace_flags_candidate_semantic_module_for_compound_shared_head_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct WriteBackReady;
+pub struct WriteBackPrepared;
+pub struct WriteBackSubmitted;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && diag.message.contains("WriteBackReady")
+            && diag.message.contains("WriteBackPrepared")
+            && diag.message.contains("WriteBackSubmitted")
+            && diag
+                .message
+                .contains("write_back::{Prepared, Ready, Submitted}")
+            && !diag.message.contains("write::{Back")
+    }));
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_candidate_semantic_module_for_weak_head_family() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -1946,6 +2107,34 @@ pub struct ConfigurationErrorKind;
             .diagnostics
             .iter()
             .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_candidate_semantic_module_for_meta_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct DiagnosticClass;
+pub struct DiagnosticCodeInfo;
+pub struct DiagnosticFix;
+pub struct DiagnosticFixKind;
+pub struct DiagnosticLevel;
+pub struct DiagnosticSelection;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_semantic_module"))
     );
 }
 
@@ -2558,6 +2747,42 @@ pub fn parse() -> Result<(), String> {
 }
 
 #[test]
+fn analyze_workspace_does_not_flag_parse_passthrough_string_error_surfaces() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Mode {
+    Warn,
+    Deny,
+}
+
+impl Mode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        raw.parse()
+    }
+}
+
+pub fn parse_mode(raw: &str) -> Result<Mode, String> {
+    Mode::parse(raw)
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_string_error_surface"))
+    );
+}
+
+#[test]
 fn analyze_workspace_does_not_treat_generic_detail_fields_as_error_surfaces() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -2781,6 +3006,8 @@ pub fn connect(email: String) {}
         &AnalysisSettings {
             scan: ScanSettings::default(),
             profile: Some(LintProfile::Surface),
+            ignored_diagnostic_codes: Vec::new(),
+            baseline: None,
         },
     );
     assert!(
@@ -3443,6 +3670,117 @@ impl Request {
             .diagnostics
             .iter()
             .any(|diag| { diag.code() == Some("api_optional_parameter_builder") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_maybe_some_callsites() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Request;
+pub struct Builder;
+
+impl Request {
+    pub fn builder() -> Builder {
+        Builder
+    }
+}
+
+impl Builder {
+    pub fn label(self, _label: String) -> Self {
+        self
+    }
+
+    pub fn maybe_label(self, _label: Option<String>) -> Self {
+        self
+    }
+
+    pub fn maybe_note(self, _note: Option<String>) -> Self {
+        self
+    }
+}
+
+pub fn build() {
+    let _ = Request::builder()
+        .maybe_label(Some("ready".to_string()))
+        .maybe_note(std::option::Option::Some("set".to_string()));
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    let maybe_some = report
+        .diagnostics
+        .iter()
+        .filter(|diag| diag.code() == Some("callsite_maybe_some"))
+        .collect::<Vec<_>>();
+    assert_eq!(maybe_some.len(), 2);
+    assert!(
+        maybe_some
+            .iter()
+            .any(|diag| diag.message.contains("maybe_label") && diag.message.contains("label"))
+    );
+    assert!(
+        maybe_some
+            .iter()
+            .any(|diag| diag.message.contains("maybe_note") && diag.message.contains("note"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_maybe_some_for_real_option_forwarding() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Request;
+pub struct Builder;
+
+impl Request {
+    pub fn builder() -> Builder {
+        Builder
+    }
+}
+
+impl Builder {
+    pub fn label(self, _label: String) -> Self {
+        self
+    }
+
+    pub fn maybe_label(self, _label: Option<String>) -> Self {
+        self
+    }
+
+    pub fn with_label(self, _label: Option<String>) -> Self {
+        self
+    }
+}
+
+pub fn build(label: Option<String>) {
+    let _ = Request::builder()
+        .maybe_label(label)
+        .with_label(Some("ready".to_string()))
+        .label("direct".to_string());
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("callsite_maybe_some"))
     );
 }
 

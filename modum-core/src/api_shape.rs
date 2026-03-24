@@ -17,7 +17,7 @@ use super::{
     split_segments, unraw_ident,
 };
 
-pub(super) struct ApiShapeAnalysis {
+pub(super) struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -123,7 +123,7 @@ pub(super) fn analyze_api_shape_rules(
     path: &Path,
     parsed: &File,
     settings: &NamespaceSettings,
-) -> ApiShapeAnalysis {
+) -> Analysis {
     let inferred_module_path = inferred_file_module_path(path);
     let inferred_is_public =
         inferred_module_path.is_empty() || inferred_module_is_public(path, &inferred_module_path);
@@ -168,7 +168,7 @@ pub(super) fn analyze_api_shape_rules(
         &mut diagnostics,
     );
 
-    ApiShapeAnalysis { diagnostics }
+    Analysis { diagnostics }
 }
 
 fn analyze_scope(
@@ -201,6 +201,12 @@ fn analyze_scope(
         settings,
         diagnostics,
     );
+
+    for item in items {
+        if !matches!(item, Item::Mod(_)) {
+            analyze_maybe_some_callsite_item(path, item, diagnostics);
+        }
+    }
 
     for item in items {
         match item {
@@ -237,6 +243,11 @@ fn analyze_scope(
             ),
         }
     }
+}
+
+fn analyze_maybe_some_callsite_item(path: &Path, item: &Item, diagnostics: &mut Vec<Diagnostic>) {
+    let mut visitor = MaybeSomeMethodCallVisitor { path, diagnostics };
+    visitor.visit_item(item);
 }
 
 fn analyze_module_item(
@@ -2007,6 +2018,7 @@ fn analyze_public_fn_typed_error_surfaces(
         item_fn.span().start().line,
         &item_fn.sig.ident.to_string(),
         &item_fn.sig.output,
+        Some(&item_fn.block),
         diagnostics,
     );
 }
@@ -2037,6 +2049,7 @@ fn analyze_public_impl_typed_error_surfaces(
             method.span().start().line,
             &format!("{self_type}::{}", method.sig.ident),
             &method.sig.output,
+            Some(&method.block),
             diagnostics,
         );
     }
@@ -2047,13 +2060,16 @@ fn analyze_typed_error_output(
     line: usize,
     item_name: &str,
     output: &ReturnType,
+    body: Option<&syn::Block>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(output_ty) = return_type(output) else {
         return;
     };
 
-    if type_is_result_string_error(output_ty) {
+    if type_is_result_string_error(output_ty)
+        && !body.is_some_and(block_is_string_parse_passthrough)
+    {
         diagnostics.push(Diagnostic::advisory(
             Some(path.to_path_buf()),
             Some(line),
@@ -2074,6 +2090,79 @@ fn analyze_typed_error_output(
             ),
         ));
     }
+}
+
+fn block_is_string_parse_passthrough(block: &syn::Block) -> bool {
+    let [Stmt::Expr(expr, _)] = block.stmts.as_slice() else {
+        return false;
+    };
+    expr_is_string_parse_passthrough(expr)
+}
+
+fn expr_is_string_parse_passthrough(expr: &Expr) -> bool {
+    match expr {
+        Expr::MethodCall(method)
+            if method.method == "parse"
+                && method.args.is_empty()
+                && expr_is_single_ident_path(&method.receiver) =>
+        {
+            true
+        }
+        Expr::Call(call)
+            if call.args.len() == 1
+                && call.args.first().is_some_and(expr_is_single_ident_path)
+                && call_target_is_parse_helper(&call.func) =>
+        {
+            true
+        }
+        Expr::Block(block) => block_is_string_parse_passthrough(&block.block),
+        _ => false,
+    }
+}
+
+fn call_target_is_parse_helper(func: &Expr) -> bool {
+    let Expr::Path(path) = func else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "parse")
+}
+
+fn expr_is_single_ident_path(expr: &Expr) -> bool {
+    let Expr::Path(path) = expr else {
+        return false;
+    };
+    path.path.segments.len() == 1
+}
+
+fn expr_is_option_some_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call)
+            if call.args.len() == 1 && expr_is_option_some_constructor(call.func.as_ref()) =>
+        {
+            true
+        }
+        Expr::Group(group) => expr_is_option_some_call(&group.expr),
+        Expr::Paren(paren) => expr_is_option_some_call(&paren.expr),
+        _ => false,
+    }
+}
+
+fn expr_is_option_some_constructor(expr: &Expr) -> bool {
+    let Expr::Path(path) = expr else {
+        return false;
+    };
+    let mut segments = path.path.segments.iter();
+    let Some(last) = segments.next_back() else {
+        return false;
+    };
+    if last.ident != "Some" {
+        return false;
+    }
+
+    path.path.segments.len() == 1 || segments.any(|segment| segment.ident == "Option")
 }
 
 fn analyze_public_fn_semantic_scalar_boundaries(
@@ -2745,6 +2834,11 @@ struct DefaultedOptionParamVisitor<'a> {
     defaulted_params: BTreeSet<String>,
 }
 
+struct MaybeSomeMethodCallVisitor<'a> {
+    path: &'a Path,
+    diagnostics: &'a mut Vec<Diagnostic>,
+}
+
 impl<'ast> Visit<'ast> for DefaultedOptionParamVisitor<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if matches!(
@@ -2754,6 +2848,28 @@ impl<'ast> Visit<'ast> for DefaultedOptionParamVisitor<'_> {
             && self.option_params.contains(&param_name)
         {
             self.defaulted_params.insert(param_name);
+        }
+
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+impl<'ast> Visit<'ast> for MaybeSomeMethodCallVisitor<'_> {
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let method_name = node.method.to_string();
+        if let Some(setter_name) = method_name.strip_prefix("maybe_")
+            && !setter_name.is_empty()
+            && node.args.len() == 1
+            && node.args.first().is_some_and(expr_is_option_some_call)
+        {
+            self.diagnostics.push(Diagnostic::advisory(
+                Some(self.path.to_path_buf()),
+                Some(node.span().start().line),
+                "callsite_maybe_some",
+                format!(
+                    "call `{method_name}(Some(...))` wraps a concrete value just to feed a `maybe_` setter; pass an `Option<_>` value to `{method_name}` or call `{setter_name}(...)` when you already have the value"
+                ),
+            ));
         }
 
         syn::visit::visit_expr_method_call(self, node);
@@ -4347,7 +4463,7 @@ fn analyze_candidate_semantic_modules(
         return suppressed_child_module_exports;
     }
     let child_modules = child_modules.bindings;
-    let mut families = BTreeMap::<String, Vec<(usize, String, String)>>::new();
+    let mut families = BTreeMap::<String, Vec<(usize, String)>>::new();
 
     for binding in &public_leaves {
         if !matches!(detect_name_style(&binding.binding_name), NameStyle::Pascal) {
@@ -4372,41 +4488,66 @@ fn analyze_candidate_semantic_modules(
             continue;
         }
 
-        let style = detect_name_style(&binding.binding_name);
-        let shorter_leaf = render_segments(&segments[1..], style);
-        families.entry(head).or_default().push((
-            binding.line,
-            binding.binding_name.clone(),
-            shorter_leaf,
-        ));
+        families
+            .entry(head)
+            .or_default()
+            .push((binding.line, binding.binding_name.clone()));
     }
 
-    for (head, members) in families {
+    for (_head, members) in families {
         if members.len() < 3 {
             continue;
         }
 
+        let member_segments = members
+            .iter()
+            .map(|(_, binding_name)| split_segments(binding_name))
+            .collect::<Vec<_>>();
+        let Some(shared_head_segments) =
+            candidate_semantic_module_shared_head_segments(&member_segments)
+        else {
+            continue;
+        };
+
         let line = members
             .iter()
-            .map(|(line, _, _)| *line)
+            .map(|(line, _)| *line)
             .min()
             .expect("family has at least one member");
-        let module_candidate = head.to_ascii_lowercase();
+        let head = shared_head_segments.concat();
+        let module_candidate = render_segments(&shared_head_segments, NameStyle::Snake);
         if semantic_module_candidate_already_emitted(diagnostics, path, &module_candidate) {
+            continue;
+        }
+        if child_modules.keys().any(|module_name| {
+            normalize_segment(module_name) == normalize_segment(&module_candidate)
+        }) {
             continue;
         }
         let original_members = members
             .iter()
-            .map(|(_, binding_name, _)| format!("`{binding_name}`"))
+            .map(|(_, binding_name)| format!("`{binding_name}`"))
             .collect::<Vec<_>>()
             .join(", ");
         let suggested_members = members
             .iter()
-            .map(|(_, _, shorter_leaf)| shorter_leaf.clone())
+            .map(|(_, binding_name)| {
+                let segments = split_segments(binding_name);
+                render_segments(
+                    &segments[shared_head_segments.len()..],
+                    detect_name_style(binding_name),
+                )
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Vec<_>>();
+        if suggested_members
+            .iter()
+            .all(|shorter_leaf| candidate_semantic_module_shorter_leaf_is_too_generic(shorter_leaf))
+        {
+            continue;
+        }
+        let suggested_members = suggested_members.join(", ");
 
         diagnostics.push(Diagnostic::advisory(
             Some(path.to_path_buf()),
@@ -5139,6 +5280,65 @@ fn is_weak_semantic_head(head: &str) -> bool {
     matches!(head, "to" | "has" | "open" | "rolled")
 }
 
+fn candidate_semantic_module_shared_head_segments(
+    member_segments: &[Vec<String>],
+) -> Option<Vec<String>> {
+    let first = member_segments.first()?;
+    let shared_prefix_len =
+        member_segments
+            .iter()
+            .skip(1)
+            .fold(first.len(), |current, segments| {
+                current.min(
+                    first
+                        .iter()
+                        .zip(segments.iter())
+                        .take_while(|(left, right)| {
+                            normalize_segment(left) == normalize_segment(right)
+                        })
+                        .count(),
+                )
+            });
+
+    (shared_prefix_len > 0
+        && member_segments
+            .iter()
+            .all(|segments| segments.len() > shared_prefix_len))
+    .then(|| first[..shared_prefix_len].to_vec())
+}
+
+fn candidate_semantic_module_shorter_leaf_is_too_generic(shorter_leaf: &str) -> bool {
+    let weak_tokens = [
+        "class",
+        "classes",
+        "code",
+        "codes",
+        "fix",
+        "fixes",
+        "info",
+        "infos",
+        "kind",
+        "kinds",
+        "level",
+        "levels",
+        "selection",
+        "selections",
+        "state",
+        "states",
+        "type",
+        "types",
+    ];
+    let tokens = split_segments(shorter_leaf)
+        .into_iter()
+        .map(|segment| normalize_segment(&segment))
+        .collect::<Vec<_>>();
+
+    !tokens.is_empty()
+        && tokens
+            .iter()
+            .all(|token| weak_tokens.contains(&token.as_str()))
+}
+
 fn module_is_hidden_or_internal(item_mod: &ItemMod) -> bool {
     is_internal_module_name(&item_mod.ident.to_string())
         || item_mod.attrs.iter().any(attribute_is_doc_hidden)
@@ -5503,9 +5703,55 @@ fn redundant_leaf_context_candidate(parent_module: &str, leaf_name: &str) -> Opt
 
 fn internal_shorter_leaf_is_too_generic(shorter_leaf: &str) -> bool {
     let weak_tokens = [
-        "ext", "ctx", "config", "kind", "input", "output", "items", "status", "shared", "global",
-        "attrs", "attr", "param", "params", "name", "names", "doc", "docs", "default", "parsing",
-        "gen", "member", "message", "state", "origin", "error", "request", "response", "outcome",
+        "ext",
+        "ctx",
+        "config",
+        "kind",
+        "input",
+        "output",
+        "items",
+        "status",
+        "shared",
+        "global",
+        "attrs",
+        "attr",
+        "param",
+        "params",
+        "name",
+        "names",
+        "doc",
+        "docs",
+        "default",
+        "parsing",
+        "gen",
+        "member",
+        "message",
+        "state",
+        "origin",
+        "error",
+        "request",
+        "response",
+        "outcome",
+        "fn",
+        "fns",
+        "impl",
+        "raw",
+        "skip",
+        "internal",
+        "signature",
+        "for",
+        "lookup",
+        "module",
+        "path",
+        "machine",
+        "key",
+        "analysis",
+        "class",
+        "level",
+        "fix",
+        "code",
+        "info",
+        "selection",
     ];
     let tokens = name_tokens(shorter_leaf);
 

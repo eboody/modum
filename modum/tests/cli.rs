@@ -202,6 +202,26 @@ profile = "default"
     temp
 }
 
+fn write_invalid_ignored_diagnostic_codes_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+ignored_diagnostic_codes = ["not_a_real_code"]
+"#,
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), "pub struct UserRepository;\n").expect("write source");
+    temp
+}
+
 fn write_invalid_semantic_scalar_metadata_fixture() -> tempfile::TempDir {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -219,6 +239,26 @@ ignored_semantic_string_scalars = [1]
     )
     .expect("write manifest");
     fs::write(root.join("src/lib.rs"), "pub fn connect(url: String) {}\n").expect("write source");
+    temp
+}
+
+fn write_invalid_namespace_preserving_override_metadata_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+ignored_namespace_preserving_modules = [1]
+"#,
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), "use components::Button;\n").expect("write source");
     temp
 }
 
@@ -293,6 +333,34 @@ pub mod components;
     temp
 }
 
+fn write_metadata_baseline_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.modum]
+baseline = ".modum-baseline.json"
+"#,
+    )
+    .expect("write manifest");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+"#,
+    )
+    .expect("write source");
+    temp
+}
+
 #[test]
 fn cli_help_shows_lint_only_surface() {
     let check_help = Command::new(env!("CARGO_BIN_EXE_modum"))
@@ -305,6 +373,9 @@ fn cli_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("MODUM=off|warn|deny"));
     assert!(check_help_out.contains("modum check"));
     assert!(check_help_out.contains("--profile core|surface|strict"));
+    assert!(check_help_out.contains("--ignore <code>"));
+    assert!(check_help_out.contains("--baseline <path>"));
+    assert!(check_help_out.contains("--write-baseline <path>"));
     assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_modum"))
@@ -331,6 +402,9 @@ fn cargo_subcommand_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("MODUM=off|warn|deny"));
     assert!(check_help_out.contains("cargo modum check"));
     assert!(check_help_out.contains("--profile core|surface|strict"));
+    assert!(check_help_out.contains("--ignore <code>"));
+    assert!(check_help_out.contains("--baseline <path>"));
+    assert!(check_help_out.contains("--write-baseline <path>"));
     assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_cargo-modum"))
@@ -486,6 +560,8 @@ fn cli_explain_prints_profile_and_summary() {
     assert!(stdout.contains("namespace_flat_use"));
     assert!(stdout.contains("profile: core"));
     assert!(stdout.contains("Flattened imports hide useful namespace context"));
+    assert!(stdout.contains("suppression: use `--ignore namespace_flat_use`"));
+    assert!(stdout.contains("write-baseline .modum-baseline.json"));
 }
 
 #[test]
@@ -501,7 +577,160 @@ fn cli_explain_semantic_string_scalar_includes_fix_and_tuning_guidance() {
     assert!(stdout.contains("typed boundary"));
     assert!(stdout.contains("extra_semantic_string_scalars"));
     assert!(stdout.contains("ignored_semantic_string_scalars"));
+    assert!(stdout.contains("ignored_diagnostic_codes"));
     assert!(!stdout.contains("thiserror"));
+}
+
+#[test]
+fn cli_explain_preserve_module_includes_tuning_guidance() {
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args(["--explain", "namespace_flat_use_preserve_module"])
+        .output()
+        .expect("run modum --explain");
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("namespace_flat_use_preserve_module"));
+    assert!(stdout.contains("extra_namespace_preserving_modules"));
+    assert!(stdout.contains("ignored_namespace_preserving_modules"));
+    assert!(stdout.contains("ignored_diagnostic_codes"));
+}
+
+#[test]
+fn cli_explain_maybe_some_includes_fix_guidance() {
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args(["--explain", "callsite_maybe_some"])
+        .output()
+        .expect("run modum --explain");
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("callsite_maybe_some"));
+    assert!(stdout.contains("profile: strict"));
+    assert!(stdout.contains("non-`maybe_` setter"));
+    assert!(stdout.contains("ignored_diagnostic_codes"));
+}
+
+#[test]
+fn cli_ignore_suppresses_matching_diagnostic_code() {
+    let temp = write_policy_and_advisory_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--ignore",
+            "api_candidate_semantic_module",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(2));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let diagnostics = json["report"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diag| diag["code"].as_str() == Some("namespace_redundant_qualified_generic"))
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diag| diag["code"].as_str() == Some("api_candidate_semantic_module"))
+    );
+}
+
+#[test]
+fn cli_write_baseline_then_apply_it() {
+    let temp = write_policy_and_advisory_fixture();
+    let root = temp.path();
+    let baseline_path = root.join(".modum/baseline.json");
+
+    let write_output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+            "--write-baseline",
+            ".modum/baseline.json",
+        ])
+        .output()
+        .expect("run modum check with baseline write");
+    assert_eq!(write_output.status.code(), Some(2));
+    assert!(baseline_path.is_file());
+    let stderr = String::from_utf8_lossy(&write_output.stderr);
+    assert!(stderr.contains("wrote baseline .modum/baseline.json (3 coded diagnostics)"));
+
+    let baseline: Value =
+        serde_json::from_slice(&fs::read(&baseline_path).expect("read baseline")).expect("json");
+    assert_eq!(baseline["version"].as_u64(), Some(1));
+    assert_eq!(baseline["diagnostics"].as_array().map(Vec::len), Some(3));
+
+    let apply_output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+            "--baseline",
+            ".modum/baseline.json",
+        ])
+        .output()
+        .expect("run modum check with baseline");
+    assert_eq!(apply_output.status.code(), Some(0));
+
+    let json: Value = serde_json::from_slice(&apply_output.stdout).expect("parse json");
+    assert_eq!(
+        json["report"]["diagnostics"].as_array().map(Vec::len),
+        Some(0)
+    );
+}
+
+#[test]
+fn cli_metadata_baseline_path_is_used_when_present() {
+    let temp = write_metadata_baseline_fixture();
+    let root = temp.path();
+
+    let write_output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+            "--write-baseline",
+            ".modum-baseline.json",
+        ])
+        .output()
+        .expect("run modum check with baseline write");
+    assert_eq!(write_output.status.code(), Some(0));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check with metadata baseline");
+    assert_eq!(output.status.code(), Some(0));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(
+        json["report"]["diagnostics"].as_array().map(Vec::len),
+        Some(0)
+    );
 }
 
 #[test]
@@ -593,6 +822,27 @@ fn cli_invalid_profile_reports_error() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--profile invalid profile `default`; expected core|surface|strict"));
+}
+
+#[test]
+fn cli_invalid_ignore_reports_error() {
+    let temp = write_json_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--ignore",
+            "not_a_real_code",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--ignore unknown diagnostic code `not_a_real_code`"));
 }
 
 #[test]
@@ -758,6 +1008,40 @@ fn cli_invalid_profile_metadata_reports_error() {
 }
 
 #[test]
+fn cli_invalid_ignored_diagnostic_codes_metadata_reports_error() {
+    let temp = write_invalid_ignored_diagnostic_codes_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(json["exit_code"].as_u64(), Some(1));
+    assert!(
+        json["report"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diag| {
+                diag["message"].as_str().is_some_and(|message| {
+                    message.contains(
+                        "`metadata.modum.ignored_diagnostic_codes[0]` unknown diagnostic code `not_a_real_code`",
+                    )
+                })
+            })
+    );
+}
+
+#[test]
 fn cli_invalid_semantic_scalar_metadata_reports_error() {
     let temp = write_invalid_semantic_scalar_metadata_fixture();
     let root = temp.path();
@@ -785,6 +1069,40 @@ fn cli_invalid_semantic_scalar_metadata_reports_error() {
                 diag["message"].as_str().is_some_and(|message| {
                     message.contains(
                         "`metadata.modum.ignored_semantic_string_scalars[0]` must be a string",
+                    )
+                })
+            })
+    );
+}
+
+#[test]
+fn cli_invalid_namespace_preserving_override_metadata_reports_error() {
+    let temp = write_invalid_namespace_preserving_override_metadata_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(json["exit_code"].as_u64(), Some(1));
+    assert!(
+        json["report"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diag| {
+                diag["message"].as_str().is_some_and(|message| {
+                    message.contains(
+                        "`metadata.modum.ignored_namespace_preserving_modules[0]` must be a string",
                     )
                 })
             })

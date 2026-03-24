@@ -6,7 +6,7 @@ use std::{
 };
 
 use glob::{Pattern, glob};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 mod api_shape;
@@ -107,6 +107,20 @@ pub struct WorkspaceReport {
 }
 
 impl WorkspaceReport {
+    fn from_diagnostics(scanned_files: usize, diagnostics: Vec<Diagnostic>) -> Self {
+        let files_with_violations = diagnostics
+            .iter()
+            .filter_map(|diag| diag.file.as_ref())
+            .collect::<BTreeSet<_>>()
+            .len();
+
+        Self {
+            scanned_files,
+            files_with_violations,
+            diagnostics,
+        }
+    }
+
     pub fn error_count(&self) -> usize {
         self.diagnostics
             .iter()
@@ -149,17 +163,7 @@ impl WorkspaceReport {
             .filter(|diag| selection.includes(diag))
             .cloned()
             .collect::<Vec<_>>();
-        let files_with_violations = diagnostics
-            .iter()
-            .filter_map(|diag| diag.file.as_ref())
-            .collect::<BTreeSet<_>>()
-            .len();
-
-        Self {
-            scanned_files: self.scanned_files,
-            files_with_violations,
-            diagnostics,
-        }
+        Self::from_diagnostics(self.scanned_files, diagnostics)
     }
 
     pub fn filtered_by_profile(&self, profile: LintProfile) -> Self {
@@ -169,17 +173,21 @@ impl WorkspaceReport {
             .filter(|diag| diag.included_in_profile(profile))
             .cloned()
             .collect::<Vec<_>>();
-        let files_with_violations = diagnostics
-            .iter()
-            .filter_map(|diag| diag.file.as_ref())
-            .collect::<BTreeSet<_>>()
-            .len();
+        Self::from_diagnostics(self.scanned_files, diagnostics)
+    }
 
-        Self {
-            scanned_files: self.scanned_files,
-            files_with_violations,
-            diagnostics,
+    pub fn filtered_by_ignored_codes(&self, ignored_codes: &BTreeSet<String>) -> Self {
+        if ignored_codes.is_empty() {
+            return self.clone();
         }
+
+        let diagnostics = self
+            .diagnostics
+            .iter()
+            .filter(|diag| !diag.code().is_some_and(|code| ignored_codes.contains(code)))
+            .cloned()
+            .collect::<Vec<_>>();
+        Self::from_diagnostics(self.scanned_files, diagnostics)
     }
 }
 
@@ -225,6 +233,8 @@ pub struct ScanSettings {
 pub struct AnalysisSettings {
     pub scan: ScanSettings,
     pub profile: Option<LintProfile>,
+    pub ignored_diagnostic_codes: Vec<String>,
+    pub baseline: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,12 +253,37 @@ struct NamespaceSettings {
 struct PackageSettings {
     namespace: NamespaceSettings,
     profile: Option<LintProfile>,
+    ignored_diagnostic_codes: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileSettings {
     namespace: NamespaceSettings,
     profile: LintProfile,
+    ignored_diagnostic_codes: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy)]
+struct FileResolutionContext<'a> {
+    workspace_defaults: &'a NamespaceSettings,
+    workspace_ignored_diagnostic_codes: &'a BTreeSet<String>,
+    repo_profile: Option<LintProfile>,
+    cli_profile: Option<LintProfile>,
+    cli_ignored_diagnostic_codes: &'a BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DiagnosticBaseline {
+    version: u8,
+    diagnostics: Vec<BaselineDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct BaselineDiagnostic {
+    code: String,
+    file: Option<String>,
+    line: Option<usize>,
+    message: String,
 }
 
 impl Default for NamespaceSettings {
@@ -312,7 +347,45 @@ pub fn render_diagnostic_explanation(code: &str) -> Option<String> {
         }
     }
 
+    let _ = write!(
+        rendered,
+        "\nsuppression: use `--ignore {code}` or `metadata.modum.ignored_diagnostic_codes = [\"{code}\"]` when the rule is not a fit for this repo or package."
+    );
+    let _ = write!(
+        rendered,
+        "\nbaseline: for large repos, write a baseline with `modum check --write-baseline .modum-baseline.json` and apply it with `modum check --baseline .modum-baseline.json` or `metadata.modum.baseline = \".modum-baseline.json\"`."
+    );
+
     Some(rendered)
+}
+
+impl DiagnosticBaseline {
+    fn from_report(root: &Path, report: &WorkspaceReport) -> Self {
+        Self {
+            version: 1,
+            diagnostics: report
+                .diagnostics
+                .iter()
+                .filter_map(|diag| baseline_diagnostic_for_report(root, diag))
+                .collect(),
+        }
+    }
+}
+
+pub fn write_diagnostic_baseline(
+    root: &Path,
+    path: &Path,
+    report: &WorkspaceReport,
+) -> io::Result<usize> {
+    let baseline = DiagnosticBaseline::from_report(root, report);
+    let resolved_path = resolve_repo_relative_path(root, path);
+    if let Some(parent) = resolved_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let rendered = serde_json::to_string_pretty(&baseline)
+        .map_err(|err| io::Error::other(format!("failed to render baseline json: {err}")))?;
+    fs::write(&resolved_path, rendered)?;
+    Ok(baseline.diagnostics.len())
 }
 
 pub fn run_check(root: &Path, include_globs: &[String], mode: CheckMode) -> CheckOutcome {
@@ -336,6 +409,8 @@ pub fn run_check_with_scan_settings(
         &AnalysisSettings {
             scan: scan_settings.clone(),
             profile: None,
+            ignored_diagnostic_codes: Vec::new(),
+            baseline: None,
         },
         mode,
     )
@@ -426,6 +501,8 @@ pub fn analyze_workspace_with_scan_settings(
         &AnalysisSettings {
             scan: cli_scan_settings.clone(),
             profile: None,
+            ignored_diagnostic_codes: Vec::new(),
+            baseline: None,
         },
     )
 }
@@ -437,8 +514,16 @@ pub fn analyze_workspace_with_settings(
     let mut diagnostics = Vec::new();
     let workspace_defaults = load_workspace_settings(root, &mut diagnostics);
     let repo_profile = load_repo_profile(root, &mut diagnostics);
+    let workspace_ignored_diagnostic_codes =
+        load_repo_ignored_diagnostic_codes(root, &mut diagnostics);
+    let repo_baseline = load_repo_baseline_path(root, &mut diagnostics);
     let repo_scan_settings = load_repo_scan_settings(root, &mut diagnostics);
     let effective_scan_settings = effective_scan_settings(&repo_scan_settings, &cli_settings.scan);
+    let cli_ignored_diagnostic_codes = collect_valid_diagnostic_codes(
+        &cli_settings.ignored_diagnostic_codes,
+        None,
+        &mut diagnostics,
+    );
     let rust_files = match collect_rust_files(
         root,
         &effective_scan_settings.include,
@@ -451,11 +536,7 @@ pub fn analyze_workspace_with_settings(
                 None,
                 format!("failed to discover rust files: {err}"),
             ));
-            return WorkspaceReport {
-                scanned_files: 0,
-                files_with_violations: 0,
-                diagnostics,
-            };
+            return WorkspaceReport::from_diagnostics(0, diagnostics);
         }
     };
 
@@ -486,16 +567,23 @@ pub fn analyze_workspace_with_settings(
         let settings = settings_for_file(
             root,
             file,
-            &workspace_defaults,
-            repo_profile,
-            cli_settings.profile,
+            FileResolutionContext {
+                workspace_defaults: &workspace_defaults,
+                workspace_ignored_diagnostic_codes: &workspace_ignored_diagnostic_codes,
+                repo_profile,
+                cli_profile: cli_settings.profile,
+                cli_ignored_diagnostic_codes: &cli_ignored_diagnostic_codes,
+            },
             &mut package_cache,
             &mut diagnostics,
         );
         let mut analysis = analyze_file_with_settings(file, &src, &settings.namespace);
-        analysis
-            .diagnostics
-            .retain(|diag| diag.included_in_profile(settings.profile));
+        analysis.diagnostics.retain(|diag| {
+            diag.included_in_profile(settings.profile)
+                && !diag
+                    .code()
+                    .is_some_and(|code| settings.ignored_diagnostic_codes.contains(code))
+        });
         if !analysis.diagnostics.is_empty() {
             files_with_violations.insert(file.clone());
         }
@@ -503,12 +591,33 @@ pub fn analyze_workspace_with_settings(
     }
 
     diagnostics.sort();
-
-    WorkspaceReport {
+    let mut report = WorkspaceReport {
         scanned_files: rust_files.len(),
         files_with_violations: files_with_violations.len(),
         diagnostics,
+    };
+
+    let effective_baseline_path = cli_settings.baseline.clone().or(repo_baseline);
+    if let Some(baseline_path) = effective_baseline_path {
+        match load_diagnostic_baseline(root, &baseline_path, cli_settings.baseline.is_some()) {
+            Ok(Some(baseline)) => {
+                report = apply_diagnostic_baseline(root, &report, &baseline);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let mut diagnostics = report.diagnostics;
+                diagnostics.push(Diagnostic::error(
+                    Some(resolve_repo_relative_path(root, &baseline_path)),
+                    None,
+                    err,
+                ));
+                diagnostics.sort();
+                report = WorkspaceReport::from_diagnostics(report.scanned_files, diagnostics);
+            }
+        }
     }
+
+    report
 }
 
 fn effective_scan_settings(
@@ -634,40 +743,133 @@ fn load_repo_profile(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<L
     )
 }
 
+fn load_repo_ignored_diagnostic_codes(
+    root: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> BTreeSet<String> {
+    let manifest_path = root.join("Cargo.toml");
+    let Ok(manifest_src) = fs::read_to_string(&manifest_path) else {
+        return BTreeSet::new();
+    };
+
+    let manifest: toml::Value = match toml::from_str(&manifest_src) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            diagnostics.push(Diagnostic::error(
+                Some(manifest_path),
+                None,
+                format!("failed to parse Cargo.toml for modum settings: {err}"),
+            ));
+            return BTreeSet::new();
+        }
+    };
+
+    parse_ignored_diagnostic_codes_from_manifest(
+        manifest
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|workspace| workspace.get("metadata"))
+            .and_then(toml::Value::as_table)
+            .and_then(|metadata| metadata.get("modum"))
+            .or_else(|| {
+                manifest
+                    .get("package")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|package| package.get("metadata"))
+                    .and_then(toml::Value::as_table)
+                    .and_then(|metadata| metadata.get("modum"))
+            }),
+        &manifest_path,
+        diagnostics,
+    )
+    .unwrap_or_default()
+}
+
+fn load_repo_baseline_path(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<PathBuf> {
+    let manifest_path = root.join("Cargo.toml");
+    let Ok(manifest_src) = fs::read_to_string(&manifest_path) else {
+        return None;
+    };
+
+    let manifest: toml::Value = match toml::from_str(&manifest_src) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            diagnostics.push(Diagnostic::error(
+                Some(manifest_path),
+                None,
+                format!("failed to parse Cargo.toml for modum settings: {err}"),
+            ));
+            return None;
+        }
+    };
+
+    parse_baseline_path_from_manifest(
+        manifest
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|workspace| workspace.get("metadata"))
+            .and_then(toml::Value::as_table)
+            .and_then(|metadata| metadata.get("modum"))
+            .or_else(|| {
+                manifest
+                    .get("package")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|package| package.get("metadata"))
+                    .and_then(toml::Value::as_table)
+                    .and_then(|metadata| metadata.get("modum"))
+            }),
+        &manifest_path,
+        diagnostics,
+    )
+}
+
 fn settings_for_file(
     root: &Path,
     file: &Path,
-    workspace_defaults: &NamespaceSettings,
-    repo_profile: Option<LintProfile>,
-    cli_profile: Option<LintProfile>,
+    context: FileResolutionContext<'_>,
     cache: &mut BTreeMap<PathBuf, PackageSettings>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> FileSettings {
     let Some(package_root) = find_package_root(root, file) else {
+        let mut ignored_diagnostic_codes = context.workspace_ignored_diagnostic_codes.clone();
+        ignored_diagnostic_codes.extend(context.cli_ignored_diagnostic_codes.iter().cloned());
         return FileSettings {
-            namespace: workspace_defaults.clone(),
-            profile: resolve_profile(cli_profile, None, repo_profile),
+            namespace: context.workspace_defaults.clone(),
+            profile: resolve_profile(context.cli_profile, None, context.repo_profile),
+            ignored_diagnostic_codes,
         };
     };
 
     if let Some(settings) = cache.get(&package_root) {
+        let mut ignored_diagnostic_codes = settings.ignored_diagnostic_codes.clone();
+        ignored_diagnostic_codes.extend(context.cli_ignored_diagnostic_codes.iter().cloned());
         return FileSettings {
             namespace: settings.namespace.clone(),
-            profile: resolve_profile(cli_profile, settings.profile, repo_profile),
+            profile: resolve_profile(context.cli_profile, settings.profile, context.repo_profile),
+            ignored_diagnostic_codes,
         };
     }
 
-    let settings = load_package_settings(&package_root, workspace_defaults, diagnostics);
+    let settings = load_package_settings(
+        &package_root,
+        context.workspace_defaults,
+        context.workspace_ignored_diagnostic_codes,
+        diagnostics,
+    );
     cache.insert(package_root, settings.clone());
+    let mut ignored_diagnostic_codes = settings.ignored_diagnostic_codes.clone();
+    ignored_diagnostic_codes.extend(context.cli_ignored_diagnostic_codes.iter().cloned());
     FileSettings {
         namespace: settings.namespace,
-        profile: resolve_profile(cli_profile, settings.profile, repo_profile),
+        profile: resolve_profile(context.cli_profile, settings.profile, context.repo_profile),
+        ignored_diagnostic_codes,
     }
 }
 
 fn load_package_settings(
     root: &Path,
     workspace_defaults: &NamespaceSettings,
+    workspace_ignored_diagnostic_codes: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> PackageSettings {
     let manifest_path = root.join("Cargo.toml");
@@ -675,6 +877,7 @@ fn load_package_settings(
         return PackageSettings {
             namespace: workspace_defaults.clone(),
             profile: None,
+            ignored_diagnostic_codes: workspace_ignored_diagnostic_codes.clone(),
         };
     };
 
@@ -689,6 +892,7 @@ fn load_package_settings(
             return PackageSettings {
                 namespace: workspace_defaults.clone(),
                 profile: None,
+                ignored_diagnostic_codes: workspace_ignored_diagnostic_codes.clone(),
             };
         }
     };
@@ -704,8 +908,18 @@ fn load_package_settings(
         parse_settings_from_manifest(metadata, workspace_defaults, &manifest_path, diagnostics)
             .unwrap_or_else(|| workspace_defaults.clone());
     let profile = parse_profile_from_manifest(metadata, &manifest_path, diagnostics);
+    let mut ignored_diagnostic_codes = workspace_ignored_diagnostic_codes.clone();
+    if let Some(local_codes) =
+        parse_ignored_diagnostic_codes_from_manifest(metadata, &manifest_path, diagnostics)
+    {
+        ignored_diagnostic_codes.extend(local_codes);
+    }
 
-    PackageSettings { namespace, profile }
+    PackageSettings {
+        namespace,
+        profile,
+        ignored_diagnostic_codes,
+    }
 }
 
 fn resolve_profile(
@@ -746,7 +960,7 @@ fn parse_settings_from_manifest(
     {
         settings.organizational_modules = values;
     }
-    if let Some(values) = parse_string_set_field(
+    if let Some(values) = parse_normalized_string_set_field(
         table,
         "namespace_preserving_modules",
         manifest_path,
@@ -754,6 +968,14 @@ fn parse_settings_from_manifest(
     ) {
         settings.namespace_preserving_modules = values;
     }
+    apply_token_family_overrides(
+        &mut settings.namespace_preserving_modules,
+        table,
+        "extra_namespace_preserving_modules",
+        "ignored_namespace_preserving_modules",
+        manifest_path,
+        diagnostics,
+    );
     apply_token_family_overrides(
         &mut settings.semantic_string_scalars,
         table,
@@ -818,6 +1040,35 @@ fn parse_profile_from_manifest(
             None
         }
     }
+}
+
+fn parse_ignored_diagnostic_codes_from_manifest(
+    value: Option<&toml::Value>,
+    manifest_path: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<BTreeSet<String>> {
+    let table = value?.as_table()?;
+    let values = parse_string_values_field(
+        table,
+        "ignored_diagnostic_codes",
+        manifest_path,
+        diagnostics,
+    )?;
+    let key_prefix = "`metadata.modum.ignored_diagnostic_codes";
+    Some(collect_valid_diagnostic_codes(
+        &values,
+        Some(key_prefix),
+        diagnostics,
+    ))
+}
+
+fn parse_baseline_path_from_manifest(
+    value: Option<&toml::Value>,
+    manifest_path: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<PathBuf> {
+    let table = value?.as_table()?;
+    parse_string_field(table, "baseline", manifest_path, diagnostics).map(PathBuf::from)
 }
 
 fn parse_string_field(
@@ -929,15 +1180,152 @@ fn apply_token_family_overrides(
     }
 }
 
+fn collect_valid_diagnostic_codes(
+    values: &[String],
+    metadata_key_prefix: Option<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> BTreeSet<String> {
+    let mut codes = BTreeSet::new();
+
+    for (index, code) in values.iter().enumerate() {
+        if diagnostic_code_info(code).is_none() {
+            let message = if let Some(prefix) = metadata_key_prefix {
+                format!("{prefix}[{index}]` unknown diagnostic code `{code}`")
+            } else {
+                format!("unknown diagnostic code `{code}`")
+            };
+            diagnostics.push(Diagnostic::error(None, None, message));
+            continue;
+        }
+        codes.insert(code.clone());
+    }
+
+    codes
+}
+
+fn load_diagnostic_baseline(
+    root: &Path,
+    path: &Path,
+    required: bool,
+) -> Result<Option<DiagnosticBaseline>, String> {
+    let resolved_path = resolve_repo_relative_path(root, path);
+    let baseline_src = match fs::read_to_string(&resolved_path) {
+        Ok(src) => src,
+        Err(err) if err.kind() == io::ErrorKind::NotFound && !required => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to read baseline {}: {err}",
+                resolved_path.display()
+            ));
+        }
+    };
+
+    let baseline: DiagnosticBaseline = serde_json::from_str(&baseline_src).map_err(|err| {
+        format!(
+            "failed to parse baseline {}: {err}",
+            resolved_path.display()
+        )
+    })?;
+    if baseline.version != 1 {
+        return Err(format!(
+            "unsupported baseline version {} in {}",
+            baseline.version,
+            resolved_path.display()
+        ));
+    }
+
+    Ok(Some(baseline))
+}
+
+fn apply_diagnostic_baseline(
+    root: &Path,
+    report: &WorkspaceReport,
+    baseline: &DiagnosticBaseline,
+) -> WorkspaceReport {
+    let mut remaining = BTreeMap::<(String, Option<String>, String), usize>::new();
+    for diagnostic in &baseline.diagnostics {
+        let key = (
+            diagnostic.code.clone(),
+            diagnostic.file.clone(),
+            diagnostic.message.clone(),
+        );
+        *remaining.entry(key).or_default() += 1;
+    }
+
+    let diagnostics = report
+        .diagnostics
+        .iter()
+        .filter(|diag| {
+            let Some(key) = baseline_match_key(root, diag) else {
+                return true;
+            };
+            let Some(count) = remaining.get_mut(&key) else {
+                return true;
+            };
+            if *count == 0 {
+                return true;
+            }
+            *count -= 1;
+            false
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    WorkspaceReport::from_diagnostics(report.scanned_files, diagnostics)
+}
+
+fn baseline_diagnostic_for_report(root: &Path, diag: &Diagnostic) -> Option<BaselineDiagnostic> {
+    Some(BaselineDiagnostic {
+        code: diag.code()?.to_string(),
+        file: diag
+            .file
+            .as_ref()
+            .map(|file| render_relative_path(root, file)),
+        line: diag.line,
+        message: diag.message.clone(),
+    })
+}
+
+fn baseline_match_key(root: &Path, diag: &Diagnostic) -> Option<(String, Option<String>, String)> {
+    Some((
+        diag.code()?.to_string(),
+        diag.file
+            .as_ref()
+            .map(|file| render_relative_path(root, file)),
+        diag.message.clone(),
+    ))
+}
+
+fn resolve_repo_relative_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn render_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 fn diagnostic_explanation_details(code: &str) -> Option<&'static [&'static str]> {
     match code {
         "namespace_prelude_glob_import" => Some(&[
             "why: prelude globs make it harder to see which module gives a name its meaning.",
             "typical fixes: import the specific items you need or keep the preserving module visible at call sites.",
         ]),
+        "namespace_flat_use_preserve_module" | "namespace_flat_pub_use_preserve_module" => Some(&[
+            "why: flattening imports from modules like `http`, `page`, or `components` can erase the part of the path that explains the item's role.",
+            "typical fixes: keep the module qualifier visible at the call site or re-export surface.",
+            "repo tuning: use `metadata.modum.extra_namespace_preserving_modules` or `metadata.modum.ignored_namespace_preserving_modules` to adjust which modules should stay visible.",
+        ]),
         "namespace_glob_preserve_module" => Some(&[
             "why: broad globs from modules like `http`, `error`, or `query` erase context that often helps readers scan call sites.",
             "typical fixes: import only the concrete items you need or keep the module qualifier in local code.",
+            "repo tuning: use `metadata.modum.extra_namespace_preserving_modules` or `metadata.modum.ignored_namespace_preserving_modules` to adjust which modules should stay visible.",
         ]),
         "api_anyhow_error_surface" => Some(&[
             "why: `anyhow` works well internally, but caller-facing boundaries usually read better when the crate owns the error type and variants.",
@@ -961,6 +1349,10 @@ fn diagnostic_explanation_details(code: &str) -> Option<&'static [&'static str]>
             "why: bags like `metadata`, `headers`, or `params` often accrete hidden contracts that are easier to understand once they are typed.",
             "typical fixes: introduce a focused options struct, metadata type, or dedicated collection wrapper.",
             "repo tuning: use `metadata.modum.extra_key_value_bag_names` or `metadata.modum.ignored_key_value_bag_names` to adjust the token family.",
+        ]),
+        "callsite_maybe_some" => Some(&[
+            "why: `maybe_*` setters are most useful when the caller already has an `Option<_>` to forward; wrapping a concrete value in `Some(...)` throws away that distinction.",
+            "typical fixes: call the non-`maybe_` setter when you already have a value, or keep the `Option<_>` intact and pass that directly.",
         ]),
         "api_boolean_flag_cluster" => Some(&[
             "why: several booleans together usually encode modes or policy choices that are easier to name explicitly.",

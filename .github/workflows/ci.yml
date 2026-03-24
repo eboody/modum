@@ -14,11 +14,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install modum
-        run: cargo install modum --locked
-
       - name: Modum
-        run: cargo modum check --root . --include modum/src --include modum-core/src --mode warn
+        run: cargo run -p modum --bin cargo-modum -- check --root . --include modum/src --include modum-core/src --mode warn
 
       - name: Format
         run: cargo fmt --all -- --check

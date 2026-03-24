@@ -416,6 +416,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
             LintProfile::Strict,
             "Defaulted optional positional parameters suggest a builder rather than `None`-passing.",
         ),
+        "callsite_maybe_some" => (
+            LintProfile::Strict,
+            "A `maybe_*` call wraps a direct value in `Some(...)` instead of using the direct setter or forwarding an existing option.",
+        ),
         "api_standalone_builder_surface" => (
             LintProfile::Strict,
             "Parallel `with_*` or `set_*` free functions suggest a real builder surface.",

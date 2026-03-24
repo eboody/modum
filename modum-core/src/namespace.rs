@@ -12,7 +12,7 @@ use super::{
     parent_module_files, render_segments, replace_path_fix, source_root, split_segments,
 };
 
-pub(super) struct NamespaceAnalysis {
+pub(super) struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -40,10 +40,10 @@ pub(super) fn analyze_namespace_rules(
     path: &Path,
     parsed: &File,
     settings: &NamespaceSettings,
-) -> NamespaceAnalysis {
+) -> Analysis {
     let mut diagnostics = Vec::new();
     analyze_scope(path, &parsed.items, settings, &mut diagnostics);
-    NamespaceAnalysis { diagnostics }
+    Analysis { diagnostics }
 }
 
 fn analyze_scope(

@@ -1,8 +1,9 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
 use modum::{
-    AnalysisSettings, CheckMode, DiagnosticSelection, ScanSettings, render_diagnostic_explanation,
-    render_pretty_report_with_selection, run_check_with_settings,
+    AnalysisSettings, CheckMode, DiagnosticSelection, ScanSettings, diagnostic_code_info,
+    render_diagnostic_explanation, render_pretty_report_with_selection, run_check_with_settings,
+    write_diagnostic_baseline,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,12 +67,15 @@ fn run_check_command(
     let mut scan_settings = ScanSettings::default();
     let mut explain_code = None;
     let mut profile = None;
+    let mut ignored_diagnostic_codes = Vec::new();
     let mut mode = env::var("MODUM")
         .ok()
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(CheckMode::Deny);
     let mut format = OutputFormat::Text;
     let mut selection = DiagnosticSelection::All;
+    let mut baseline = None;
+    let mut write_baseline = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -103,6 +107,15 @@ fn run_check_command(
                         .map_err(|err: String| format!("--profile {err}"))?,
                 );
             }
+            "--ignore" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--ignore requires a diagnostic code".to_string())?;
+                if diagnostic_code_info(&value).is_none() {
+                    return Err(format!("--ignore unknown diagnostic code `{value}`"));
+                }
+                ignored_diagnostic_codes.push(value);
+            }
             "--explain" => {
                 let value = args
                     .next()
@@ -127,6 +140,18 @@ fn run_check_command(
                     .ok_or_else(|| "--format requires one of: text|json".to_string())?;
                 format = value.parse()?;
             }
+            "--baseline" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--baseline requires a path value".to_string())?;
+                baseline = Some(PathBuf::from(value));
+            }
+            "--write-baseline" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--write-baseline requires a path value".to_string())?;
+                write_baseline = Some(PathBuf::from(value));
+            }
             "--help" | "-h" => {
                 println!("{}", check_usage(command_prefix));
                 return Ok(ExitCode::from(0));
@@ -150,6 +175,13 @@ fn run_check_command(
         return Ok(ExitCode::from(0));
     }
 
+    if baseline.is_some() && write_baseline.is_some() {
+        return Err(
+            "--baseline and --write-baseline cannot be used together; write a fresh baseline first, then apply it in a separate run"
+                .to_string(),
+        );
+    }
+
     if format == OutputFormat::Json && selection != DiagnosticSelection::All {
         return Err(
             "--show is only available with text output; json already includes `policy` and `fix` metadata"
@@ -162,9 +194,19 @@ fn run_check_command(
         &AnalysisSettings {
             scan: scan_settings,
             profile,
+            ignored_diagnostic_codes,
+            baseline,
         },
         mode,
     );
+    if let Some(path) = write_baseline {
+        let count = write_diagnostic_baseline(&root, &path, &outcome.report)
+            .map_err(|err| format!("failed to write baseline: {err}"))?;
+        eprintln!(
+            "wrote baseline {} ({count} coded diagnostics)",
+            path.display()
+        );
+    }
     match format {
         OutputFormat::Text => print!(
             "{}",
@@ -221,7 +263,7 @@ fn check_usage(command_prefix: &'static str) -> String {
     [
         "Usage:",
         &format!(
-            "  {} check [--root <path>] [--include <path-or-glob>]... [--exclude <path-or-glob>]... [--profile core|surface|strict] [--show all|policy|advisory] [--mode off|warn|deny] [--format text|json] [--explain <code>]",
+            "  {} check [--root <path>] [--include <path-or-glob>]... [--exclude <path-or-glob>]... [--profile core|surface|strict] [--ignore <code>]... [--baseline <path>] [--write-baseline <path>] [--show all|policy|advisory] [--mode off|warn|deny] [--format text|json] [--explain <code>]",
             command_prefix
         ),
         "",
@@ -229,6 +271,9 @@ fn check_usage(command_prefix: &'static str) -> String {
         &format!("  {command_prefix} check"),
         &format!("  {command_prefix} check --mode warn"),
         &format!("  {command_prefix} check --profile core"),
+        &format!("  {command_prefix} check --ignore api_candidate_semantic_module"),
+        &format!("  {command_prefix} check --write-baseline .modum-baseline.json"),
+        &format!("  {command_prefix} check --baseline .modum-baseline.json"),
         &format!("  {command_prefix} --explain namespace_flat_use"),
         &format!("  {command_prefix} check --exclude examples/high-coverage/**"),
         &format!("  {command_prefix} check --show advisory"),

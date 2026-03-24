@@ -108,6 +108,9 @@ cargo modum check --root . --mode warn
 cargo modum check --root . --profile core
 cargo modum --explain namespace_flat_use
 cargo modum check --root . --show advisory
+cargo modum check --root . --ignore api_candidate_semantic_module
+cargo modum check --root . --write-baseline .modum-baseline.json
+cargo modum check --root . --baseline .modum-baseline.json
 cargo modum check --root . --exclude examples/high-coverage
 cargo modum check --root . --format json
 ```
@@ -187,6 +190,8 @@ Use `--show policy` or `--show advisory` when you want to focus one side of the 
 
 Use `--profile core`, `--profile surface`, or `--profile strict` to choose how opinionated the lint set should be. `strict` is the default.
 
+Use `--ignore <code>` for one-off opt-outs in local runs, and `--write-baseline <path>` plus `--baseline <path>` when you want to ratchet down an existing repo without fixing every warning at once.
+
 Text output includes the diagnostic code profile, and direct rewrite-style fixes show a short `fix:` hint inline.
 
 JSON output keeps the full diagnostic list and includes:
@@ -211,6 +216,13 @@ Use `modum` the same way you would use `clippy` or `cargo-deny`: run it as a nor
 - run: cargo modum check --root .
 ```
 
+For large repos that are adopting `modum` incrementally:
+
+```yaml
+- run: cargo install modum
+- run: cargo modum check --root . --baseline .modum-baseline.json
+```
+
 ## Exit Behavior
 
 - `0`: clean, or warnings allowed via `--mode warn`
@@ -231,17 +243,25 @@ weak_modules = ["storage", "transport", "infra", "common", "misc", "helpers", "h
 catch_all_modules = ["common", "misc", "helpers", "helper", "types", "util", "utils"]
 organizational_modules = ["error", "errors", "request", "response"]
 namespace_preserving_modules = ["auth", "command", "components", "email", "error", "http", "page", "partials", "policy", "query", "repo", "store", "storage", "transport", "infra"]
+extra_namespace_preserving_modules = ["widgets"]
+ignored_namespace_preserving_modules = ["components"]
 extra_semantic_string_scalars = ["mime"]
 ignored_semantic_string_scalars = ["url"]
 extra_semantic_numeric_scalars = ["epoch"]
 ignored_semantic_numeric_scalars = ["port"]
 extra_key_value_bag_names = ["labels"]
 ignored_key_value_bag_names = ["tags"]
+ignored_diagnostic_codes = ["api_candidate_semantic_module"]
+baseline = ".modum-baseline.json"
 ```
 
 Use `[package.metadata.modum]` inside a member crate to override workspace defaults for that package. Package settings inherit the workspace defaults first, then apply only the keys you set locally.
 
 `include` and `exclude` are optional scan defaults. CLI `--include` overrides metadata `include`, and CLI `--exclude` adds to metadata `exclude`.
+
+`ignored_diagnostic_codes` is additive across workspace, package, and CLI `--ignore` values. Use it for durable repo-level exceptions.
+
+`baseline` is a repo-root-relative JSON file of existing coded diagnostics. Matching baseline entries are filtered out after normal analysis. A metadata baseline is optional until the file exists; an explicit CLI `--baseline <path>` requires the file to exist.
 
 Profile guide:
 
@@ -260,12 +280,23 @@ Tuning guide:
 
 - `generic_nouns`: generic leaves like `Repository`, `Error`, or `Request`
 - `namespace_preserving_modules`: modules that should stay visible at call sites, such as `http`, `email`, `partials`, or `components`
+- `extra_namespace_preserving_modules` / `ignored_namespace_preserving_modules`: additive tuning for preserve-module pressure when defaults are close but UI or domain modules like `widgets`, `components`, `page`, or `partials` need adjustment
 - `organizational_modules`: modules that should not leak into the public API surface, such as `error`, `request`, or `response`
 - `extra_semantic_string_scalars` / `ignored_semantic_string_scalars`: token families for string-like boundary names such as `email`, `url`, `path`, or your own repo-specific additions like `mime`
 - `extra_semantic_numeric_scalars` / `ignored_semantic_numeric_scalars`: token families for numeric boundary names such as `duration`, `timestamp`, `ttl`, or repo-specific numeric concepts
 - `extra_key_value_bag_names` / `ignored_key_value_bag_names`: token families for string bag names such as `metadata`, `headers`, `params`, or repo-specific names like `labels`
+- `ignored_diagnostic_codes`: exact diagnostic codes to suppress, such as `api_candidate_semantic_module`
+- `baseline`: repo-root-relative path for a generated baseline file such as `.modum-baseline.json`
 
 These tuning keys work on lowercase name tokens, not full paths.
+
+Adoption workflow:
+
+- start with `--profile core` or `--mode warn`
+- use `ignored_diagnostic_codes` for durable repo-specific exceptions
+- use `ignored_namespace_preserving_modules = ["components", "page", "partials"]` when a UI aggregator repo intentionally flattens those modules and you do not want to replace the full preserve-module default set
+- generate a baseline with `modum check --write-baseline .modum-baseline.json`
+- apply it in CI with `modum check --baseline .modum-baseline.json` or `metadata.modum.baseline = ".modum-baseline.json"`
 
 ## Lint Categories
 
@@ -336,6 +367,8 @@ For these surface-shape rules, shared crate-visible surfaces such as `pub(crate)
   Warning for builder-shaped public entrypoints that take positional `Option<_>` parameters and would read better as a `bon` builder, so callers can omit unset values instead of passing `None`.
 - `api_defaulted_optional_parameter`
   Warning for builder-shaped public entrypoints that immediately default positional `Option<_>` parameters, when a `bon` builder would let callers omit those values entirely.
+- `callsite_maybe_some`
+  Advisory warning for `maybe_*` method calls that pass `Some(...)` directly, which usually defeats the point of having paired `x(...)` and `maybe_x(...)` builder setters.
 - `api_standalone_builder_surface`
   Advisory warning for families of public `with_*` or `set_*` free functions that collectively behave like a builder surface for one type.
 - `api_boolean_protocol_decision`
@@ -439,5 +472,6 @@ The broader import-style lints only inspect module-scope `use` items. They do no
 To reduce false negatives:
 
 - extend `namespace_preserving_modules` for domain modules like `user`, `billing`, or `tenant`
+- use `extra_namespace_preserving_modules` or `ignored_namespace_preserving_modules` when the default preserve-module set is close but not quite right for your repo
 - keep `generic_nouns` aligned with the generic leaves your API actually uses
 - keep `organizational_modules` configured so `partials::error::Error`-style paths stay blocked
