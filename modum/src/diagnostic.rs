@@ -328,6 +328,14 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
             LintProfile::Core,
             "An internal item leaf repeats the parent category in a redundant suffix.",
         ),
+        "internal_flat_namespace_preserving_module" => (
+            LintProfile::Core,
+            "An internal flat module name hides a namespace-preserving facet that should stay visible in the path.",
+        ),
+        "internal_candidate_semantic_module" => (
+            LintProfile::Strict,
+            "A family of sibling internal items or modules suggests a stronger semantic module surface.",
+        ),
         "api_catch_all_module" => (
             LintProfile::Core,
             "A surface-visible module is a catch-all bucket instead of a stable domain or facet.",

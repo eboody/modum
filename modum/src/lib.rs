@@ -43,7 +43,21 @@ const DEFAULT_WEAK_MODULES: &[&str] = &[
 ];
 
 const DEFAULT_CATCH_ALL_MODULES: &[&str] = &[
-    "common", "misc", "helpers", "helper", "types", "util", "utils",
+    "common",
+    "misc",
+    "helpers",
+    "helper",
+    "types",
+    "util",
+    "utils",
+    "service",
+    "services",
+    "machine",
+    "machines",
+    "dependency",
+    "dependencies",
+    "id",
+    "ids",
 ];
 
 const DEFAULT_ORGANIZATIONAL_MODULES: &[&str] = &["error", "errors", "request", "response"];
@@ -2033,6 +2047,10 @@ mod tests {
         assert!(settings.generic_nouns.contains("Outcome"));
         assert!(settings.weak_modules.contains("storage"));
         assert!(settings.catch_all_modules.contains("helpers"));
+        assert!(settings.catch_all_modules.contains("service"));
+        assert!(settings.catch_all_modules.contains("machine"));
+        assert!(settings.catch_all_modules.contains("dependencies"));
+        assert!(settings.catch_all_modules.contains("ids"));
         assert!(settings.organizational_modules.contains("error"));
         assert!(settings.organizational_modules.contains("request"));
         assert!(settings.organizational_modules.contains("response"));

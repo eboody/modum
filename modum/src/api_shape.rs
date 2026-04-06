@@ -46,6 +46,12 @@ struct SharedHeadSemanticModuleSuggestion {
     surface: String,
 }
 
+struct SemanticModuleSurfaceCandidate {
+    preferred_path: String,
+    module_name: String,
+    shorter_leaf: String,
+}
+
 #[derive(Clone)]
 struct ChildModuleSurfaceExport {
     parent_binding: String,
@@ -124,6 +130,24 @@ struct ChildModulePublicBindings {
     observation_gap_constructs: BTreeSet<String>,
 }
 
+#[derive(Clone)]
+struct ScopeModuleBinding {
+    line: usize,
+    module_name: String,
+}
+
+#[derive(Clone)]
+struct ScopeItemBinding {
+    line: usize,
+    binding_name: String,
+}
+
+struct SharedHeadSemanticFamilyChoice {
+    shared_head_segments: Vec<String>,
+    members: Vec<(usize, String)>,
+    suggestion: SharedHeadSemanticModuleSuggestion,
+}
+
 pub(super) fn analyze_api_shape_rules(
     path: &Path,
     parsed: &File,
@@ -194,6 +218,29 @@ fn analyze_scope(
         settings,
         diagnostics,
     );
+    if !internal_candidate_semantic_module_inference_blocked(
+        items,
+        module_path,
+        scope_flags,
+        settings,
+    ) {
+        analyze_internal_candidate_module_families(
+            path,
+            items,
+            module_path,
+            scope_flags,
+            settings,
+            diagnostics,
+        );
+        analyze_internal_candidate_item_families(
+            path,
+            items,
+            module_path,
+            scope_flags,
+            settings,
+            diagnostics,
+        );
+    }
     let scope_context = ScopeSurfaceContext {
         public_bindings: &public_bindings,
         suppressed_child_module_exports: &suppressed_child_module_exports,
@@ -350,6 +397,24 @@ fn analyze_module_item(
                 ),
             ));
         }
+
+        if let Some((head_module, tail_module)) =
+            namespace_preserving_module_tail_candidate(&module_name, settings)
+        {
+            let path_text = render_public_path(module_path, &module_name);
+            let mut preferred_module_path = module_path.to_vec();
+            preferred_module_path.push(head_module);
+            let preferred_path = render_public_path(&preferred_module_path, &tail_module);
+
+            diagnostics.push(Diagnostic::policy(
+                Some(path.to_path_buf()),
+                Some(line),
+                "internal_flat_namespace_preserving_module",
+                format!(
+                    "internal module `{path_text}` flattens namespace-preserving `{tail_module}` facet; prefer `{preferred_path}`",
+                ),
+            ));
+        }
     }
 
     if is_surface_export_candidate(module_path, scope_flags.path_is_public, settings)
@@ -489,6 +554,7 @@ fn analyze_public_use_item(
             scope_items,
             module_path,
             &leaf.binding_name,
+            Some(&leaf),
             settings,
             diagnostics,
         );
@@ -563,6 +629,80 @@ fn collect_scope_public_leaf_bindings(items: &[Item]) -> Vec<PublicLeafBinding> 
     }
 
     bindings
+}
+
+fn collect_scope_public_module_bindings(
+    items: &[Item],
+    path_is_public: bool,
+    settings: &NamespaceSettings,
+) -> Vec<ScopeModuleBinding> {
+    collect_scope_module_bindings(items, path_is_public, true, settings)
+}
+
+fn collect_scope_internal_module_bindings(
+    items: &[Item],
+    path_is_public: bool,
+    settings: &NamespaceSettings,
+) -> Vec<ScopeModuleBinding> {
+    collect_scope_module_bindings(items, path_is_public, false, settings)
+}
+
+fn collect_scope_module_bindings(
+    items: &[Item],
+    path_is_public: bool,
+    public_only: bool,
+    settings: &NamespaceSettings,
+) -> Vec<ScopeModuleBinding> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let Item::Mod(item_mod) = item else {
+                return None;
+            };
+            if module_is_hidden_or_internal(item_mod) {
+                return None;
+            }
+            let module_is_public = path_is_public && is_public(&item_mod.vis);
+            if public_only != module_is_public {
+                return None;
+            }
+
+            let module_name = item_mod.ident.to_string();
+            let normalized = normalize_segment(&module_name);
+            if settings.weak_modules.contains(&normalized)
+                || settings.catch_all_modules.contains(&normalized)
+                || settings.organizational_modules.contains(&normalized)
+            {
+                return None;
+            }
+
+            Some(ScopeModuleBinding {
+                line: item_mod.span().start().line,
+                module_name,
+            })
+        })
+        .collect()
+}
+
+fn collect_scope_internal_item_bindings(
+    items: &[Item],
+    path_is_public: bool,
+) -> Vec<ScopeItemBinding> {
+    items
+        .iter()
+        .filter_map(|item| {
+            if !is_internal_shape_candidate_item(item) {
+                return None;
+            }
+
+            let (line, binding_name, is_item_public) = public_item_leaf(item)?;
+            if path_is_public && is_item_public {
+                return None;
+            }
+
+            Some(ScopeItemBinding { line, binding_name })
+        })
+        .collect()
 }
 
 fn collect_scope_public_enum_names(items: &[Item]) -> BTreeSet<String> {
@@ -4456,6 +4596,7 @@ fn analyze_candidate_semantic_modules(
             items,
             &public_leaves,
             public_bindings,
+            scope_flags.path_is_public,
             settings,
         )
     {
@@ -4504,52 +4645,42 @@ fn analyze_candidate_semantic_modules(
             continue;
         }
 
-        let member_segments = members
-            .iter()
-            .map(|(_, binding_name)| split_segments(binding_name))
-            .collect::<Vec<_>>();
-        let Some(shared_head_segments) =
-            candidate_semantic_module_shared_head_segments(&member_segments)
+        let Some(choice) =
+            choose_public_shared_head_semantic_family(module_path, &child_modules, &members, 3)
         else {
             continue;
         };
 
-        let line = members
+        let line = choice
+            .members
             .iter()
             .map(|(line, _)| *line)
             .min()
             .expect("family has at least one member");
-        let head = shared_head_segments.concat();
-        let module_candidate = render_segments(&shared_head_segments, NameStyle::Snake);
+        let head = choice.shared_head_segments.concat();
+        let module_candidate = render_segments(&choice.shared_head_segments, NameStyle::Snake);
         if semantic_module_candidate_already_emitted(diagnostics, path, &module_candidate) {
             continue;
         }
-        let original_members = members
+        let original_members = choice
+            .members
             .iter()
             .map(|(_, binding_name)| format!("`{binding_name}`"))
             .collect::<Vec<_>>()
             .join(", ");
-        let Some(suggestion) = shared_head_semantic_module_suggestion(
-            &child_modules,
-            &module_candidate,
-            &shared_head_segments,
-            &members,
-        ) else {
-            continue;
-        };
 
         diagnostics.push(Diagnostic::advisory(
             Some(path.to_path_buf()),
             Some(line),
             "api_candidate_semantic_module",
-            match suggestion.shared_tail {
+            match choice.suggestion.shared_tail {
                 Some(tail) => format!(
                     "public siblings {original_members} share the `{head}` head and `{tail}` tail; consider a semantic `{}` surface",
-                    suggestion.surface,
+                    choice.suggestion.surface,
                 ),
                 None => format!(
                     "public siblings {original_members} share the `{head}` head; consider a semantic `{}` surface",
-                    suggestion.surface,
+                    choice.suggestion.surface,
                 ),
             },
         ));
@@ -4674,7 +4805,546 @@ fn analyze_candidate_semantic_modules(
         }
     }
 
+    analyze_public_candidate_module_families(path, items, scope_flags, settings, diagnostics);
+
     suppressed_child_module_exports
+}
+
+fn analyze_public_candidate_module_families(
+    path: &Path,
+    items: &[Item],
+    scope_flags: ScopeFlags,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let scope_members =
+        collect_scope_public_module_bindings(items, scope_flags.path_is_public, settings);
+    if scope_members.len() < 3 {
+        return;
+    }
+
+    let minimum_family_members = if scope_has_compound_module_family_pressure(&scope_members) {
+        2
+    } else {
+        3
+    };
+
+    let mut head_families = BTreeMap::<String, Vec<ScopeModuleBinding>>::new();
+    for member in &scope_members {
+        let segments = split_segments(&member.module_name);
+        if segments.len() < 2 {
+            continue;
+        }
+
+        let head = normalize_segment(&segments[0]);
+        if is_weak_semantic_head(&head) {
+            continue;
+        }
+        head_families.entry(head).or_default().push(member.clone());
+    }
+
+    for members in head_families.into_values() {
+        let member_segments = members
+            .iter()
+            .map(|member| split_segments(&member.module_name))
+            .collect::<Vec<_>>();
+        let Some(shared_head_segments) =
+            candidate_semantic_module_shared_head_segments(&member_segments)
+        else {
+            continue;
+        };
+        let minimum_head_family_members = minimum_family_members_for_module_head(
+            &scope_members,
+            &shared_head_segments,
+            minimum_family_members,
+        );
+        if members.len() < minimum_head_family_members {
+            continue;
+        }
+
+        let module_candidate = render_segments(&shared_head_segments, NameStyle::Snake);
+        let Some(surface) = internal_module_family_surface_for_head(
+            &members,
+            &shared_head_segments,
+            minimum_head_family_members,
+        ) else {
+            continue;
+        };
+        if semantic_module_candidate_already_emitted(diagnostics, path, &module_candidate) {
+            continue;
+        }
+
+        let line = members
+            .iter()
+            .map(|member| member.line)
+            .min()
+            .expect("family has members");
+        let original_members = members
+            .iter()
+            .map(|member| format!("`{}`", member.module_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let head = shared_head_segments.concat();
+
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_candidate_semantic_module",
+            format!(
+                "public sibling modules {original_members} share the `{head}` head; consider a semantic `{surface}` surface"
+            ),
+        ));
+    }
+
+    let mut tail_families = BTreeMap::<String, Vec<ScopeModuleBinding>>::new();
+    for member in &scope_members {
+        let segments = split_segments(&member.module_name);
+        if segments.len() < 2 {
+            continue;
+        }
+        let Some(tail) = segments.last().map(|segment| normalize_segment(segment)) else {
+            continue;
+        };
+        tail_families.entry(tail).or_default().push(member.clone());
+    }
+
+    for (tail, members) in tail_families {
+        if members.len() < minimum_family_members
+            || settings.weak_modules.contains(&tail)
+            || settings.catch_all_modules.contains(&tail)
+            || settings.organizational_modules.contains(&tail)
+        {
+            continue;
+        }
+
+        let suggested_members = members
+            .iter()
+            .filter_map(|member| {
+                let segments = split_segments(&member.module_name);
+                let shorter_segments = &segments[..segments.len() - 1];
+                if shorter_segments.is_empty() {
+                    return None;
+                }
+                let shorter_leaf = render_segments(shorter_segments, NameStyle::Snake);
+                (!candidate_semantic_module_shorter_leaf_is_too_generic(&shorter_leaf))
+                    .then_some(shorter_leaf)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if suggested_members.len() < minimum_family_members {
+            continue;
+        }
+
+        let line = members
+            .iter()
+            .map(|member| member.line)
+            .min()
+            .expect("family has members");
+        if semantic_module_candidate_already_emitted(diagnostics, path, &tail) {
+            continue;
+        }
+        let surface = format!("{tail}::{{{}}}", suggested_members.join(", "));
+        let original_members = members
+            .iter()
+            .map(|member| format!("`{}`", member.module_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tail_label = render_segments(&split_segments(&tail), NameStyle::Pascal);
+
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "api_candidate_semantic_module",
+            format!(
+                "public sibling modules {original_members} share the `{tail_label}` tail; consider a semantic `{surface}` surface"
+            ),
+        ));
+    }
+}
+
+fn analyze_internal_candidate_module_families(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+    scope_flags: ScopeFlags,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if module_path_contains_internal_namespace(module_path)
+        || module_path_is_synthetic_scaffolding(module_path)
+    {
+        return;
+    }
+
+    let scope_members =
+        collect_scope_internal_module_bindings(items, scope_flags.path_is_public, settings);
+    if scope_members.len() < 3 {
+        return;
+    }
+
+    let minimum_family_members = if scope_has_compound_module_family_pressure(&scope_members) {
+        2
+    } else {
+        3
+    };
+
+    let mut head_families = BTreeMap::<String, Vec<ScopeModuleBinding>>::new();
+    for member in &scope_members {
+        let segments = split_segments(&member.module_name);
+        if segments.len() < 2 {
+            continue;
+        }
+
+        let head = normalize_segment(&segments[0]);
+        if is_weak_semantic_head(&head) {
+            continue;
+        }
+        head_families.entry(head).or_default().push(member.clone());
+    }
+
+    for members in head_families.into_values() {
+        let member_segments = members
+            .iter()
+            .map(|member| split_segments(&member.module_name))
+            .collect::<Vec<_>>();
+        let Some(shared_head_segments) =
+            candidate_semantic_module_shared_head_segments(&member_segments)
+        else {
+            continue;
+        };
+        let minimum_head_family_members = minimum_family_members_for_module_head(
+            &scope_members,
+            &shared_head_segments,
+            minimum_family_members,
+        );
+        if members.len() < minimum_head_family_members {
+            continue;
+        }
+
+        let Some(surface) = internal_module_family_surface_for_head(
+            &members,
+            &shared_head_segments,
+            minimum_head_family_members,
+        ) else {
+            continue;
+        };
+        if internal_candidate_surface_already_emitted(diagnostics, path, &surface) {
+            continue;
+        }
+        let line = members
+            .iter()
+            .map(|member| member.line)
+            .min()
+            .expect("family has members");
+        let original_members = members
+            .iter()
+            .map(|member| format!("`{}`", member.module_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let head = shared_head_segments.concat();
+
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "internal_candidate_semantic_module",
+            format!(
+                "sibling modules {original_members} share the `{head}` head; consider a semantic `{surface}` surface"
+            ),
+        ));
+    }
+
+    let mut tail_families = BTreeMap::<String, Vec<ScopeModuleBinding>>::new();
+    for member in &scope_members {
+        let segments = split_segments(&member.module_name);
+        if segments.len() < 2 {
+            continue;
+        }
+        let Some(tail) = segments.last().map(|segment| normalize_segment(segment)) else {
+            continue;
+        };
+        tail_families.entry(tail).or_default().push(member.clone());
+    }
+
+    for (tail, members) in tail_families {
+        if members.len() < minimum_family_members
+            || settings.weak_modules.contains(&tail)
+            || settings.catch_all_modules.contains(&tail)
+            || settings.organizational_modules.contains(&tail)
+        {
+            continue;
+        }
+
+        let suggested_members = members
+            .iter()
+            .filter_map(|member| {
+                let segments = split_segments(&member.module_name);
+                let shorter_segments = &segments[..segments.len() - 1];
+                if shorter_segments.is_empty() {
+                    return None;
+                }
+                let shorter_leaf = render_segments(shorter_segments, NameStyle::Snake);
+                (!candidate_semantic_module_shorter_leaf_is_too_generic(&shorter_leaf))
+                    .then_some(shorter_leaf)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if suggested_members.len() < minimum_family_members {
+            continue;
+        }
+
+        let line = members
+            .iter()
+            .map(|member| member.line)
+            .min()
+            .expect("family has members");
+        let surface = format!("{tail}::{{{}}}", suggested_members.join(", "));
+        if internal_candidate_surface_already_emitted(diagnostics, path, &surface) {
+            continue;
+        }
+        let original_members = members
+            .iter()
+            .map(|member| format!("`{}`", member.module_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tail_label = render_segments(&split_segments(&tail), NameStyle::Pascal);
+
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "internal_candidate_semantic_module",
+            format!(
+                "sibling modules {original_members} share the `{tail_label}` tail; consider a semantic `{surface}` surface",
+            ),
+        ));
+    }
+}
+
+fn analyze_internal_candidate_item_families(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+    scope_flags: ScopeFlags,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if module_path_contains_internal_namespace(module_path)
+        || module_path_is_synthetic_scaffolding(module_path)
+    {
+        return;
+    }
+
+    let members = collect_scope_internal_item_bindings(items, scope_flags.path_is_public);
+    if members.len() < 3 {
+        return;
+    }
+
+    let mut head_families = BTreeMap::<String, Vec<ScopeItemBinding>>::new();
+    for member in &members {
+        if !matches!(detect_name_style(&member.binding_name), NameStyle::Pascal) {
+            continue;
+        }
+
+        let segments = split_segments(&member.binding_name);
+        if segments.len() < 2 {
+            continue;
+        }
+
+        let head = normalize_segment(&segments[0]);
+        if settings.weak_modules.contains(&head)
+            || settings.catch_all_modules.contains(&head)
+            || settings.organizational_modules.contains(&head)
+            || is_weak_semantic_head(&head)
+        {
+            continue;
+        }
+
+        head_families.entry(head).or_default().push(member.clone());
+    }
+
+    for members in head_families.into_values() {
+        if members.len() < 3 {
+            continue;
+        }
+
+        let member_segments = members
+            .iter()
+            .map(|member| split_segments(&member.binding_name))
+            .collect::<Vec<_>>();
+        let Some(shared_head_segments) =
+            candidate_semantic_module_shared_head_segments(&member_segments)
+        else {
+            continue;
+        };
+
+        let module_candidate = render_segments(&shared_head_segments, NameStyle::Snake);
+        let member_entries = members
+            .iter()
+            .map(|member| (member.line, member.binding_name.clone()))
+            .collect::<Vec<_>>();
+        if internal_item_family_has_bare_head_tail_member(&member_entries, &shared_head_segments) {
+            continue;
+        }
+        let Some(suggestion) = shared_head_semantic_module_suggestion(
+            &BTreeMap::new(),
+            &module_candidate,
+            &shared_head_segments,
+            &member_entries,
+        ) else {
+            continue;
+        };
+        let Some(tail) = suggestion.shared_tail.as_deref() else {
+            continue;
+        };
+        if internal_candidate_surface_already_emitted(diagnostics, path, &suggestion.surface) {
+            continue;
+        }
+
+        let line = members
+            .iter()
+            .map(|member| member.line)
+            .min()
+            .expect("family has members");
+        let original_members = members
+            .iter()
+            .map(|member| format!("`{}`", member.binding_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let head = shared_head_segments.concat();
+
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "internal_candidate_semantic_module",
+            format!(
+                "internal siblings {original_members} share the `{head}` head and `{tail}` tail; consider a semantic `{}` surface",
+                suggestion.surface,
+            ),
+        ));
+    }
+}
+
+fn internal_item_family_has_bare_head_tail_member(
+    members: &[(usize, String)],
+    shared_head_segments: &[String],
+) -> bool {
+    let trimmed_member_segments = members
+        .iter()
+        .map(|(_, binding_name)| split_segments(binding_name))
+        .map(|segments| segments[shared_head_segments.len()..].to_vec())
+        .collect::<Vec<_>>();
+    let Some(shared_tail_segments) =
+        candidate_semantic_module_shared_tail_segments(&trimmed_member_segments)
+    else {
+        return false;
+    };
+    let tail_len = shared_tail_segments.len();
+
+    trimmed_member_segments.iter().any(|segments| {
+        segments.len() == tail_len
+            && normalize_segment(&render_segments(&shared_tail_segments, NameStyle::Pascal))
+                == normalize_segment(&render_segments(segments, NameStyle::Pascal))
+    })
+}
+
+fn internal_module_family_surface_for_head(
+    members: &[ScopeModuleBinding],
+    shared_head_segments: &[String],
+    minimum_family_members: usize,
+) -> Option<String> {
+    let member_segments = members
+        .iter()
+        .map(|member| split_segments(&member.module_name))
+        .collect::<Vec<_>>();
+    let trimmed_member_segments = member_segments
+        .iter()
+        .map(|segments| segments[shared_head_segments.len()..].to_vec())
+        .collect::<Vec<_>>();
+    let module_candidate = render_segments(shared_head_segments, NameStyle::Snake);
+
+    if let Some(shared_tail_segments) =
+        candidate_semantic_module_shared_tail_segments(&trimmed_member_segments)
+    {
+        let tail_len = shared_tail_segments.len();
+        let nested_members = trimmed_member_segments
+            .iter()
+            .filter_map(|segments| {
+                let middle_segments = &segments[..segments.len() - tail_len];
+                if middle_segments.is_empty() {
+                    return None;
+                }
+                let leaf = render_segments(middle_segments, NameStyle::Snake);
+                (!candidate_semantic_module_shorter_leaf_is_too_generic(&leaf)).then_some(leaf)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if nested_members.len() >= minimum_family_members {
+            let tail_module = render_segments(&shared_tail_segments, NameStyle::Snake);
+            return Some(format!(
+                "{module_candidate}::{tail_module}::{{{}}}",
+                nested_members.join(", ")
+            ));
+        }
+    }
+
+    let inferred_members = trimmed_member_segments
+        .into_iter()
+        .filter(|segments| !segments.is_empty())
+        .map(|segments| render_segments(&segments, NameStyle::Snake))
+        .filter(|leaf| !candidate_semantic_module_shorter_leaf_is_too_generic(leaf))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    (inferred_members.len() >= minimum_family_members)
+        .then(|| format!("{module_candidate}::{{{}}}", inferred_members.join(", ")))
+}
+
+fn internal_candidate_surface_already_emitted(
+    diagnostics: &[Diagnostic],
+    path: &Path,
+    surface: &str,
+) -> bool {
+    let marker = format!("`{surface}`");
+    diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_candidate_semantic_module")
+            && diag.file.as_deref() == Some(path)
+            && diag.message.contains(&marker)
+    })
+}
+
+fn scope_has_compound_module_family_pressure(members: &[ScopeModuleBinding]) -> bool {
+    members
+        .iter()
+        .filter(|member| split_segments(&member.module_name).len() >= 2)
+        .nth(2)
+        .is_some()
+}
+
+fn minimum_family_members_for_module_head(
+    scope_members: &[ScopeModuleBinding],
+    shared_head_segments: &[String],
+    default_minimum_family_members: usize,
+) -> usize {
+    if default_minimum_family_members <= 2
+        || !scope_has_bare_head_module(scope_members, shared_head_segments)
+    {
+        return default_minimum_family_members;
+    }
+
+    2
+}
+
+fn scope_has_bare_head_module(
+    scope_members: &[ScopeModuleBinding],
+    shared_head_segments: &[String],
+) -> bool {
+    let bare_head_module = render_segments(shared_head_segments, NameStyle::Snake);
+    scope_members.iter().any(|member| {
+        split_segments(&member.module_name).len() == shared_head_segments.len()
+            && normalize_segment(&member.module_name) == normalize_segment(&bare_head_module)
+    })
 }
 
 fn semantic_module_candidate_already_emitted(
@@ -4817,6 +5487,157 @@ fn shared_head_semantic_module_suggestion(
     })
 }
 
+fn choose_public_shared_head_semantic_family(
+    module_path: &[String],
+    child_modules: &BTreeMap<String, BTreeSet<String>>,
+    members: &[(usize, String)],
+    minimum_family_members: usize,
+) -> Option<SharedHeadSemanticFamilyChoice> {
+    let member_segments = members
+        .iter()
+        .map(|(_, binding_name)| split_segments(binding_name))
+        .collect::<Vec<_>>();
+    let dominant_compound_minimum =
+        dominant_compound_head_minimum_family_members(members.len(), minimum_family_members);
+    let mut seen_prefixes = BTreeSet::new();
+    let mut best_compound = None::<(usize, usize, SharedHeadSemanticFamilyChoice)>;
+
+    for segments in &member_segments {
+        for prefix_len in 2..segments.len() {
+            let prefix = segments[..prefix_len].to_vec();
+            let prefix_key = render_segments(&prefix, NameStyle::Snake);
+            if !seen_prefixes.insert(prefix_key.clone()) {
+                continue;
+            }
+
+            let candidate_members = members
+                .iter()
+                .cloned()
+                .filter(|(_, binding_name)| {
+                    let binding_segments = split_segments(binding_name);
+                    binding_segments.len() > prefix_len
+                        && segments_start_with_normalized(&binding_segments, &prefix)
+                })
+                .collect::<Vec<_>>();
+            if candidate_members.len() < dominant_compound_minimum
+                || shared_head_candidate_redundant_with_parent_module(
+                    module_path,
+                    &prefix,
+                    &candidate_members,
+                )
+            {
+                continue;
+            }
+
+            let Some(suggestion) = shared_head_semantic_module_suggestion(
+                child_modules,
+                &prefix_key,
+                &prefix,
+                &candidate_members,
+            ) else {
+                continue;
+            };
+
+            let score = (candidate_members.len(), prefix_len);
+            let choice = SharedHeadSemanticFamilyChoice {
+                shared_head_segments: prefix,
+                members: candidate_members,
+                suggestion,
+            };
+            if best_compound
+                .as_ref()
+                .is_none_or(|best| score > (best.0, best.1))
+            {
+                best_compound = Some((score.0, score.1, choice));
+            }
+        }
+    }
+
+    if let Some((_, _, choice)) = best_compound {
+        return Some(choice);
+    }
+
+    let shared_head_segments = candidate_semantic_module_shared_head_segments(&member_segments)?;
+    if shared_head_candidate_redundant_with_parent_module(
+        module_path,
+        &shared_head_segments,
+        members,
+    ) {
+        return None;
+    }
+    let module_candidate = render_segments(&shared_head_segments, NameStyle::Snake);
+    let suggestion = shared_head_semantic_module_suggestion(
+        child_modules,
+        &module_candidate,
+        &shared_head_segments,
+        members,
+    )?;
+
+    Some(SharedHeadSemanticFamilyChoice {
+        shared_head_segments,
+        members: members.to_vec(),
+        suggestion,
+    })
+}
+
+fn dominant_compound_head_minimum_family_members(
+    family_member_count: usize,
+    minimum_family_members: usize,
+) -> usize {
+    minimum_family_members.max((family_member_count * 2).div_ceil(3))
+}
+
+fn shared_head_candidate_redundant_with_parent_module(
+    module_path: &[String],
+    shared_head_segments: &[String],
+    members: &[(usize, String)],
+) -> bool {
+    let Some(parent_module) = module_path.last() else {
+        return false;
+    };
+    let parent_segments = split_segments(parent_module);
+    if parent_segments.is_empty() {
+        return false;
+    }
+
+    if segments_equal_normalized(&parent_segments, shared_head_segments) {
+        return true;
+    }
+    if parent_segments.len() <= shared_head_segments.len()
+        || !segments_start_with_normalized(&parent_segments, shared_head_segments)
+    {
+        return false;
+    }
+
+    let parent_remainder = &parent_segments[shared_head_segments.len()..];
+    members.iter().any(|(_, binding_name)| {
+        let binding_segments = split_segments(binding_name);
+        binding_segments.len() > shared_head_segments.len()
+            && segments_start_with_normalized(&binding_segments, shared_head_segments)
+            && segments_equal_normalized(
+                &binding_segments[shared_head_segments.len()..],
+                parent_remainder,
+            )
+    })
+}
+
+fn segments_start_with_normalized(segments: &[String], prefix: &[String]) -> bool {
+    segments.len() >= prefix.len()
+        && segments
+            .iter()
+            .zip(prefix.iter())
+            .take(prefix.len())
+            .all(|(left, right)| normalize_segment(left) == normalize_segment(right))
+}
+
+fn segments_equal_normalized(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| normalize_segment(left) == normalize_segment(right))
+}
+
 fn semantic_child_module_members<'a>(
     child_modules: &'a BTreeMap<String, BTreeSet<String>>,
     module_candidate: &str,
@@ -4830,6 +5651,51 @@ fn module_path_is_synthetic_scaffolding(module_path: &[String]) -> bool {
     module_path
         .iter()
         .any(|segment| module_name_is_synthetic_scaffolding(segment))
+}
+
+fn internal_candidate_semantic_module_inference_blocked(
+    items: &[Item],
+    module_path: &[String],
+    scope_flags: ScopeFlags,
+    settings: &NamespaceSettings,
+) -> bool {
+    if module_path_contains_internal_namespace(module_path)
+        || module_path_is_synthetic_scaffolding(module_path)
+    {
+        return false;
+    }
+
+    if internal_semantic_module_inference_gap_for_scope_items(items).is_none() {
+        return false;
+    }
+    if !scope_has_internal_candidate_semantic_module_inputs(
+        items,
+        scope_flags.path_is_public,
+        settings,
+    ) {
+        return false;
+    }
+    true
+}
+
+fn scope_has_internal_candidate_semantic_module_inputs(
+    items: &[Item],
+    path_is_public: bool,
+    settings: &NamespaceSettings,
+) -> bool {
+    collect_scope_internal_module_bindings(items, path_is_public, settings)
+        .iter()
+        .filter(|binding| split_segments(&binding.module_name).len() >= 2)
+        .nth(1)
+        .is_some()
+        || collect_scope_internal_item_bindings(items, path_is_public)
+            .iter()
+            .filter(|binding| {
+                matches!(detect_name_style(&binding.binding_name), NameStyle::Pascal)
+                    && split_segments(&binding.binding_name).len() >= 2
+            })
+            .nth(1)
+            .is_some()
 }
 
 fn module_name_is_synthetic_scaffolding(module_name: &str) -> bool {
@@ -5104,6 +5970,7 @@ fn analyze_item_shape(
             scope_items,
             module_path,
             &leaf_name,
+            None,
             settings,
             diagnostics,
         );
@@ -5118,18 +5985,28 @@ fn analyze_public_leaf(
     scope_items: &[Item],
     module_path: &[String],
     leaf_name: &str,
+    source_use_leaf: Option<&PublicUseLeaf>,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if let Some(preferred_path) =
         semantic_module_surface_candidate(path, scope_items, module_path, leaf_name, settings)
+            .filter(|candidate| {
+                !scope_has_shorter_sibling_surface_export(
+                    scope_items,
+                    module_path,
+                    source_use_leaf,
+                    candidate,
+                )
+            })
     {
         diagnostics.push(Diagnostic::policy(
             Some(path.to_path_buf()),
             Some(line),
             "api_redundant_leaf_context",
             format!(
-                "public API already exposes `{preferred_path}`; prefer it over `{}`",
+                "public API already exposes `{}`; prefer it over `{}`",
+                preferred_path.preferred_path,
                 render_public_path(module_path, leaf_name),
             ),
         ));
@@ -5302,13 +6179,49 @@ fn normalize_generic_surface_modules(
     modules
 }
 
+fn scope_has_shorter_sibling_surface_export(
+    scope_items: &[Item],
+    module_path: &[String],
+    source_use_leaf: Option<&PublicUseLeaf>,
+    candidate: &SemanticModuleSurfaceCandidate,
+) -> bool {
+    let Some(source_use_leaf) = source_use_leaf else {
+        return false;
+    };
+
+    let expected_path = {
+        let mut path = module_path.to_vec();
+        path.push(candidate.module_name.clone());
+        path.push(candidate.shorter_leaf.clone());
+        path
+    };
+
+    scope_items.iter().any(|item| {
+        let Item::Use(item_use) = item else {
+            return false;
+        };
+        if !is_public(&item_use.vis) {
+            return false;
+        }
+
+        let mut leaves = Vec::new();
+        flatten_public_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+        leaves.into_iter().any(|leaf| {
+            leaf.binding_name == candidate.shorter_leaf
+                && leaf.binding_name != source_use_leaf.binding_name
+                && resolve_local_module_path(module_path, &leaf.full_path)
+                    .is_some_and(|resolved| resolved == expected_path)
+        })
+    })
+}
+
 fn semantic_module_surface_candidate(
     path: &Path,
     scope_items: &[Item],
     module_path: &[String],
     leaf_name: &str,
     settings: &NamespaceSettings,
-) -> Option<String> {
+) -> Option<SemanticModuleSurfaceCandidate> {
     let child_module_bindings =
         semantic_child_module_bindings(path, scope_items, module_path, settings);
     if child_module_bindings.bindings.is_empty() {
@@ -5349,11 +6262,15 @@ fn semantic_module_surface_candidate(
                 continue;
             }
 
-            return Some(render_public_path_with_module(
-                module_path,
-                &module_name,
-                &shorter_leaf,
-            ));
+            return Some(SemanticModuleSurfaceCandidate {
+                preferred_path: render_public_path_with_module(
+                    module_path,
+                    &module_name,
+                    &shorter_leaf,
+                ),
+                module_name,
+                shorter_leaf,
+            });
         }
 
         if !leaf_normalized.ends_with(&module_segments) {
@@ -5373,11 +6290,15 @@ fn semantic_module_surface_candidate(
             continue;
         }
 
-        return Some(render_public_path_with_module(
-            module_path,
-            &module_name,
-            &shorter_leaf,
-        ));
+        return Some(SemanticModuleSurfaceCandidate {
+            preferred_path: render_public_path_with_module(
+                module_path,
+                &module_name,
+                &shorter_leaf,
+            ),
+            module_name,
+            shorter_leaf,
+        });
     }
 
     None
@@ -5625,6 +6546,33 @@ fn semantic_module_inference_gap_for_scope_items(
     gap
 }
 
+fn internal_semantic_module_inference_gap_for_scope_items(
+    items: &[Item],
+) -> Option<SemanticInferenceObservationGap> {
+    let mut gap = None;
+
+    for item in items {
+        let mut constructs = BTreeSet::new();
+        for attr in item_attrs(item) {
+            if attr.path().is_ident("cfg") {
+                constructs.insert("#[cfg]".to_string());
+            }
+            if attr.path().is_ident("cfg_attr") {
+                constructs.insert("#[cfg_attr]".to_string());
+            }
+        }
+        if let Item::Macro(item_macro) = item {
+            constructs.insert(item_macro_observation_construct(item_macro).to_string());
+        }
+
+        for construct in constructs {
+            note_semantic_inference_construct(&mut gap, item.span().start().line, construct);
+        }
+    }
+
+    gap
+}
+
 fn semantic_module_inference_constructs_in_items(items: &[Item]) -> BTreeSet<String> {
     let mut constructs = BTreeSet::new();
 
@@ -5660,16 +6608,107 @@ fn scope_has_candidate_semantic_module_inputs(
     items: &[Item],
     public_leaves: &[PublicLeafBinding],
     public_bindings: &BTreeSet<String>,
+    path_is_public: bool,
     settings: &NamespaceSettings,
 ) -> bool {
     public_leaves.iter().any(|binding| {
         matches!(detect_name_style(&binding.binding_name), NameStyle::Pascal)
             && split_segments(&binding.binding_name).len() >= 2
     }) || items.iter().any(|item| matches!(item, Item::Macro(_)))
+        || scope_has_public_candidate_module_family_inputs(items, path_is_public, settings)
         || (public_bindings
             .iter()
             .any(|binding| settings.generic_nouns.contains(binding))
             && scope_has_public_candidate_child_module(items, settings))
+}
+
+fn scope_has_public_candidate_module_family_inputs(
+    items: &[Item],
+    path_is_public: bool,
+    settings: &NamespaceSettings,
+) -> bool {
+    let scope_members = collect_scope_public_module_bindings(items, path_is_public, settings);
+    if scope_members.len() < 2 {
+        return false;
+    }
+
+    let minimum_family_members = if scope_has_compound_module_family_pressure(&scope_members) {
+        2
+    } else {
+        3
+    };
+
+    let mut head_families = BTreeMap::<String, Vec<ScopeModuleBinding>>::new();
+    for member in &scope_members {
+        let segments = split_segments(&member.module_name);
+        if segments.len() < 2 {
+            continue;
+        }
+
+        let head = normalize_segment(&segments[0]);
+        if is_weak_semantic_head(&head) {
+            continue;
+        }
+        head_families.entry(head).or_default().push(member.clone());
+    }
+
+    if head_families.into_values().any(|members| {
+        let member_segments = members
+            .iter()
+            .map(|member| split_segments(&member.module_name))
+            .collect::<Vec<_>>();
+        let Some(shared_head_segments) =
+            candidate_semantic_module_shared_head_segments(&member_segments)
+        else {
+            return false;
+        };
+        let minimum_head_family_members = minimum_family_members_for_module_head(
+            &scope_members,
+            &shared_head_segments,
+            minimum_family_members,
+        );
+        members.len() >= minimum_head_family_members
+    }) {
+        return true;
+    }
+
+    let mut tail_families = BTreeMap::<String, Vec<ScopeModuleBinding>>::new();
+    for member in &scope_members {
+        let segments = split_segments(&member.module_name);
+        if segments.len() < 2 {
+            continue;
+        }
+        let Some(tail) = segments.last().map(|segment| normalize_segment(segment)) else {
+            continue;
+        };
+        tail_families.entry(tail).or_default().push(member.clone());
+    }
+
+    tail_families.into_iter().any(|(tail, members)| {
+        if members.len() < minimum_family_members
+            || settings.weak_modules.contains(&tail)
+            || settings.catch_all_modules.contains(&tail)
+            || settings.organizational_modules.contains(&tail)
+        {
+            return false;
+        }
+
+        let suggested_members = members
+            .iter()
+            .filter_map(|member| {
+                let segments = split_segments(&member.module_name);
+                let shorter_segments = &segments[..segments.len() - 1];
+                if shorter_segments.is_empty() {
+                    return None;
+                }
+                let shorter_leaf = render_segments(shorter_segments, NameStyle::Snake);
+                (!candidate_semantic_module_shorter_leaf_is_too_generic(&shorter_leaf))
+                    .then_some(shorter_leaf)
+            })
+            .collect::<BTreeSet<_>>();
+
+        suggested_members.len() >= minimum_family_members
+    })
 }
 
 fn scope_has_public_candidate_child_module(items: &[Item], settings: &NamespaceSettings) -> bool {
@@ -5902,6 +6941,8 @@ fn internal_shorter_leaf_is_too_generic(shorter_leaf: &str) -> bool {
         "status",
         "shared",
         "global",
+        "part",
+        "parts",
         "attrs",
         "attr",
         "param",
@@ -5983,6 +7024,50 @@ fn internal_leaf_context_is_adapter_policy(parent_module: &str, shorter_leaf: &s
         && shorter_tokens
             .last()
             .is_some_and(|token| adapter_role_tokens.contains(&token.as_str()))
+}
+
+fn namespace_preserving_module_tail_candidate(
+    module_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<(String, String)> {
+    let segments = split_segments(module_name);
+    if segments.len() < 2 {
+        return None;
+    }
+
+    for tail_len in (1..segments.len()).rev() {
+        let head_segments = &segments[..segments.len() - tail_len];
+        let tail_segments = &segments[segments.len() - tail_len..];
+        if head_segments.is_empty() {
+            continue;
+        }
+
+        let tail_module = render_segments(tail_segments, NameStyle::Snake);
+        if !settings.namespace_preserving_modules.contains(&tail_module)
+            || !namespace_preserving_module_tail_is_actionable(&tail_module)
+        {
+            continue;
+        }
+
+        let head_module = render_segments(head_segments, NameStyle::Snake);
+        if settings.weak_modules.contains(&head_module)
+            || settings.catch_all_modules.contains(&head_module)
+            || settings.organizational_modules.contains(&head_module)
+        {
+            return None;
+        }
+
+        return Some((head_module, tail_module));
+    }
+
+    None
+}
+
+fn namespace_preserving_module_tail_is_actionable(tail_module: &str) -> bool {
+    matches!(
+        tail_module,
+        "command" | "email" | "http" | "policy" | "query" | "repo" | "store" | "write_back"
+    )
 }
 
 fn internal_leaf_context_is_human_facing_machinery(

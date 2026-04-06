@@ -474,6 +474,31 @@ mod trace {
 }
 
 #[test]
+fn analyze_workspace_suppresses_internal_redundant_leaf_context_for_parts_leafs() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod runtime {
+    struct RuntimeParts;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_redundant_leaf_context"))
+    );
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_internal_redundant_leaf_context_for_meta_shorter_leaves() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -512,6 +537,218 @@ mod builder {
 }
 
 #[test]
+fn analyze_workspace_flags_internal_candidate_semantic_module_for_shared_head_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod pilot_acceptance;
+mod pilot_bootstrap;
+mod pilot_live_ops;
+mod pilot_mock_harness;
+mod pilot_recovery;
+mod pilot_wedge;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_candidate_semantic_module")
+            && diag.message.contains("pilot_acceptance")
+            && diag.message.contains("pilot_bootstrap")
+            && diag.message.contains("pilot_live_ops")
+            && diag
+                .message
+                .contains("pilot::{acceptance, bootstrap, live_ops, mock_harness, recovery, wedge}")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_internal_candidate_semantic_module_for_shared_tail_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod finalize_stage;
+mod inbound_stage;
+mod intake_stage;
+mod prepare_stage;
+mod release_stage;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_candidate_semantic_module")
+            && diag.message.contains("finalize_stage")
+            && diag.message.contains("inbound_stage")
+            && diag.message.contains("intake_stage")
+            && diag
+                .message
+                .contains("stage::{finalize, inbound, intake, prepare, release}")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_internal_candidate_semantic_module_for_private_args_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+struct CaseDetailArgs;
+struct CaseExceptionArgs;
+struct CaseAuditArgs;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_candidate_semantic_module")
+            && diag.message.contains("CaseDetailArgs")
+            && diag.message.contains("CaseExceptionArgs")
+            && diag.message.contains("CaseAuditArgs")
+            && diag
+                .message
+                .contains("case::args::{Audit, Detail, Exception}")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_internal_candidate_semantic_module_for_shared_head_items_without_shared_tail()
+ {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+struct ReleaseOutcome;
+enum ReleaseResult {}
+enum ReleaseStatus {}
+struct ReleaseReport;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_candidate_semantic_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_skips_internal_candidate_semantic_module_for_bare_head_tail_member_shape() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+struct GovernanceArgs;
+struct GovernanceBoardArgs;
+struct GovernanceHistoryArgs;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_candidate_semantic_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_internal_candidate_semantic_module_for_two_item_head_family_in_compound_scope()
+ {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod alpha_vendor_http;
+mod epic_fhir;
+mod epic_write_back;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_candidate_semantic_module")
+            && diag.message.contains("epic_fhir")
+            && diag.message.contains("epic_write_back")
+            && diag.message.contains("epic::{fhir, write_back}")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_internal_flat_namespace_preserving_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod alpha_vendor_http;
+mod epic_write_back;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_flat_namespace_preserving_module")
+            && diag.message.contains("alpha_vendor_http")
+            && diag.message.contains("alpha_vendor::http")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_flat_namespace_preserving_module")
+            && diag.message.contains("epic_write_back")
+            && diag.message.contains("epic::write_back")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_internal_flat_namespace_preserving_module_for_transport_tail() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "mod fhir_transport;\n").expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_flat_namespace_preserving_module"))
+    );
+}
+
+#[test]
 fn analyze_workspace_flags_internal_weak_module_generic_leaf() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -540,6 +777,35 @@ mod helpers {
             .iter()
             .any(|diag| diag.code() == Some("internal_weak_module_generic_leaf"))
     );
+}
+
+#[test]
+fn analyze_workspace_flags_internal_technical_bucket_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod dependencies {
+    trait ScopeReview {}
+}
+
+mod ids {
+    struct TaskId;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_catch_all_module") && diag.message.contains("dependencies")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_catch_all_module") && diag.message.contains("ids")
+    }));
 }
 
 #[test]
@@ -2078,6 +2344,45 @@ pub struct Repository;
 }
 
 #[test]
+fn analyze_workspace_allows_longer_internal_reexport_when_shorter_surface_is_also_exposed() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/replay")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod replay;
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/replay.rs"),
+        r#"
+pub(crate) mod machine;
+
+pub use machine::rebuild;
+pub(crate) use machine::rebuild_machine;
+"#,
+    )
+    .expect("write replay");
+    fs::write(
+        root.join("src/replay/machine.rs"),
+        r#"
+pub fn rebuild() {}
+pub(crate) fn rebuild_machine() {}
+"#,
+    )
+    .expect("write machine");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_redundant_leaf_context")
+            && diag.message.contains("rebuild_machine")
+    }));
+}
+
+#[test]
 fn analyze_workspace_flags_prefixed_public_root_alias_when_semantic_module_surface_exists() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -2237,6 +2542,105 @@ pub struct WriteBackSubmitted;
                 .message
                 .contains("write_back::{Prepared, Ready, Submitted}")
             && !diag.message.contains("write::{Back")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_candidate_semantic_module_for_public_shared_head_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod audit;
+pub mod audit_path;
+pub mod audit_semantics;
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/audit.rs"), "pub struct Record;\n").expect("write audit");
+    fs::write(root.join("src/audit_path.rs"), "pub struct Boundary;\n").expect("write audit path");
+    fs::write(
+        root.join("src/audit_semantics.rs"),
+        "pub struct Snapshot;\n",
+    )
+    .expect("write audit semantics");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && diag.message.contains("public sibling modules")
+            && diag.message.contains("audit_path")
+            && diag.message.contains("audit_semantics")
+            && diag.message.contains("audit::{path, semantics}")
+    }));
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_candidate_semantic_module")
+            && diag.message.contains("audit::{path, semantics}")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_candidate_semantic_module_for_public_shared_tail_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod case_review;
+pub mod field_review;
+pub mod scope_review;
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/case_review.rs"), "pub struct Case;\n").expect("write case review");
+    fs::write(root.join("src/field_review.rs"), "pub struct Field;\n").expect("write field review");
+    fs::write(root.join("src/scope_review.rs"), "pub struct Scope;\n").expect("write scope review");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && diag.message.contains("public sibling modules")
+            && diag.message.contains("share the `Review` tail")
+            && diag.message.contains("review::{case, field, scope}")
+    }));
+}
+
+#[test]
+fn analyze_workspace_prefers_dominant_compound_head_for_public_shared_head_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct SourceUpdateAdapter;
+pub struct SourceUpdateApiSchema;
+pub struct SourceUpdateAuth;
+pub struct SourceAuthorizationHeader;
+pub struct SourceUpdateConfig;
+pub struct SourceEndpoint;
+pub struct SourceUpdateMode;
+pub struct SourceUpdateRequest;
+pub struct SourceUpdateResponse;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && diag.message.contains("SourceUpdateAdapter")
+            && diag.message.contains("SourceUpdateResponse")
+            && diag.message.contains(
+                "source_update::{Adapter, ApiSchema, Auth, Config, Mode, Request, Response}",
+            )
+            && !diag.message.contains("source::{AuthorizationHeader")
     }));
 }
 
@@ -2464,6 +2868,39 @@ pub mod __private {
 }
 
 #[test]
+fn analyze_workspace_does_not_nest_candidate_semantic_module_inside_parent_that_already_carries_the_head()
+ {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    let scope_review_file = root.join("src/scope_review.rs");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod scope_review;\n").expect("write lib");
+    fs::write(
+        &scope_review_file,
+        r#"
+pub type ScopeReviewResult = std::result::Result<ScopeDecision, Error>;
+
+pub enum ScopeDecision {
+    Approved,
+    Rejected,
+}
+
+pub trait ScopeReview {}
+
+pub struct Error;
+"#,
+    )
+    .expect("write scope review");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && diag.file.as_deref() == Some(scope_review_file.as_path())
+    }));
+}
+
+#[test]
 fn analyze_workspace_skips_candidate_semantic_module_for_cfg_guarded_public_items() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -2491,6 +2928,59 @@ pub struct UserId;
             .iter()
             .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
     );
+}
+
+#[test]
+fn analyze_workspace_skips_candidate_semantic_module_for_cfg_guarded_public_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod audit {}
+#[cfg(any())]
+pub mod audit_path {}
+pub mod audit_semantics {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module_unsupported_construct")
+            && diag.message.contains("`#[cfg]`")
+    }));
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_candidate_semantic_module_unsupported_construct_for_unrelated_cfg_guarded_public_modules()
+ {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[cfg(any())]
+pub mod user_profile {}
+pub mod audit_log {}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module_unsupported_construct")
+    }));
 }
 
 #[test]
@@ -2526,6 +3016,64 @@ declare_user_family!();
             .diagnostics
             .iter()
             .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_skips_internal_candidate_semantic_module_for_macro_generated_internal_items() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+macro_rules! declare_case_family {
+    () => {
+        struct CaseAuditArgs;
+    };
+}
+
+declare_case_family!();
+
+struct CaseDetailArgs;
+struct CaseHistoryArgs;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("internal_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_skips_internal_candidate_semantic_module_for_cfg_guarded_internal_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[cfg(any())]
+mod epic_fhir;
+mod epic_write_back;
+mod alpha_vendor_http;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("internal_candidate_semantic_module") })
     );
 }
 
