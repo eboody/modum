@@ -1222,6 +1222,156 @@ pub fn keep(submission: outbound::Submission) -> outbound::Submission {
 }
 
 #[test]
+fn analyze_workspace_prefers_promotable_parent_surface_for_alias_paths_with_redundant_canonical_leaf()
+ {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use crate::workflow::inbound::source_update as source_update_boundary;
+
+pub mod workflow {
+    pub mod inbound {
+        pub mod source_update {
+            pub trait SourceUpdate {}
+        }
+    }
+}
+
+pub fn keep(boundary: &dyn source_update_boundary::SourceUpdate) -> &dyn source_update_boundary::SourceUpdate {
+    boundary
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diag| diag.code() == Some("namespace_aliased_qualified_path"))
+        .expect("namespace alias diagnostic");
+    assert!(
+        diagnostic
+            .message
+            .contains("source_update_boundary::SourceUpdate")
+    );
+    assert!(
+        diagnostic
+            .message
+            .contains("prefer `inbound::SourceUpdate`")
+    );
+    assert!(diagnostic.fix.is_none());
+    assert_eq!(
+        report
+            .diagnostics
+            .iter()
+            .filter(|diag| {
+                diag.code() == Some("namespace_aliased_qualified_path")
+                    && diag
+                        .message
+                        .contains("source_update_boundary::SourceUpdate")
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn analyze_workspace_prefers_promotable_parent_surface_for_redundant_same_name_namespace_paths() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use crate::workflow::inbound::source_update;
+
+pub mod workflow {
+    pub mod inbound {
+        pub mod source_update {
+            pub trait SourceUpdate {}
+        }
+    }
+}
+
+pub fn keep(boundary: &dyn source_update::SourceUpdate) -> &dyn source_update::SourceUpdate {
+    boundary
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diag| diag.code() == Some("namespace_redundant_qualified_generic"))
+        .expect("redundant qualified path diagnostic");
+    assert!(diagnostic.message.contains("source_update::SourceUpdate"));
+    assert!(
+        diagnostic
+            .message
+            .contains("prefer `inbound::SourceUpdate`")
+    );
+    assert!(diagnostic.fix.is_none());
+    assert_eq!(
+        report
+            .diagnostics
+            .iter()
+            .filter(|diag| {
+                diag.code() == Some("namespace_redundant_qualified_generic")
+                    && diag.message.contains("source_update::SourceUpdate")
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn analyze_workspace_skips_promotable_parent_surface_when_ancestor_bindings_conflict() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use crate::workflow::inbound::source_update;
+
+pub struct SourceUpdate;
+
+pub mod workflow {
+    pub struct SourceUpdate;
+
+    pub mod inbound {
+        pub struct SourceUpdate;
+
+        pub mod source_update {
+            pub trait SourceUpdate {}
+        }
+    }
+}
+
+pub fn keep(boundary: &dyn source_update::SourceUpdate) -> &dyn source_update::SourceUpdate {
+    boundary
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_redundant_qualified_generic")
+            && diag.message.contains("source_update::SourceUpdate")
+    }));
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_preserve_module_imports_inside_same_namespace_subtree() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -2753,6 +2903,32 @@ pub struct ToQueryValue;
 }
 
 #[test]
+fn analyze_workspace_flags_candidate_semantic_module_for_high_signal_two_item_head_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct TransactionId;
+pub enum TransactionFailure {
+    Failed,
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module")
+            && diag.message.contains("TransactionId")
+            && diag.message.contains("TransactionFailure")
+            && diag.message.contains("transaction::{Failure, Id}")
+    }));
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_candidate_semantic_module_for_two_item_head_family() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -2913,6 +3089,38 @@ fn analyze_workspace_skips_candidate_semantic_module_for_cfg_guarded_public_item
 pub struct UserRepository;
 pub struct UserService;
 pub struct UserId;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_semantic_module_unsupported_construct")
+            && diag.message.contains("`#[cfg]`")
+    }));
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_skips_candidate_semantic_module_for_cfg_guarded_high_signal_two_item_head_family()
+ {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[cfg(any())]
+pub struct TransactionId;
+pub enum TransactionFailure {
+    Failed,
+}
 "#,
     )
     .expect("write lib");

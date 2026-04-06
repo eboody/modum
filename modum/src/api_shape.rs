@@ -4649,13 +4649,17 @@ fn analyze_candidate_semantic_modules(
     }
 
     for (_head, members) in families {
-        if members.len() < 3 {
+        let minimum_family_members = minimum_public_shared_head_family_members(&members, settings);
+        if members.len() < minimum_family_members {
             continue;
         }
 
-        let Some(choice) =
-            choose_public_shared_head_semantic_family(module_path, &child_modules, &members, 3)
-        else {
+        let Some(choice) = choose_public_shared_head_semantic_family(
+            module_path,
+            &child_modules,
+            &members,
+            minimum_family_members,
+        ) else {
             continue;
         };
 
@@ -5586,6 +5590,59 @@ fn choose_public_shared_head_semantic_family(
         members: members.to_vec(),
         suggestion,
     })
+}
+
+fn minimum_public_shared_head_family_members(
+    members: &[(usize, String)],
+    settings: &NamespaceSettings,
+) -> usize {
+    if public_two_item_head_family_is_semantic_candidate(members, settings) {
+        2
+    } else {
+        3
+    }
+}
+
+fn public_two_item_head_family_is_semantic_candidate(
+    members: &[(usize, String)],
+    settings: &NamespaceSettings,
+) -> bool {
+    if members.len() != 2 {
+        return false;
+    }
+
+    let member_segments = members
+        .iter()
+        .map(|(_, binding_name)| split_segments(binding_name))
+        .collect::<Vec<_>>();
+    let Some(shared_head_segments) =
+        candidate_semantic_module_shared_head_segments(&member_segments)
+    else {
+        return false;
+    };
+
+    let shorter_leaves = member_segments
+        .iter()
+        .map(|segments| {
+            let shorter_segments = &segments[shared_head_segments.len()..];
+            (shorter_segments.len() == 1)
+                .then(|| render_segments(shorter_segments, NameStyle::Pascal))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(shorter_leaves) = shorter_leaves else {
+        return false;
+    };
+    if shorter_leaves.iter().collect::<BTreeSet<_>>().len() != shorter_leaves.len() {
+        return false;
+    }
+
+    shorter_leaves
+        .iter()
+        .all(|leaf| public_two_item_semantic_leaf(leaf, settings))
+}
+
+fn public_two_item_semantic_leaf(leaf_name: &str, settings: &NamespaceSettings) -> bool {
+    settings.generic_nouns.contains(leaf_name) || looks_like_error_surface_type_name(leaf_name)
 }
 
 fn dominant_compound_head_minimum_family_members(

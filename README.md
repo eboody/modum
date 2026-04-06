@@ -311,7 +311,7 @@ These warn when imports or re-exports flatten a namespace that should stay visib
 - `namespace_flat_use_redundant_leaf_context`
   Warning for flattened imports or actionable rename-heavy aliases whose leaf repeats parent context. For plain imports, this only fires when the shorter leaf would be an actionable generic noun such as `Repository`, `Error`, or `Id`. For rename aliases, this only fires when the qualified form would still preserve real context, such as `http::StatusCode` or `page::Event`.
 - `namespace_redundant_qualified_generic`
-  Warning for qualified call-site paths whose module only repeats a generic category already named by the leaf, such as `response::Response` or `error::Error`.
+  Warning for qualified call-site paths whose module only repeats a generic category already named by the leaf, such as `response::Response` or `error::Error`. When the written path resolves through an imported namespace and a nearer parent surface would read better, it can recommend that promotable parent surface even if the export does not exist yet.
 - `namespace_prelude_glob_import`
   Warning for `use ...::prelude::*` imports that hide the real source modules and flatten call-site context.
 - `namespace_glob_preserve_module`
@@ -348,7 +348,7 @@ For these surface-shape rules, shared crate-visible surfaces such as `pub(crate)
 - `api_redundant_leaf_context`
   Warning for public leaves that repeat semantic module context already carried by the path, such as `user::UserRepository`, or that bake a sibling semantic module into a flat public leaf when `user::Repository` already exists.
 - `api_candidate_semantic_module`
-  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, through a shared head plus tail that points to a nested surface like `case::launch::{Inbox, Detail, Audit}`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`. It works on parsed source only and does not see macro expansion or cfg-pruned items.
+  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, through select 2-member high-signal pairs like `TransactionId` plus `TransactionFailure` or `HttpRequest` plus `HttpResponse`, through a shared head plus tail that points to a nested surface like `case::launch::{Inbox, Detail, Audit}`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`. It works on parsed source only and does not see macro expansion or cfg-pruned items.
 - `api_candidate_semantic_module_unsupported_construct`
   Advisory warning for scopes where semantic-module family inference was skipped because the parsed source includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`.
 - `api_manual_enum_string_helper`

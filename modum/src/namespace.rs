@@ -2,7 +2,8 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use syn::{
     ExprPath, File, Item, ItemConst, ItemEnum, ItemFn, ItemMod, ItemStatic, ItemStruct, ItemTrait,
-    ItemTraitAlias, ItemType, ItemUnion, ItemUse, Path as SynPath, TypePath, UseTree, Visibility,
+    ItemTraitAlias, ItemType, ItemUnion, ItemUse, Path as SynPath, TypeParamBound, TypePath,
+    UseTree, Visibility,
     spanned::Spanned,
     visit::{self, Visit},
 };
@@ -34,6 +35,12 @@ enum UseLeaf {
 struct ScopeUseBinding {
     binding: UseBinding,
     renamed: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct QualifiedPathSurfaceCandidate {
+    rendered_path: String,
+    fixable: bool,
 }
 
 pub(super) fn analyze_namespace_rules(
@@ -128,6 +135,19 @@ impl<'ast> Visit<'ast> for QualifiedCallsitePathVisitor<'_> {
             );
         }
         visit::visit_type_path(self, node);
+    }
+
+    fn visit_type_param_bound(&mut self, node: &'ast TypeParamBound) {
+        if let TypeParamBound::Trait(trait_bound) = node {
+            analyze_qualified_generic_path(
+                self.file,
+                &trait_bound.path,
+                self.settings,
+                self.diagnostics,
+                self.scope_use_bindings,
+            );
+        }
+        visit::visit_type_param_bound(self, node);
     }
 }
 
@@ -415,35 +435,67 @@ fn analyze_qualified_generic_path(
             &resolved_alias_path,
             settings,
         )
+        .map(|candidate| candidate.rendered_path)
         .unwrap_or_else(|| resolved_alias_path.join("::"));
         if preferred_path != rendered_path {
-            diagnostics.push(Diagnostic::policy(
+            let diagnostic = Diagnostic::policy(
                 Some(file.to_path_buf()),
                 Some(path.span().start().line),
                 "namespace_aliased_qualified_path",
                 format!(
                     "`{rendered_path}` flattens a semantic module path; prefer `{preferred_path}`"
                 ),
-            ));
+            );
+            if !namespace_diagnostic_already_emitted(diagnostics, &diagnostic) {
+                diagnostics.push(diagnostic);
+            }
             return;
         }
     }
 
+    let resolved_binding = resolved_namespace_binding(&full_path, scope_use_bindings);
+    let analysis_path = resolved_binding
+        .as_ref()
+        .map(|binding| render_resolved_namespace_binding_path(&full_path, binding))
+        .unwrap_or_else(|| full_path.clone());
     let Some(preferred_path) =
-        preferred_qualified_path_surface(file, &current_module_path, &full_path, settings)
+        preferred_qualified_path_surface(file, &current_module_path, &analysis_path, settings)
     else {
         return;
     };
 
-    diagnostics.push(
+    let diagnostic = if resolved_binding
+        .as_ref()
+        .is_some_and(|binding| binding.renamed)
+    {
+        Diagnostic::policy(
+            Some(file.to_path_buf()),
+            Some(path.span().start().line),
+            "namespace_aliased_qualified_path",
+            format!(
+                "`{rendered_path}` flattens a semantic module path; prefer `{}`",
+                preferred_path.rendered_path
+            ),
+        )
+    } else {
         Diagnostic::policy(
             Some(file.to_path_buf()),
             Some(path.span().start().line),
             "namespace_redundant_qualified_generic",
-            format!("`{rendered_path}` repeats a generic category; prefer `{preferred_path}`"),
+            format!(
+                "`{rendered_path}` repeats module context; prefer `{}`",
+                preferred_path.rendered_path
+            ),
         )
-        .with_fix(replace_path_fix(preferred_path.clone())),
-    );
+    };
+    let diagnostic = if preferred_path.fixable {
+        diagnostic.with_fix(replace_path_fix(preferred_path.rendered_path))
+    } else {
+        diagnostic
+    };
+    if !namespace_diagnostic_already_emitted(diagnostics, &diagnostic) {
+        diagnostics.push(diagnostic);
+    }
 }
 
 fn preferred_qualified_path_surface(
@@ -451,7 +503,7 @@ fn preferred_qualified_path_surface(
     current_module_path: &[String],
     full_path: &[String],
     settings: &NamespaceSettings,
-) -> Option<String> {
+) -> Option<QualifiedPathSurfaceCandidate> {
     let analysis_path = trim_relative_prefix(full_path);
     if analysis_path.len() < 2 {
         return None;
@@ -459,17 +511,33 @@ fn preferred_qualified_path_surface(
 
     let parent_module = &analysis_path[analysis_path.len() - 2];
     let leaf_name = &analysis_path[analysis_path.len() - 1];
-    if !qualified_generic_context_is_redundant(parent_module, leaf_name, settings) {
+    let repeated_generic_context =
+        qualified_generic_context_is_redundant(parent_module, leaf_name, settings);
+    let repeated_module_context = path_context_is_redundant(parent_module, leaf_name);
+    if !repeated_generic_context && !repeated_module_context {
         return None;
     }
 
-    let preferred_path =
-        qualified_generic_parent_surface_candidate(file, current_module_path, full_path, leaf_name);
-    if analysis_path.len() > 2 && preferred_path.is_none() {
-        return None;
+    if let Some(preferred_path) =
+        qualified_generic_parent_surface_candidate(file, current_module_path, full_path, leaf_name)
+    {
+        return Some(preferred_path);
     }
 
-    Some(preferred_path.unwrap_or_else(|| leaf_name.to_string()))
+    if let Some(preferred_path) = promotable_parent_surface_candidate(
+        file,
+        current_module_path,
+        full_path,
+        leaf_name,
+        settings,
+    ) {
+        return Some(preferred_path);
+    }
+
+    (repeated_generic_context && full_path.len() == 2).then(|| QualifiedPathSurfaceCandidate {
+        rendered_path: leaf_name.to_string(),
+        fixable: true,
+    })
 }
 
 fn resolved_namespace_alias_path(
@@ -492,6 +560,33 @@ fn resolved_namespace_alias_path(
     Some(resolved)
 }
 
+fn resolved_namespace_binding(
+    full_path: &[String],
+    scope_use_bindings: &[ScopeUseBinding],
+) -> Option<ScopeUseBinding> {
+    let binding_name = full_path.first()?;
+    let mut matches = scope_use_bindings.iter().filter(|binding| {
+        binding.binding.binding_name == *binding_name
+            && namespace_like_binding_name(&binding.binding.binding_name)
+            && actionable_namespace_binding(binding)
+    });
+    let binding = matches.next()?.clone();
+    if matches.next().is_some() {
+        return None;
+    }
+
+    Some(binding)
+}
+
+fn render_resolved_namespace_binding_path(
+    full_path: &[String],
+    binding: &ScopeUseBinding,
+) -> Vec<String> {
+    let mut resolved = binding.binding.full_path.clone();
+    resolved.extend(full_path.iter().skip(1).cloned());
+    resolved
+}
+
 fn actionable_namespace_alias(binding: &UseBinding) -> bool {
     matches!(
         detect_name_style(&binding.source_name),
@@ -500,6 +595,22 @@ fn actionable_namespace_alias(binding: &UseBinding) -> bool {
         detect_name_style(&binding.binding_name),
         super::NameStyle::Snake
     ) && alias_flattens_import_path(binding)
+}
+
+fn actionable_namespace_binding(binding: &ScopeUseBinding) -> bool {
+    if !namespace_like_binding_name(&binding.binding.binding_name) {
+        return false;
+    }
+
+    if binding.renamed {
+        return binding.binding.full_path.len() >= 2;
+    }
+
+    binding.binding.full_path.len() >= 2
+}
+
+fn namespace_like_binding_name(binding_name: &str) -> bool {
+    matches!(detect_name_style(binding_name), super::NameStyle::Snake)
 }
 
 fn alias_flattens_import_path(binding: &UseBinding) -> bool {
@@ -551,23 +662,102 @@ fn qualified_generic_parent_surface_candidate(
     current_module_path: &[String],
     full_path: &[String],
     leaf_name: &str,
-) -> Option<String> {
+) -> Option<QualifiedPathSurfaceCandidate> {
     if full_path.len() < 3 {
         return None;
     }
 
-    let parent_surface_prefix = &full_path[..full_path.len() - 2];
-    let resolved_parent_surface =
-        resolve_qualified_parent_surface_path(current_module_path, parent_surface_prefix)?;
-    let public_bindings = public_bindings_for_module(path, &resolved_parent_surface);
-    if !public_bindings.contains(leaf_name) {
+    for prefix_len in (1..=full_path.len() - 2).rev() {
+        let parent_surface_prefix = &full_path[..prefix_len];
+        let resolved_parent_surface =
+            resolve_qualified_parent_surface_path(current_module_path, parent_surface_prefix)?;
+        if !resolved_parent_surface.is_empty()
+            && !resolved_parent_surface_adds_net_context(&resolved_parent_surface, leaf_name, None)
+        {
+            continue;
+        }
+
+        let descendant_path = &full_path[prefix_len..];
+        if !module_publicly_reexports_descendant_leaf(
+            path,
+            &resolved_parent_surface,
+            descendant_path,
+        ) {
+            continue;
+        }
+
+        return Some(QualifiedPathSurfaceCandidate {
+            rendered_path: render_qualified_parent_surface(parent_surface_prefix, leaf_name),
+            fixable: true,
+        });
+    }
+
+    None
+}
+
+fn promotable_parent_surface_candidate(
+    path: &Path,
+    current_module_path: &[String],
+    full_path: &[String],
+    leaf_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<QualifiedPathSurfaceCandidate> {
+    if full_path.len() < 3 {
         return None;
     }
 
-    Some(render_qualified_parent_surface(
-        parent_surface_prefix,
-        leaf_name,
-    ))
+    for prefix_len in (1..=full_path.len() - 2).rev() {
+        let parent_surface_prefix = &full_path[..prefix_len];
+        let resolved_parent_surface =
+            resolve_qualified_parent_surface_path(current_module_path, parent_surface_prefix)?;
+        if !resolved_parent_surface_adds_net_context(
+            &resolved_parent_surface,
+            leaf_name,
+            Some(settings),
+        ) {
+            continue;
+        }
+
+        let existing_bindings = module_bindings_for_module(path, &resolved_parent_surface);
+        if existing_bindings.contains(leaf_name) {
+            continue;
+        }
+
+        let Some(parent_module) = resolved_parent_surface.last() else {
+            continue;
+        };
+        return Some(QualifiedPathSurfaceCandidate {
+            rendered_path: format!("{parent_module}::{leaf_name}"),
+            fixable: false,
+        });
+    }
+
+    None
+}
+
+fn resolved_parent_surface_adds_net_context(
+    resolved_parent_surface: &[String],
+    leaf_name: &str,
+    settings: Option<&NamespaceSettings>,
+) -> bool {
+    let Some(parent_module) = resolved_parent_surface.last() else {
+        return false;
+    };
+    if path_context_is_redundant(parent_module, leaf_name) {
+        return false;
+    }
+
+    if let Some(settings) = settings {
+        let normalized_parent = parent_module.to_ascii_lowercase();
+        if settings.weak_modules.contains(&normalized_parent)
+            || settings.catch_all_modules.contains(&normalized_parent)
+            || settings.organizational_modules.contains(&normalized_parent)
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn resolve_qualified_parent_surface_path(
@@ -1040,7 +1230,11 @@ fn qualified_generic_context_is_redundant(
     leaf_name: &str,
     settings: &NamespaceSettings,
 ) -> bool {
-    parent_module.eq_ignore_ascii_case(leaf_name) && matches_generic_noun(leaf_name, settings)
+    path_context_is_redundant(parent_module, leaf_name) && matches_generic_noun(leaf_name, settings)
+}
+
+fn path_context_is_redundant(parent_module: &str, leaf_name: &str) -> bool {
+    normalized_segments(parent_module) == normalized_segments(leaf_name)
 }
 
 fn trim_relative_prefix(full_path: &[String]) -> &[String] {
@@ -1114,6 +1308,18 @@ fn canonical_parent_surface_message(
 }
 
 fn public_bindings_for_module(path: &Path, module_path: &[String]) -> BTreeSet<String> {
+    bindings_for_module(path, module_path, true)
+}
+
+fn module_bindings_for_module(path: &Path, module_path: &[String]) -> BTreeSet<String> {
+    bindings_for_module(path, module_path, false)
+}
+
+fn bindings_for_module(path: &Path, module_path: &[String], public_only: bool) -> BTreeSet<String> {
+    if let Some(bindings) = inline_module_bindings_for_module(path, module_path, public_only) {
+        return bindings;
+    }
+
     let Some(src_root) = source_root(path) else {
         return BTreeSet::new();
     };
@@ -1125,18 +1331,149 @@ fn public_bindings_for_module(path: &Path, module_path: &[String]) -> BTreeSet<S
         let Ok(parsed) = syn::parse_file(&src) else {
             continue;
         };
-        return collect_public_bindings(&parsed.items);
+        return collect_bindings(&parsed.items, public_only);
     }
 
     BTreeSet::new()
 }
 
-fn collect_public_bindings(items: &[Item]) -> BTreeSet<String> {
+fn module_publicly_reexports_descendant_leaf(
+    path: &Path,
+    module_path: &[String],
+    descendant_path: &[String],
+) -> bool {
+    if descendant_path.is_empty() {
+        return false;
+    }
+
+    if let Some(items) = inline_module_items_for_module(path, module_path) {
+        return items_publicly_reexport_descendant_leaf(&items, module_path, descendant_path);
+    }
+
+    let Some(src_root) = source_root(path) else {
+        return false;
+    };
+
+    for candidate in parent_module_files(&src_root, module_path) {
+        let Ok(src) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = syn::parse_file(&src) else {
+            continue;
+        };
+        return items_publicly_reexport_descendant_leaf(
+            &parsed.items,
+            module_path,
+            descendant_path,
+        );
+    }
+
+    false
+}
+
+fn items_publicly_reexport_descendant_leaf(
+    items: &[Item],
+    module_path: &[String],
+    descendant_path: &[String],
+) -> bool {
+    let expected_path = module_path
+        .iter()
+        .cloned()
+        .chain(descendant_path.iter().cloned())
+        .collect::<Vec<_>>();
+    let expected_leaf = descendant_path
+        .last()
+        .expect("descendant path is non-empty");
+
+    items.iter().any(|item| {
+        let Item::Use(item_use) = item else {
+            return false;
+        };
+        if matches!(item_use.vis, Visibility::Inherited) {
+            return false;
+        }
+
+        let mut leaves = Vec::new();
+        flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+        leaves.into_iter().any(|leaf| {
+            let binding = match leaf {
+                UseLeaf::Direct(binding) | UseLeaf::Rename(binding) => binding,
+                UseLeaf::Glob(_) => return false,
+            };
+            if &binding.binding_name != expected_leaf {
+                return false;
+            }
+
+            let resolved_prefix = resolve_qualified_parent_surface_path(
+                module_path,
+                &binding.full_path[..binding.full_path.len() - 1],
+            );
+            let Some(mut resolved_path) = resolved_prefix else {
+                return false;
+            };
+            resolved_path.push(binding.source_name);
+            resolved_path == expected_path
+        })
+    })
+}
+
+fn inline_module_bindings_for_module(
+    path: &Path,
+    module_path: &[String],
+    public_only: bool,
+) -> Option<BTreeSet<String>> {
+    let current_module_path = inferred_file_module_path(path);
+    if module_path.len() < current_module_path.len()
+        || !module_path.starts_with(&current_module_path)
+    {
+        return None;
+    }
+
+    let src = fs::read_to_string(path).ok()?;
+    let parsed = syn::parse_file(&src).ok()?;
+    let nested_path = &module_path[current_module_path.len()..];
+    let items = nested_inline_module_items(&parsed.items, nested_path)?;
+    Some(collect_bindings(items, public_only))
+}
+
+fn nested_inline_module_items<'a>(items: &'a [Item], path: &[String]) -> Option<&'a [Item]> {
+    let Some((head, tail)) = path.split_first() else {
+        return Some(items);
+    };
+
+    let module = items.iter().find_map(|item| {
+        let Item::Mod(item_mod) = item else {
+            return None;
+        };
+        (item_mod.ident == head.as_str()).then_some(item_mod)
+    })?;
+    let (_, nested) = module.content.as_ref()?;
+    nested_inline_module_items(nested, tail)
+}
+
+fn inline_module_items_for_module(path: &Path, module_path: &[String]) -> Option<Vec<Item>> {
+    let current_module_path = inferred_file_module_path(path);
+    if module_path.len() < current_module_path.len()
+        || !module_path.starts_with(&current_module_path)
+    {
+        return None;
+    }
+
+    let src = fs::read_to_string(path).ok()?;
+    let parsed = syn::parse_file(&src).ok()?;
+    let nested_path = &module_path[current_module_path.len()..];
+    let items = nested_inline_module_items(&parsed.items, nested_path)?;
+    Some(items.to_vec())
+}
+
+fn collect_bindings(items: &[Item], public_only: bool) -> BTreeSet<String> {
     let mut bindings = BTreeSet::new();
 
     for item in items {
         match item {
-            Item::Use(item_use) if !matches!(item_use.vis, Visibility::Inherited) => {
+            Item::Use(item_use)
+                if !public_only || !matches!(item_use.vis, Visibility::Inherited) =>
+            {
                 let mut leaves = Vec::new();
                 flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
                 for leaf in leaves {
@@ -1151,7 +1488,7 @@ fn collect_public_bindings(items: &[Item]) -> BTreeSet<String> {
             }
             _ => {
                 if let Some((binding_name, is_public)) = public_item_binding(item)
-                    && is_public
+                    && (!public_only || is_public)
                 {
                     bindings.insert(binding_name);
                 }
@@ -1205,6 +1542,19 @@ fn render_canonical_parent_surface(
     }
 
     format!("{}::{binding_name}", module_path.join("::"))
+}
+
+fn namespace_diagnostic_already_emitted(
+    diagnostics: &[Diagnostic],
+    candidate: &Diagnostic,
+) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        diagnostic.code() == candidate.code()
+            && diagnostic.file == candidate.file
+            && diagnostic.line == candidate.line
+            && diagnostic.message == candidate.message
+            && diagnostic.fix == candidate.fix
+    })
 }
 
 fn module_path_contains_namespace(module_path: &[String], namespace: &str) -> bool {
