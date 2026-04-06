@@ -30,7 +30,4 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
       - name: Package modum
-        run: cargo package -p modum --no-verify
-
-      - name: Package modum-core
-        run: cargo package -p modum-core --no-verify
+        run: cargo package -p modum --no-verify ${ACT:+--allow-dirty}

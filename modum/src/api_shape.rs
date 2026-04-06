@@ -52,6 +52,12 @@ struct SemanticModuleSurfaceCandidate {
     shorter_leaf: String,
 }
 
+#[derive(Clone, Copy)]
+struct PublicLeafAnalysisTarget<'a> {
+    leaf_name: &'a str,
+    source_use_leaf: Option<&'a PublicUseLeaf>,
+}
+
 #[derive(Clone)]
 struct ChildModuleSurfaceExport {
     parent_binding: String,
@@ -553,8 +559,10 @@ fn analyze_public_use_item(
             line,
             scope_items,
             module_path,
-            &leaf.binding_name,
-            Some(&leaf),
+            PublicLeafAnalysisTarget {
+                leaf_name: &leaf.binding_name,
+                source_use_leaf: Some(&leaf),
+            },
             settings,
             diagnostics,
         );
@@ -5512,12 +5520,12 @@ fn choose_public_shared_head_semantic_family(
 
             let candidate_members = members
                 .iter()
-                .cloned()
                 .filter(|(_, binding_name)| {
                     let binding_segments = split_segments(binding_name);
                     binding_segments.len() > prefix_len
                         && segments_start_with_normalized(&binding_segments, &prefix)
                 })
+                .cloned()
                 .collect::<Vec<_>>();
             if candidate_members.len() < dominant_compound_minimum
                 || shared_head_candidate_redundant_with_parent_module(
@@ -5969,8 +5977,10 @@ fn analyze_item_shape(
             line,
             scope_items,
             module_path,
-            &leaf_name,
-            None,
+            PublicLeafAnalysisTarget {
+                leaf_name: &leaf_name,
+                source_use_leaf: None,
+            },
             settings,
             diagnostics,
         );
@@ -5984,18 +5994,19 @@ fn analyze_public_leaf(
     line: usize,
     scope_items: &[Item],
     module_path: &[String],
-    leaf_name: &str,
-    source_use_leaf: Option<&PublicUseLeaf>,
+    target: PublicLeafAnalysisTarget<'_>,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let leaf_name = target.leaf_name;
+
     if let Some(preferred_path) =
         semantic_module_surface_candidate(path, scope_items, module_path, leaf_name, settings)
             .filter(|candidate| {
                 !scope_has_shorter_sibling_surface_export(
                     scope_items,
                     module_path,
-                    source_use_leaf,
+                    target.source_use_leaf,
                     candidate,
                 )
             })
