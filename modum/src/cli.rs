@@ -1,4 +1,11 @@
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use modum::{
     AnalysisSettings, CheckMode, DiagnosticSelection, ScanSettings, diagnostic_code_info,
@@ -11,6 +18,8 @@ enum OutputFormat {
     Text,
     Json,
 }
+
+const MARKDOWN_REPORT_FILENAME_PREFIX: &str = "modum-lint-report-";
 
 impl std::str::FromStr for OutputFormat {
     type Err = String;
@@ -63,7 +72,8 @@ fn run_check_command(
     mut args: impl Iterator<Item = String>,
     command_prefix: &'static str,
 ) -> Result<ExitCode, String> {
-    let mut root = env::current_dir().map_err(|err| format!("failed to get current dir: {err}"))?;
+    let run_dir = env::current_dir().map_err(|err| format!("failed to get current dir: {err}"))?;
+    let mut root = run_dir.clone();
     let mut scan_settings = ScanSettings::default();
     let mut explain_code = None;
     let mut profile = None;
@@ -76,6 +86,7 @@ fn run_check_command(
     let mut selection = DiagnosticSelection::All;
     let mut baseline = None;
     let mut write_baseline = None;
+    let mut should_write_markdown_report = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -152,6 +163,9 @@ fn run_check_command(
                     .ok_or_else(|| "--write-baseline requires a path value".to_string())?;
                 write_baseline = Some(PathBuf::from(value));
             }
+            "--write-markdown-report" | "-w" => {
+                should_write_markdown_report = true;
+            }
             "--help" | "-h" => {
                 println!("{}", check_usage(command_prefix));
                 return Ok(ExitCode::from(0));
@@ -207,11 +221,13 @@ fn run_check_command(
             path.display()
         );
     }
+    let text_report = render_pretty_report_with_selection(&outcome.report, selection);
+    if should_write_markdown_report {
+        let report_path = write_markdown_report(&run_dir, &text_report)?;
+        eprintln!("wrote markdown report {}", report_path.display());
+    }
     match format {
-        OutputFormat::Text => print!(
-            "{}",
-            render_pretty_report_with_selection(&outcome.report, selection)
-        ),
+        OutputFormat::Text => print!("{text_report}"),
         OutputFormat::Json => {
             println!(
                 "{}",
@@ -259,11 +275,65 @@ fn top_level_usage(command_prefix: &'static str) -> String {
     .join("\n")
 }
 
+fn write_markdown_report(run_dir: &Path, text_report: &str) -> Result<PathBuf, String> {
+    let markdown = format!(
+        "# modum lint report\n\n```text\n{}```\n",
+        text_report.trim_end()
+    );
+    let timestamp_secs = current_timestamp_secs()?;
+
+    for collision_index in 0.. {
+        let report_path = run_dir.join(markdown_report_filename(timestamp_secs, collision_index));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&report_path)
+        {
+            Ok(mut file) => {
+                file.write_all(markdown.as_bytes()).map_err(|err| {
+                    format!(
+                        "failed to write markdown report {}: {err}",
+                        report_path.display()
+                    )
+                })?;
+                return Ok(report_path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to create markdown report {}: {err}",
+                    report_path.display()
+                ));
+            }
+        }
+    }
+
+    unreachable!("collision index iterator is unbounded")
+}
+
+fn current_timestamp_secs() -> Result<u64, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("failed to get current timestamp: {err}"))?;
+    Ok(timestamp.as_secs())
+}
+
+fn markdown_report_filename(timestamp_secs: u64, collision_index: usize) -> String {
+    if collision_index == 0 {
+        return format!("{MARKDOWN_REPORT_FILENAME_PREFIX}{timestamp_secs}.md");
+    }
+
+    format!(
+        "{MARKDOWN_REPORT_FILENAME_PREFIX}{timestamp_secs}-{}.md",
+        collision_index + 1
+    )
+}
+
 fn check_usage(command_prefix: &'static str) -> String {
     [
         "Usage:",
         &format!(
-            "  {} check [--root <path>] [--include <path-or-glob>]... [--exclude <path-or-glob>]... [--profile core|surface|strict] [--ignore <code>]... [--baseline <path>] [--write-baseline <path>] [--show all|policy|advisory] [--mode off|warn|deny] [--format text|json] [--explain <code>]",
+            "  {} check [--root <path>] [--include <path-or-glob>]... [--exclude <path-or-glob>]... [--profile core|surface|strict] [--ignore <code>]... [--baseline <path>] [--write-baseline <path>] [--write-markdown-report|-w] [--show all|policy|advisory] [--mode off|warn|deny] [--format text|json] [--explain <code>]",
             command_prefix
         ),
         "",
@@ -271,6 +341,7 @@ fn check_usage(command_prefix: &'static str) -> String {
         &format!("  {command_prefix} check"),
         &format!("  {command_prefix} check --mode warn"),
         &format!("  {command_prefix} check --profile core"),
+        &format!("  {command_prefix} check -w"),
         &format!("  {command_prefix} check --ignore api_candidate_semantic_module"),
         &format!("  {command_prefix} check --write-baseline .modum-baseline.json"),
         &format!("  {command_prefix} check --baseline .modum-baseline.json"),

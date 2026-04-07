@@ -376,6 +376,8 @@ fn cli_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("--ignore <code>"));
     assert!(check_help_out.contains("--baseline <path>"));
     assert!(check_help_out.contains("--write-baseline <path>"));
+    assert!(check_help_out.contains("--write-markdown-report|-w"));
+    assert!(check_help_out.contains("check -w"));
     assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_modum"))
@@ -405,6 +407,8 @@ fn cargo_subcommand_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("--ignore <code>"));
     assert!(check_help_out.contains("--baseline <path>"));
     assert!(check_help_out.contains("--write-baseline <path>"));
+    assert!(check_help_out.contains("--write-markdown-report|-w"));
+    assert!(check_help_out.contains("check -w"));
     assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_cargo-modum"))
@@ -425,6 +429,7 @@ fn cli_json_output_reports_policy_diagnostics() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -454,6 +459,7 @@ fn cargo_subcommand_json_output_reports_policy_diagnostics() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-modum"))
+        .current_dir(root)
         .args([
             "modum",
             "check",
@@ -480,6 +486,7 @@ fn cli_json_output_includes_fix_metadata_for_direct_path_rewrites() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -513,6 +520,7 @@ fn cli_text_output_can_filter_to_advisories() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -538,6 +546,7 @@ fn cli_text_output_shows_profile_and_fix_hint() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args(["check", "--root", root.to_str().expect("utf8 root")])
         .output()
         .expect("run modum check");
@@ -617,6 +626,7 @@ fn cli_ignore_suppresses_matching_diagnostic_code() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -653,6 +663,7 @@ fn cli_write_baseline_then_apply_it() {
     let baseline_path = root.join(".modum/baseline.json");
 
     let write_output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -675,6 +686,7 @@ fn cli_write_baseline_then_apply_it() {
     assert_eq!(baseline["diagnostics"].as_array().map(Vec::len), Some(2));
 
     let apply_output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -701,6 +713,7 @@ fn cli_metadata_baseline_path_is_used_when_present() {
     let root = temp.path();
 
     let write_output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -715,6 +728,7 @@ fn cli_metadata_baseline_path_is_used_when_present() {
     assert_eq!(write_output.status.code(), Some(0));
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -734,11 +748,161 @@ fn cli_metadata_baseline_path_is_used_when_present() {
 }
 
 #[test]
+fn cli_does_not_write_markdown_report_without_flag() {
+    let temp = write_policy_and_advisory_fixture();
+    let root = temp.path();
+    let run_dir = tempdir().expect("create run dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(run_dir.path())
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        !fs::read_dir(run_dir.path())
+            .expect("read run dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("modum-lint-report-") && name.ends_with(".md")
+                    })
+            })
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("wrote markdown report"));
+
+    let _: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+}
+
+#[test]
+fn cli_writes_markdown_report_in_invocation_directory() {
+    let temp = write_policy_and_advisory_fixture();
+    let root = temp.path();
+    let run_dir = tempdir().expect("create run dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(run_dir.path())
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "-w",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(2));
+    let reports = fs::read_dir(run_dir.path())
+        .expect("read run dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("modum-lint-report-") && name.ends_with(".md"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 1);
+    let report_name = reports[0]
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("report file name");
+    let timestamp_stem = report_name
+        .strip_prefix("modum-lint-report-")
+        .and_then(|name| name.strip_suffix(".md"))
+        .expect("timestamped report name");
+    assert!(!timestamp_stem.is_empty());
+    assert!(timestamp_stem.chars().all(|ch| ch.is_ascii_digit()));
+    assert!(
+        !fs::read_dir(root)
+            .expect("read root dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("modum-lint-report-") && name.ends_with(".md")
+                    })
+            })
+    );
+
+    let markdown = fs::read_to_string(&reports[0]).expect("read markdown report");
+    assert!(markdown.starts_with("# modum lint report\n\n```text\n"));
+    assert!(markdown.contains("Policy Diagnostics:"));
+    assert!(markdown.contains("Advisory Diagnostics:"));
+    assert!(markdown.contains("namespace_redundant_qualified_generic"));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("wrote markdown report"));
+    assert!(stderr.contains("modum-lint-report-"));
+    assert!(stderr.contains(".md"));
+
+    let _: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+}
+
+#[test]
+fn cli_writes_distinct_timestamped_markdown_reports_across_runs() {
+    let temp = write_policy_and_advisory_fixture();
+    let root = temp.path();
+    let run_dir = tempdir().expect("create run dir");
+
+    for _ in 0..2 {
+        let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+            .current_dir(run_dir.path())
+            .args([
+                "check",
+                "--root",
+                root.to_str().expect("utf8 root"),
+                "--write-markdown-report",
+                "--format",
+                "json",
+            ])
+            .output()
+            .expect("run modum check");
+        assert_eq!(output.status.code(), Some(2));
+    }
+
+    let reports = fs::read_dir(run_dir.path())
+        .expect("read run dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("modum-lint-report-") && name.ends_with(".md"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 2);
+
+    let first_name = reports[0]
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("first report file name");
+    let second_name = reports[1]
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("second report file name");
+    assert_ne!(first_name, second_name);
+    assert!(first_name.starts_with("modum-lint-report-"));
+    assert!(second_name.starts_with("modum-lint-report-"));
+}
+
+#[test]
 fn cli_profile_core_hides_strict_advisories() {
     let temp = write_policy_and_advisory_fixture();
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -774,6 +938,7 @@ fn cli_profile_surface_includes_surface_and_hides_strict_advisories() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -809,6 +974,7 @@ fn cli_invalid_profile_reports_error() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -830,6 +996,7 @@ fn cli_invalid_ignore_reports_error() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -851,6 +1018,7 @@ fn cli_respects_workspace_metadata_exclude_defaults() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -881,6 +1049,7 @@ fn cli_invalid_exclude_pattern_reports_error() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -915,6 +1084,7 @@ fn cli_invalid_generic_nouns_metadata_reports_error() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -947,6 +1117,7 @@ fn cli_invalid_scan_default_metadata_reports_error() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -979,6 +1150,7 @@ fn cli_invalid_profile_metadata_reports_error() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -1013,6 +1185,7 @@ fn cli_invalid_ignored_diagnostic_codes_metadata_reports_error() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -1047,6 +1220,7 @@ fn cli_invalid_semantic_scalar_metadata_reports_error() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -1081,6 +1255,7 @@ fn cli_invalid_namespace_preserving_override_metadata_reports_error() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -1115,6 +1290,7 @@ fn cli_package_metadata_profile_sets_default_filter() {
     let root = temp.path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
