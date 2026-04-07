@@ -1,16 +1,17 @@
 use std::{
     env,
+    fmt::Write as _,
     fs::OpenOptions,
-    io::Write,
+    io::Write as _,
     path::{Path, PathBuf},
     process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use modum::{
-    AnalysisSettings, CheckMode, DiagnosticSelection, ScanSettings, diagnostic_code_info,
-    render_diagnostic_explanation, render_pretty_report_with_selection, run_check_with_settings,
-    write_diagnostic_baseline,
+    AnalysisSettings, CheckMode, Diagnostic, DiagnosticLevel, DiagnosticSelection, ScanSettings,
+    WorkspaceReport, diagnostic_code_info, render_diagnostic_explanation,
+    render_pretty_report_with_selection, run_check_with_settings, write_diagnostic_baseline,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,14 @@ enum OutputFormat {
 }
 
 const MARKDOWN_REPORT_FILENAME_PREFIX: &str = "modum-lint-report-";
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
+const ANSI_BOLD_RED: &str = "\x1b[1;31m";
+const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
+const ANSI_BOLD_BLUE: &str = "\x1b[1;34m";
+const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
+const ANSI_BOLD_WHITE: &str = "\x1b[1;37m";
+const ANSI_DIM: &str = "\x1b[2m";
 
 impl std::str::FromStr for OutputFormat {
     type Err = String;
@@ -87,6 +96,7 @@ fn run_check_command(
     let mut baseline = None;
     let mut write_baseline = None;
     let mut should_write_markdown_report = false;
+    let mut pretty_text = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -166,6 +176,9 @@ fn run_check_command(
             "--write-markdown-report" | "-w" => {
                 should_write_markdown_report = true;
             }
+            "--pretty" | "-p" => {
+                pretty_text = true;
+            }
             "--help" | "-h" => {
                 println!("{}", check_usage(command_prefix));
                 return Ok(ExitCode::from(0));
@@ -203,6 +216,10 @@ fn run_check_command(
         );
     }
 
+    if format == OutputFormat::Json && pretty_text {
+        return Err("--pretty is only available with text output".to_string());
+    }
+
     let outcome = run_check_with_settings(
         &root,
         &AnalysisSettings {
@@ -221,13 +238,20 @@ fn run_check_command(
             path.display()
         );
     }
-    let text_report = render_pretty_report_with_selection(&outcome.report, selection);
+    let plain_text_report = render_pretty_report_with_selection(&outcome.report, selection);
     if should_write_markdown_report {
-        let report_path = write_markdown_report(&run_dir, &text_report)?;
+        let report_path = write_markdown_report(&run_dir, &plain_text_report)?;
         eprintln!("wrote markdown report {}", report_path.display());
     }
     match format {
-        OutputFormat::Text => print!("{text_report}"),
+        OutputFormat::Text => {
+            let text_report = if pretty_text {
+                render_pretty_cli_report(&outcome.report, selection)
+            } else {
+                plain_text_report
+            };
+            print!("{text_report}");
+        }
         OutputFormat::Json => {
             println!(
                 "{}",
@@ -258,6 +282,162 @@ fn print_explanation(code: &str) -> Result<(), String> {
         .ok_or_else(|| format!("unknown diagnostic code `{code}`"))?;
     println!("{rendered}");
     Ok(())
+}
+
+fn render_pretty_cli_report(report: &WorkspaceReport, selection: DiagnosticSelection) -> String {
+    let filtered = report.filtered(selection);
+    let mut out = String::new();
+
+    let _ = writeln!(&mut out, "{}", ansi("modum lint report", ANSI_BOLD_CYAN));
+    let _ = writeln!(&mut out, "{}", ansi("=================", ANSI_DIM));
+    let _ = writeln!(&mut out);
+
+    render_summary_row(
+        &mut out,
+        "Files scanned",
+        &filtered.scanned_files.to_string(),
+        ANSI_BOLD_WHITE,
+    );
+    render_summary_row(
+        &mut out,
+        "Files with violations",
+        &filtered.files_with_violations.to_string(),
+        ANSI_BOLD_WHITE,
+    );
+    render_summary_row(
+        &mut out,
+        "Errors",
+        &filtered.error_count().to_string(),
+        ANSI_BOLD_RED,
+    );
+    render_summary_row(
+        &mut out,
+        "Policy warnings",
+        &filtered.policy_warning_count().to_string(),
+        ANSI_BOLD_YELLOW,
+    );
+    render_summary_row(
+        &mut out,
+        "Advisory warnings",
+        &filtered.advisory_warning_count().to_string(),
+        ANSI_BOLD_BLUE,
+    );
+    if let Some(selection_label) = selection.report_label() {
+        render_summary_row(&mut out, "Showing", selection_label, ANSI_BOLD_WHITE);
+        let _ = writeln!(
+            &mut out,
+            "  {:<22} {}",
+            "",
+            ansi("(exit code still reflects the full report)", ANSI_DIM)
+        );
+    }
+
+    if filtered.diagnostics.is_empty() {
+        let _ = writeln!(&mut out);
+        let _ = writeln!(
+            &mut out,
+            "{}",
+            ansi("No diagnostics found.", ANSI_BOLD_GREEN)
+        );
+        return out;
+    }
+
+    let errors = filtered
+        .diagnostics
+        .iter()
+        .filter(|diag| diag.is_error())
+        .collect::<Vec<_>>();
+    let policy = filtered
+        .diagnostics
+        .iter()
+        .filter(|diag| diag.is_policy_warning())
+        .collect::<Vec<_>>();
+    let advisory = filtered
+        .diagnostics
+        .iter()
+        .filter(|diag| diag.is_advisory_warning())
+        .collect::<Vec<_>>();
+
+    let _ = writeln!(&mut out);
+    render_pretty_diagnostic_section(&mut out, "Errors", &errors, ANSI_BOLD_RED);
+    render_pretty_diagnostic_section(&mut out, "Policy Diagnostics", &policy, ANSI_BOLD_YELLOW);
+    render_pretty_diagnostic_section(&mut out, "Advisory Diagnostics", &advisory, ANSI_BOLD_BLUE);
+
+    out
+}
+
+fn render_summary_row(out: &mut String, label: &str, value: &str, value_style: &str) {
+    let _ = writeln!(
+        out,
+        "  {:<22} {}",
+        format!("{label}:"),
+        ansi(value, value_style)
+    );
+}
+
+fn render_pretty_diagnostic_section(
+    out: &mut String,
+    title: &str,
+    diagnostics: &[&Diagnostic],
+    accent_style: &str,
+) {
+    if diagnostics.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(
+        out,
+        "{} {}",
+        ansi(title, accent_style),
+        ansi(format!("({})", diagnostics.len()), ANSI_DIM)
+    );
+    let _ = writeln!(out, "{}", ansi("----------------------", ANSI_DIM));
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        let badge = match diagnostic.level() {
+            DiagnosticLevel::Warning => ansi("warning", accent_style),
+            DiagnosticLevel::Error => ansi("error", ANSI_BOLD_RED),
+        };
+        let code = match (diagnostic.code(), diagnostic.profile()) {
+            (Some(code), Some(profile)) => format!("{code} | {}", profile.as_str()),
+            (Some(code), None) => code.to_string(),
+            (None, _) => "tool".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "  {} {} {}",
+            ansi(format!("{:>2}.", index + 1), ANSI_DIM),
+            badge,
+            ansi(code, ANSI_BOLD_WHITE)
+        );
+
+        if let Some(file) = &diagnostic.file {
+            let location = match diagnostic.line {
+                Some(line) => format!("{}:{line}", file.display()),
+                None => file.display().to_string(),
+            };
+            let _ = writeln!(out, "      {} {}", ansi("at", ANSI_DIM), location);
+        }
+
+        let _ = writeln!(out, "      {}", diagnostic.message);
+
+        if let Some(fix) = &diagnostic.fix {
+            let _ = writeln!(
+                out,
+                "      {} {}",
+                ansi("fix:", ANSI_BOLD_GREEN),
+                fix.replacement
+            );
+        }
+
+        if index + 1 != diagnostics.len() {
+            let _ = writeln!(out);
+        }
+    }
+    let _ = writeln!(out);
+}
+
+fn ansi(text: impl std::fmt::Display, style: &str) -> String {
+    format!("{style}{text}{ANSI_RESET}")
 }
 
 fn top_level_usage(command_prefix: &'static str) -> String {
@@ -333,7 +513,7 @@ fn check_usage(command_prefix: &'static str) -> String {
     [
         "Usage:",
         &format!(
-            "  {} check [--root <path>] [--include <path-or-glob>]... [--exclude <path-or-glob>]... [--profile core|surface|strict] [--ignore <code>]... [--baseline <path>] [--write-baseline <path>] [--write-markdown-report|-w] [--show all|policy|advisory] [--mode off|warn|deny] [--format text|json] [--explain <code>]",
+            "  {} check [--root <path>] [--include <path-or-glob>]... [--exclude <path-or-glob>]... [--profile core|surface|strict] [--ignore <code>]... [--baseline <path>] [--write-baseline <path>] [--write-markdown-report|-w] [--pretty|-p] [--show all|policy|advisory] [--mode off|warn|deny] [--format text|json] [--explain <code>]",
             command_prefix
         ),
         "",
@@ -342,6 +522,7 @@ fn check_usage(command_prefix: &'static str) -> String {
         &format!("  {command_prefix} check --mode warn"),
         &format!("  {command_prefix} check --profile core"),
         &format!("  {command_prefix} check -w"),
+        &format!("  {command_prefix} check -p"),
         &format!("  {command_prefix} check --ignore api_candidate_semantic_module"),
         &format!("  {command_prefix} check --write-baseline .modum-baseline.json"),
         &format!("  {command_prefix} check --baseline .modum-baseline.json"),

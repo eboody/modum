@@ -377,7 +377,9 @@ fn cli_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("--baseline <path>"));
     assert!(check_help_out.contains("--write-baseline <path>"));
     assert!(check_help_out.contains("--write-markdown-report|-w"));
+    assert!(check_help_out.contains("--pretty|-p"));
     assert!(check_help_out.contains("check -w"));
+    assert!(check_help_out.contains("check -p"));
     assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_modum"))
@@ -408,7 +410,9 @@ fn cargo_subcommand_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("--baseline <path>"));
     assert!(check_help_out.contains("--write-baseline <path>"));
     assert!(check_help_out.contains("--write-markdown-report|-w"));
+    assert!(check_help_out.contains("--pretty|-p"));
     assert!(check_help_out.contains("check -w"));
+    assert!(check_help_out.contains("check -p"));
     assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_cargo-modum"))
@@ -515,6 +519,29 @@ fn cli_json_output_includes_fix_metadata_for_direct_path_rewrites() {
 }
 
 #[test]
+fn cli_pretty_flag_requires_text_output() {
+    let temp = write_json_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "--format",
+            "json",
+            "-p",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(1));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--pretty is only available with text output"));
+}
+
+#[test]
 fn cli_text_output_can_filter_to_advisories() {
     let temp = write_policy_and_advisory_fixture();
     let root = temp.path();
@@ -555,6 +582,35 @@ fn cli_text_output_shows_profile_and_fix_hint() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("namespace_redundant_qualified_generic, core"));
     assert!(stdout.contains("[fix: Response]"));
+}
+
+#[test]
+fn cli_pretty_output_adds_formatting_and_color() {
+    let temp = write_policy_and_advisory_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "-p",
+            "--show",
+            "advisory",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\u{1b}["));
+    assert!(stdout.contains("Files scanned:"));
+    assert!(stdout.contains("Showing:"));
+    assert!(stdout.contains("Advisory Diagnostics"));
+    assert!(stdout.contains("api_candidate_semantic_module | strict"));
+    assert!(stdout.contains("(exit code still reflects the full report)"));
+    assert!(!stdout.contains("Policy Diagnostics"));
 }
 
 #[test]
@@ -848,6 +904,45 @@ fn cli_writes_markdown_report_in_invocation_directory() {
     assert!(stderr.contains(".md"));
 
     let _: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+}
+
+#[test]
+fn cli_pretty_output_keeps_markdown_report_plain() {
+    let temp = write_policy_and_advisory_fixture();
+    let root = temp.path();
+    let run_dir = tempdir().expect("create run dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(run_dir.path())
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "-p",
+            "-w",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(2));
+
+    let reports = fs::read_dir(run_dir.path())
+        .expect("read run dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("modum-lint-report-") && name.ends_with(".md"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 1);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\u{1b}["));
+
+    let markdown = fs::read_to_string(&reports[0]).expect("read markdown report");
+    assert!(!markdown.contains("\u{1b}["));
+    assert!(markdown.contains("Policy Diagnostics:"));
+    assert!(markdown.contains("Advisory Diagnostics:"));
 }
 
 #[test]
