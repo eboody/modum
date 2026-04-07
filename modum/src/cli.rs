@@ -9,7 +9,7 @@ use std::{
 };
 
 use modum::{
-    AnalysisSettings, CheckMode, Diagnostic, DiagnosticLevel, DiagnosticSelection, ScanSettings,
+    AnalysisSettings, CheckMode, Diagnostic, DiagnosticClass, DiagnosticSelection, ScanSettings,
     WorkspaceReport, diagnostic_code_info, render_diagnostic_explanation,
     render_pretty_report_with_selection, run_check_with_settings, write_diagnostic_baseline,
 };
@@ -26,9 +26,24 @@ const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
 const ANSI_BOLD_RED: &str = "\x1b[1;31m";
 const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
 const ANSI_BOLD_BLUE: &str = "\x1b[1;34m";
+const ANSI_BOLD_MAGENTA: &str = "\x1b[1;35m";
 const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
 const ANSI_BOLD_WHITE: &str = "\x1b[1;37m";
+const ANSI_BOLD_WHITE_ON_RED: &str = "\x1b[1;37;41m";
+const ANSI_BOLD_WHITE_ON_BLUE: &str = "\x1b[1;37;44m";
+const ANSI_BOLD_BLACK_ON_WHITE: &str = "\x1b[1;30;47m";
+const ANSI_BOLD_BLACK_ON_CYAN: &str = "\x1b[1;30;46m";
+const ANSI_BOLD_BLACK_ON_YELLOW: &str = "\x1b[1;30;43m";
+const ANSI_BOLD_BLACK_ON_GREEN: &str = "\x1b[1;30;42m";
 const ANSI_DIM: &str = "\x1b[2m";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeSpanRole {
+    Problem,
+    Trait,
+    FamilyMarker,
+    Suggestion,
+}
 
 impl std::str::FromStr for OutputFormat {
     type Err = String;
@@ -288,45 +303,61 @@ fn render_pretty_cli_report(report: &WorkspaceReport, selection: DiagnosticSelec
     let filtered = report.filtered(selection);
     let mut out = String::new();
 
-    let _ = writeln!(&mut out, "{}", ansi("modum lint report", ANSI_BOLD_CYAN));
-    let _ = writeln!(&mut out, "{}", ansi("=================", ANSI_DIM));
+    let _ = writeln!(
+        &mut out,
+        "{} {}",
+        ansi_badge("MODUM", ANSI_BOLD_BLACK_ON_CYAN),
+        ansi("lint report", ANSI_BOLD_CYAN)
+    );
+    let _ = writeln!(&mut out, "{}", ansi("  ==============================", ANSI_DIM));
     let _ = writeln!(&mut out);
 
     render_summary_row(
         &mut out,
         "Files scanned",
         &filtered.scanned_files.to_string(),
+        ANSI_BOLD_BLACK_ON_WHITE,
         ANSI_BOLD_WHITE,
     );
     render_summary_row(
         &mut out,
         "Files with violations",
         &filtered.files_with_violations.to_string(),
+        ANSI_BOLD_BLACK_ON_WHITE,
         ANSI_BOLD_WHITE,
     );
     render_summary_row(
         &mut out,
         "Errors",
         &filtered.error_count().to_string(),
+        ANSI_BOLD_WHITE_ON_RED,
         ANSI_BOLD_RED,
     );
     render_summary_row(
         &mut out,
         "Policy warnings",
         &filtered.policy_warning_count().to_string(),
+        ANSI_BOLD_BLACK_ON_YELLOW,
         ANSI_BOLD_YELLOW,
     );
     render_summary_row(
         &mut out,
         "Advisory warnings",
         &filtered.advisory_warning_count().to_string(),
+        ANSI_BOLD_WHITE_ON_BLUE,
         ANSI_BOLD_BLUE,
     );
     if let Some(selection_label) = selection.report_label() {
-        render_summary_row(&mut out, "Showing", selection_label, ANSI_BOLD_WHITE);
+        render_summary_row(
+            &mut out,
+            "Showing",
+            selection_label,
+            ANSI_BOLD_BLACK_ON_CYAN,
+            ANSI_BOLD_WHITE,
+        );
         let _ = writeln!(
             &mut out,
-            "  {:<22} {}",
+            "  {:<28} {}",
             "",
             ansi("(exit code still reflects the full report)", ANSI_DIM)
         );
@@ -359,18 +390,34 @@ fn render_pretty_cli_report(report: &WorkspaceReport, selection: DiagnosticSelec
         .collect::<Vec<_>>();
 
     let _ = writeln!(&mut out);
-    render_pretty_diagnostic_section(&mut out, "Errors", &errors, ANSI_BOLD_RED);
-    render_pretty_diagnostic_section(&mut out, "Policy Diagnostics", &policy, ANSI_BOLD_YELLOW);
-    render_pretty_diagnostic_section(&mut out, "Advisory Diagnostics", &advisory, ANSI_BOLD_BLUE);
+    render_pretty_diagnostic_section(&mut out, "Errors", &errors, ANSI_BOLD_WHITE_ON_RED);
+    render_pretty_diagnostic_section(
+        &mut out,
+        "Policy Diagnostics",
+        &policy,
+        ANSI_BOLD_BLACK_ON_YELLOW,
+    );
+    render_pretty_diagnostic_section(
+        &mut out,
+        "Advisory Diagnostics",
+        &advisory,
+        ANSI_BOLD_WHITE_ON_BLUE,
+    );
 
     out
 }
 
-fn render_summary_row(out: &mut String, label: &str, value: &str, value_style: &str) {
+fn render_summary_row(
+    out: &mut String,
+    label: &str,
+    value: &str,
+    label_style: &str,
+    value_style: &str,
+) {
     let _ = writeln!(
         out,
-        "  {:<22} {}",
-        format!("{label}:"),
+        "  {} {}",
+        ansi_badge(label, label_style),
         ansi(value, value_style)
     );
 }
@@ -379,7 +426,7 @@ fn render_pretty_diagnostic_section(
     out: &mut String,
     title: &str,
     diagnostics: &[&Diagnostic],
-    accent_style: &str,
+    section_style: &str,
 ) {
     if diagnostics.is_empty() {
         return;
@@ -388,52 +435,276 @@ fn render_pretty_diagnostic_section(
     let _ = writeln!(
         out,
         "{} {}",
-        ansi(title, accent_style),
-        ansi(format!("({})", diagnostics.len()), ANSI_DIM)
+        ansi_badge(title, section_style),
+        ansi(
+            format!(
+                "{} item{}",
+                diagnostics.len(),
+                if diagnostics.len() == 1 { "" } else { "s" }
+            ),
+            ANSI_DIM
+        )
     );
-    let _ = writeln!(out, "{}", ansi("----------------------", ANSI_DIM));
+    let _ = writeln!(out, "{}", ansi("  --------------------------------------------------", ANSI_DIM));
     for (index, diagnostic) in diagnostics.iter().enumerate() {
-        let badge = match diagnostic.level() {
-            DiagnosticLevel::Warning => ansi("warning", accent_style),
-            DiagnosticLevel::Error => ansi("error", ANSI_BOLD_RED),
-        };
         let code = match (diagnostic.code(), diagnostic.profile()) {
-            (Some(code), Some(profile)) => format!("{code} | {}", profile.as_str()),
-            (Some(code), None) => code.to_string(),
-            (None, _) => "tool".to_string(),
+            (Some(code), Some(profile)) => {
+                format!(
+                    "{} {}",
+                    ansi_badge(code, ANSI_BOLD_BLACK_ON_WHITE),
+                    ansi_badge(profile.as_str(), ANSI_BOLD_BLACK_ON_CYAN)
+                )
+            }
+            (Some(code), None) => ansi_badge(code, ANSI_BOLD_BLACK_ON_WHITE),
+            (None, _) => ansi_badge("tool", ANSI_BOLD_BLACK_ON_WHITE),
         };
         let _ = writeln!(
             out,
             "  {} {} {}",
             ansi(format!("{:>2}.", index + 1), ANSI_DIM),
-            badge,
-            ansi(code, ANSI_BOLD_WHITE)
+            diagnostic_kind_badge(diagnostic),
+            code
         );
 
-        if let Some(file) = &diagnostic.file {
-            let location = match diagnostic.line {
-                Some(line) => format!("{}:{line}", file.display()),
-                None => file.display().to_string(),
-            };
-            let _ = writeln!(out, "      {} {}", ansi("at", ANSI_DIM), location);
+        if let Some(location) = diagnostic_location(diagnostic) {
+            render_pretty_detail(out, "FILE", &location, ANSI_BOLD_WHITE_ON_BLUE, ANSI_DIM);
         }
 
-        let _ = writeln!(out, "      {}", diagnostic.message);
+        render_pretty_lint_detail(out, &diagnostic.message);
 
         if let Some(fix) = &diagnostic.fix {
-            let _ = writeln!(
-                out,
-                "      {} {}",
-                ansi("fix:", ANSI_BOLD_GREEN),
-                fix.replacement
-            );
+            render_pretty_fix_detail(out, &fix.replacement);
         }
 
         if index + 1 != diagnostics.len() {
+            let _ = writeln!(out, "{}", ansi("      ................................................", ANSI_DIM));
             let _ = writeln!(out);
         }
     }
     let _ = writeln!(out);
+}
+
+fn render_pretty_detail(
+    out: &mut String,
+    label: &str,
+    value: &str,
+    label_style: &str,
+    value_style: &str,
+) {
+    let _ = writeln!(
+        out,
+        "      {} {}",
+        ansi_badge(label, label_style),
+        ansi(value, value_style)
+    );
+}
+
+fn render_pretty_lint_detail(out: &mut String, message: &str) {
+    let _ = writeln!(
+        out,
+        "      {} {}",
+        ansi_badge("LINT", ANSI_BOLD_BLACK_ON_YELLOW),
+        render_pretty_message(message)
+    );
+}
+
+fn render_pretty_fix_detail(out: &mut String, replacement: &str) {
+    let _ = writeln!(
+        out,
+        "      {} {} {}",
+        ansi_badge("CHANGE", ANSI_BOLD_BLACK_ON_GREEN),
+        ansi("replace with", ANSI_BOLD_GREEN),
+        render_inline_code_span(replacement, CodeSpanRole::Suggestion)
+    );
+}
+
+fn render_pretty_message(message: &str) -> String {
+    let mut out = String::new();
+    let mut previous_code_role = None;
+    let parts = message.split('`').collect::<Vec<_>>();
+
+    for (index, part) in parts.iter().enumerate() {
+        if index % 2 == 0 {
+            if !part.is_empty() {
+                out.push_str(&ansi(part, ANSI_BOLD_WHITE));
+            }
+            continue;
+        }
+
+        let role = code_span_role(parts[index - 1], previous_code_role);
+        previous_code_role = Some(role);
+        out.push_str(&render_inline_code_span(part, role));
+    }
+
+    out
+}
+
+fn code_span_role(previous_text: &str, previous_code_role: Option<CodeSpanRole>) -> CodeSpanRole {
+    let context = previous_text.to_ascii_lowercase();
+    let trimmed = context.trim();
+
+    if trimmed.ends_with("prefer")
+        || trimmed.ends_with("consider a semantic")
+        || matches!(trimmed, "or" | "and" | "on")
+            && previous_code_role == Some(CodeSpanRole::Suggestion)
+    {
+        return CodeSpanRole::Suggestion;
+    }
+
+    if trimmed.ends_with("manually implements both")
+        || trimmed == "and" && previous_code_role == Some(CodeSpanRole::Trait)
+    {
+        return CodeSpanRole::Trait;
+    }
+
+    if trimmed.ends_with("share the")
+        || trimmed.ends_with("share the generic")
+        || trimmed == "head and" && previous_code_role == Some(CodeSpanRole::FamilyMarker)
+    {
+        return CodeSpanRole::FamilyMarker;
+    }
+
+    CodeSpanRole::Problem
+}
+
+fn render_inline_code_span(code: &str, role: CodeSpanRole) -> String {
+    let mut out = String::new();
+    out.push_str(&ansi("`", ANSI_DIM));
+    out.push_str(&render_code_span_content(code, role));
+    out.push_str(&ansi("`", ANSI_DIM));
+    out
+}
+
+fn render_code_span_content(code: &str, role: CodeSpanRole) -> String {
+    let mut out = String::new();
+    let mut chars = code.char_indices().peekable();
+    let mut inside_group = false;
+
+    while let Some((start, ch)) = chars.next() {
+        if ch.is_whitespace() {
+            let mut end = start + ch.len_utf8();
+            while let Some((next_start, next_ch)) = chars.peek().copied() {
+                if !next_ch.is_whitespace() {
+                    break;
+                }
+                chars.next();
+                end = next_start + next_ch.len_utf8();
+            }
+            out.push_str(&code[start..end]);
+            continue;
+        }
+
+        if ch == ':' && chars.next_if(|(_, next)| *next == ':').is_some() {
+            out.push_str(&ansi("::", separator_style(role)));
+            continue;
+        }
+
+        if is_code_ident_char(ch) {
+            let mut end = start + ch.len_utf8();
+            while let Some((next_start, next_ch)) = chars.peek().copied() {
+                if !is_code_ident_char(next_ch) {
+                    break;
+                }
+                chars.next();
+                end = next_start + next_ch.len_utf8();
+            }
+            let ident = &code[start..end];
+            out.push_str(&ansi(
+                ident,
+                code_ident_style(role, inside_group, remaining_starts_with_separator(&chars)),
+            ));
+            continue;
+        }
+
+        out.push_str(&ansi(
+            &code[start..start + ch.len_utf8()],
+            punctuation_style(role, ch),
+        ));
+
+        if ch == '{' {
+            inside_group = true;
+        } else if ch == '}' {
+            inside_group = false;
+        }
+    }
+
+    out
+}
+
+fn remaining_starts_with_separator(
+    chars: &std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> bool {
+    let mut clone = chars.clone();
+    while let Some((_, ch)) = clone.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch != ':' {
+            return false;
+        }
+        return matches!(clone.next(), Some((_, ':')));
+    }
+    false
+}
+
+fn is_code_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\'')
+}
+
+fn code_ident_style(role: CodeSpanRole, inside_group: bool, followed_by_separator: bool) -> &'static str {
+    match role {
+        CodeSpanRole::Problem => ANSI_BOLD_RED,
+        CodeSpanRole::Trait => ANSI_BOLD_BLUE,
+        CodeSpanRole::FamilyMarker => ANSI_BOLD_MAGENTA,
+        CodeSpanRole::Suggestion if followed_by_separator => ANSI_BOLD_CYAN,
+        CodeSpanRole::Suggestion if inside_group => ANSI_BOLD_GREEN,
+        CodeSpanRole::Suggestion => ANSI_BOLD_GREEN,
+    }
+}
+
+fn separator_style(role: CodeSpanRole) -> &'static str {
+    match role {
+        CodeSpanRole::Problem => ANSI_BOLD_RED,
+        CodeSpanRole::Trait => ANSI_BOLD_BLUE,
+        CodeSpanRole::FamilyMarker => ANSI_BOLD_MAGENTA,
+        CodeSpanRole::Suggestion => ANSI_BOLD_YELLOW,
+    }
+}
+
+fn punctuation_style(role: CodeSpanRole, ch: char) -> &'static str {
+    match role {
+        CodeSpanRole::Problem => ANSI_BOLD_RED,
+        CodeSpanRole::Trait => ANSI_BOLD_BLUE,
+        CodeSpanRole::FamilyMarker => ANSI_BOLD_MAGENTA,
+        CodeSpanRole::Suggestion if matches!(ch, '{' | '}' | '(' | ')' | '[' | ']' | '<' | '>' | ',') => {
+            ANSI_BOLD_MAGENTA
+        }
+        CodeSpanRole::Suggestion => ANSI_BOLD_WHITE,
+    }
+}
+
+fn diagnostic_location(diagnostic: &Diagnostic) -> Option<String> {
+    diagnostic.file.as_ref().map(|file| match diagnostic.line {
+        Some(line) => format!("{}:{line}", file.display()),
+        None => file.display().to_string(),
+    })
+}
+
+fn diagnostic_kind_badge(diagnostic: &Diagnostic) -> String {
+    match &diagnostic.class {
+        DiagnosticClass::ToolError | DiagnosticClass::PolicyError { .. } => {
+            ansi_badge("ERROR", ANSI_BOLD_WHITE_ON_RED)
+        }
+        DiagnosticClass::ToolWarning => ansi_badge("WARNING", ANSI_BOLD_BLACK_ON_YELLOW),
+        DiagnosticClass::PolicyWarning { .. } => ansi_badge("POLICY", ANSI_BOLD_BLACK_ON_YELLOW),
+        DiagnosticClass::AdvisoryWarning { .. } => {
+            ansi_badge("ADVISORY", ANSI_BOLD_WHITE_ON_BLUE)
+        }
+    }
+}
+
+fn ansi_badge(text: impl std::fmt::Display, style: &str) -> String {
+    ansi(format!(" {text} "), style)
 }
 
 fn ansi(text: impl std::fmt::Display, style: &str) -> String {

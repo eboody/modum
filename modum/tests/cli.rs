@@ -3,6 +3,30 @@ use std::{fs, process::Command};
 use serde_json::Value;
 use tempfile::tempdir;
 
+fn strip_ansi_codes(raw: &str) -> String {
+    let mut stripped = String::new();
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            stripped.push(ch);
+            continue;
+        }
+
+        if chars.next_if_eq(&'[').is_none() {
+            continue;
+        }
+
+        for next in chars.by_ref() {
+            if ('@'..='~').contains(&next) {
+                break;
+            }
+        }
+    }
+
+    stripped
+}
+
 fn write_json_fixture() -> tempfile::TempDir {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -64,6 +88,43 @@ pub fn handler() -> response::Response {
     temp
 }
 
+fn write_pretty_highlight_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .expect("write manifest");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct RequestError {
+    pub message: String,
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+pub fn load() -> std::result::Result<(), RequestError> {
+    todo!()
+}
+"#,
+    )
+    .expect("write source");
+    temp
+}
+
 fn write_policy_and_advisory_fixture() -> tempfile::TempDir {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -91,6 +152,31 @@ pub struct UserId;
 pub fn handler() -> response::Response {
     todo!()
 }
+"#,
+    )
+    .expect("write source");
+    temp
+}
+
+fn write_source_family_fixture() -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .expect("write manifest");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct SourceRuntime;
+pub struct SourceUpdate;
+pub struct SourceVendor;
 "#,
     )
     .expect("write source");
@@ -591,6 +677,99 @@ fn cli_pretty_output_adds_formatting_and_color() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
         .current_dir(root)
+        .args(["check", "--root", root.to_str().expect("utf8 root"), "-p"])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(2));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\u{1b}[1;30;43m"));
+    assert!(stdout.contains("\u{1b}[1;30;42m"));
+    assert!(stdout.contains("\u{1b}[1;37;44m"));
+
+    let stripped = strip_ansi_codes(&stdout);
+    assert!(stripped.contains("Files scanned"));
+    assert!(stripped.contains("Policy Diagnostics"));
+    assert!(stripped.contains("Advisory Diagnostics"));
+    assert!(stripped.contains("namespace_redundant_qualified_generic"));
+    assert!(stripped.contains("api_candidate_semantic_module"));
+    assert!(stripped.contains("LINT"));
+    assert!(stripped.contains("CHANGE"));
+    assert!(stripped.contains("replace with"));
+    assert!(stripped.contains("FILE"));
+}
+
+#[test]
+fn cli_pretty_output_highlights_problem_and_recommended_code_spans() {
+    let temp = write_pretty_highlight_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "-p",
+            "--mode",
+            "warn",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\u{1b}[1;31mRequestError\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;34mDisplay\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;34mError\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;31mstd\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;31mresult\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;31mResult\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;36mstd\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;33m::\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;32mResult\u{1b}[0m"));
+}
+
+#[test]
+fn cli_pretty_output_syntax_highlights_semantic_surface_suggestion() {
+    let temp = write_source_family_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
+        .args([
+            "check",
+            "--root",
+            root.to_str().expect("utf8 root"),
+            "-p",
+            "--mode",
+            "warn",
+        ])
+        .output()
+        .expect("run modum check");
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\u{1b}[1;31mSourceRuntime\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;31mSourceUpdate\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;31mSourceVendor\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;35mSource\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;36msource\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;33m::\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;35m{\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;32mRuntime\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;32mUpdate\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;32mVendor\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;35m}\u{1b}[0m"));
+}
+
+#[test]
+fn cli_pretty_output_respects_advisory_filter() {
+    let temp = write_policy_and_advisory_fixture();
+    let root = temp.path();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .current_dir(root)
         .args([
             "check",
             "--root",
@@ -604,13 +783,13 @@ fn cli_pretty_output_adds_formatting_and_color() {
     assert_eq!(output.status.code(), Some(2));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\u{1b}["));
-    assert!(stdout.contains("Files scanned:"));
-    assert!(stdout.contains("Showing:"));
-    assert!(stdout.contains("Advisory Diagnostics"));
-    assert!(stdout.contains("api_candidate_semantic_module | strict"));
-    assert!(stdout.contains("(exit code still reflects the full report)"));
-    assert!(!stdout.contains("Policy Diagnostics"));
+    let stripped = strip_ansi_codes(&stdout);
+    assert!(stripped.contains("Showing"));
+    assert!(stripped.contains("advisory diagnostics and errors only"));
+    assert!(stripped.contains("(exit code still reflects the full report)"));
+    assert!(stripped.contains("Advisory Diagnostics"));
+    assert!(!stripped.contains("Policy Diagnostics"));
+    assert!(!stripped.contains("namespace_redundant_qualified_generic"));
 }
 
 #[test]
