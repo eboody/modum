@@ -616,12 +616,16 @@ fn cli_json_output_includes_fix_metadata_for_direct_path_rewrites() {
     assert_eq!(diag["policy"].as_bool(), Some(true));
     assert_eq!(diag["fix"]["kind"].as_str(), Some("replace_path"));
     assert_eq!(diag["fix"]["replacement"].as_str(), Some("Response"));
-    assert!(diag["guidance"]["why"]
-        .as_str()
-        .is_some_and(|text| text.contains("generic category")));
-    assert!(diag["guidance"]["address"]
-        .as_str()
-        .is_some_and(|text| text.contains("direct rewrite is `Response`")));
+    assert!(
+        diag["guidance"]["why"]
+            .as_str()
+            .is_some_and(|text| text.contains("generic category"))
+    );
+    assert!(
+        diag["guidance"]["address"]
+            .as_str()
+            .is_some_and(|text| text.contains("direct rewrite is `Response`"))
+    );
 }
 
 #[test]

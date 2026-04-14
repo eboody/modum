@@ -309,7 +309,11 @@ fn render_pretty_cli_report(report: &WorkspaceReport, selection: DiagnosticSelec
         ansi_badge("MODUM", ANSI_BOLD_BLACK_ON_CYAN),
         ansi("lint report", ANSI_BOLD_CYAN)
     );
-    let _ = writeln!(&mut out, "{}", ansi("  ==============================", ANSI_DIM));
+    let _ = writeln!(
+        &mut out,
+        "{}",
+        ansi("  ==============================", ANSI_DIM)
+    );
     let _ = writeln!(&mut out);
 
     render_summary_row(
@@ -445,7 +449,14 @@ fn render_pretty_diagnostic_section(
             ANSI_DIM
         )
     );
-    let _ = writeln!(out, "{}", ansi("  --------------------------------------------------", ANSI_DIM));
+    let _ = writeln!(
+        out,
+        "{}",
+        ansi(
+            "  --------------------------------------------------",
+            ANSI_DIM
+        )
+    );
     for (index, diagnostic) in diagnostics.iter().enumerate() {
         let code = match (diagnostic.code(), diagnostic.profile()) {
             (Some(code), Some(profile)) => {
@@ -473,12 +484,7 @@ fn render_pretty_diagnostic_section(
         render_pretty_lint_detail(out, &diagnostic.message);
 
         if let Some(guidance) = diagnostic.guidance() {
-            render_pretty_guidance_detail(
-                out,
-                "WHY",
-                &guidance.why,
-                ANSI_BOLD_BLACK_ON_CYAN,
-            );
+            render_pretty_guidance_detail(out, "WHY", &guidance.why, ANSI_BOLD_BLACK_ON_CYAN);
             render_pretty_guidance_detail(
                 out,
                 "ADDRESS",
@@ -492,7 +498,14 @@ fn render_pretty_diagnostic_section(
         }
 
         if index + 1 != diagnostics.len() {
-            let _ = writeln!(out, "{}", ansi("      ................................................", ANSI_DIM));
+            let _ = writeln!(
+                out,
+                "{}",
+                ansi(
+                    "      ................................................",
+                    ANSI_DIM
+                )
+            );
             let _ = writeln!(out);
         }
     }
@@ -655,9 +668,7 @@ fn render_code_span_content(code: &str, role: CodeSpanRole) -> String {
     out
 }
 
-fn remaining_starts_with_separator(
-    chars: &std::iter::Peekable<std::str::CharIndices<'_>>,
-) -> bool {
+fn remaining_starts_with_separator(chars: &std::iter::Peekable<std::str::CharIndices<'_>>) -> bool {
     let mut clone = chars.clone();
     while let Some((_, ch)) = clone.next() {
         if ch.is_whitespace() {
@@ -675,7 +686,11 @@ fn is_code_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\'')
 }
 
-fn code_ident_style(role: CodeSpanRole, inside_group: bool, followed_by_separator: bool) -> &'static str {
+fn code_ident_style(
+    role: CodeSpanRole,
+    inside_group: bool,
+    followed_by_separator: bool,
+) -> &'static str {
     match role {
         CodeSpanRole::Problem => ANSI_BOLD_RED,
         CodeSpanRole::Trait => ANSI_BOLD_BLUE,
@@ -700,7 +715,9 @@ fn punctuation_style(role: CodeSpanRole, ch: char) -> &'static str {
         CodeSpanRole::Problem => ANSI_BOLD_RED,
         CodeSpanRole::Trait => ANSI_BOLD_BLUE,
         CodeSpanRole::FamilyMarker => ANSI_BOLD_MAGENTA,
-        CodeSpanRole::Suggestion if matches!(ch, '{' | '}' | '(' | ')' | '[' | ']' | '<' | '>' | ',') => {
+        CodeSpanRole::Suggestion
+            if matches!(ch, '{' | '}' | '(' | ')' | '[' | ']' | '<' | '>' | ',') =>
+        {
             ANSI_BOLD_MAGENTA
         }
         CodeSpanRole::Suggestion => ANSI_BOLD_WHITE,
@@ -721,9 +738,7 @@ fn diagnostic_kind_badge(diagnostic: &Diagnostic) -> String {
         }
         DiagnosticClass::ToolWarning => ansi_badge("WARNING", ANSI_BOLD_BLACK_ON_YELLOW),
         DiagnosticClass::PolicyWarning { .. } => ansi_badge("POLICY", ANSI_BOLD_BLACK_ON_YELLOW),
-        DiagnosticClass::AdvisoryWarning { .. } => {
-            ansi_badge("ADVISORY", ANSI_BOLD_WHITE_ON_BLUE)
-        }
+        DiagnosticClass::AdvisoryWarning { .. } => ansi_badge("ADVISORY", ANSI_BOLD_WHITE_ON_BLUE),
     }
 }
 

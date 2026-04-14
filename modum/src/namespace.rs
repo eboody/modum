@@ -710,12 +710,8 @@ fn promotable_parent_surface_candidate(
         let parent_surface_prefix = &full_path[..prefix_len];
         let resolved_parent_surface =
             resolve_qualified_parent_surface_path(current_module_path, parent_surface_prefix)?;
-        if !promotable_parent_surface_is_owned(
-            path,
-            full_path,
-            &resolved_parent_surface,
-            settings,
-        ) {
+        if !promotable_parent_surface_is_owned(path, full_path, &resolved_parent_surface, settings)
+        {
             continue;
         }
         if !resolved_parent_surface_adds_net_context(
