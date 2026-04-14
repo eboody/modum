@@ -537,6 +537,85 @@ mod builder {
 }
 
 #[test]
+fn analyze_workspace_does_not_flag_internal_redundant_leaf_context_for_role_suffix_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod access {
+    struct AuthorizedRecordAccess;
+}
+
+mod actions {
+    struct SectionActions;
+}
+
+mod copy {
+    struct SectionCopy;
+    struct LeadCopy;
+}
+
+mod section_card {
+    struct CaseSectionCard;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_redundant_leaf_context"))
+    );
+}
+
+#[test]
+fn analyze_workspace_keeps_internal_redundant_leaf_context_for_viewer_resolution_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod viewer {
+    enum ViewerResolutionState {
+        Incoming,
+    }
+
+    struct ViewerResolutionFlow;
+    enum ViewerResolutionOutcome {
+        Ready,
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_redundant_leaf_context")
+            && diag.message.contains("viewer::ViewerResolutionState")
+            && diag.message.contains("viewer::ResolutionState")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_redundant_leaf_context")
+            && diag.message.contains("viewer::ViewerResolutionFlow")
+            && diag.message.contains("viewer::ResolutionFlow")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_redundant_leaf_context")
+            && diag.message.contains("viewer::ViewerResolutionOutcome")
+            && diag.message.contains("viewer::ResolutionOutcome")
+    }));
+}
+
+#[test]
 fn analyze_workspace_flags_internal_candidate_semantic_module_for_shared_head_modules() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -1713,6 +1792,47 @@ pub use message::MessageBody;
 }
 
 #[test]
+fn analyze_workspace_flags_public_reexports_with_standalone_shorter_names() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod auth {
+    pub struct AuthStrategy;
+    pub struct NoAuth;
+}
+
+pub mod config {
+    pub struct PracticeFusionConfig;
+}
+
+pub use auth::{AuthStrategy, NoAuth};
+pub use config::PracticeFusionConfig;
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_pub_use_redundant_leaf_context")
+            && diag.message.contains("AuthStrategy")
+            && diag.message.contains("auth::Strategy")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_pub_use_redundant_leaf_context")
+            && diag.message.contains("PracticeFusionConfig")
+            && diag.message.contains("config::PracticeFusion")
+    }));
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_pub_use_redundant_leaf_context")
+            && diag.message.contains("NoAuth")
+    }));
+}
+
+#[test]
 fn analyze_workspace_does_not_flag_private_child_module_family_reexports() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -2491,6 +2611,39 @@ pub fn load(repo: UserRepository) -> UserRepository {
 }
 
 #[test]
+fn analyze_workspace_flags_flattened_imports_with_standalone_shorter_names() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod auth {
+    pub struct AuthStrategy;
+    pub struct NoAuth;
+}
+
+use auth::{AuthStrategy, NoAuth};
+
+struct Demo(AuthStrategy, NoAuth);
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use_redundant_leaf_context")
+            && diag.message.contains("AuthStrategy")
+            && diag.message.contains("auth::Strategy")
+    }));
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use_redundant_leaf_context")
+            && diag.message.contains("NoAuth")
+    }));
+}
+
+#[test]
 fn analyze_workspace_flags_relative_imports_with_real_parent_modules() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -2540,6 +2693,197 @@ pub struct UserRepository;
     assert!(report.diagnostics.iter().any(|diag| {
         diag.code() == Some("api_redundant_leaf_context")
             && diag.message.contains("user::Repository")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_public_redundant_leaf_context_for_standalone_shorter_names() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod auth {
+    pub struct AuthStrategy;
+    pub struct NoAuth;
+}
+
+pub mod client {
+    pub struct PracticeFusionClient;
+}
+
+pub mod config {
+    pub struct EpicConfig;
+}
+
+pub mod factory {
+    pub struct EhrClientFactory;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_redundant_leaf_context")
+            && diag.message.contains("auth::AuthStrategy")
+            && diag.message.contains("auth::Strategy")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_redundant_leaf_context")
+            && diag.message.contains("client::PracticeFusionClient")
+            && diag.message.contains("client::PracticeFusion")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_redundant_leaf_context")
+            && diag.message.contains("config::EpicConfig")
+            && diag.message.contains("config::Epic")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_redundant_leaf_context")
+            && diag.message.contains("factory::EhrClientFactory")
+            && diag.message.contains("factory::EhrClient")
+    }));
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_redundant_leaf_context") && diag.message.contains("auth::NoAuth")
+    }));
+}
+
+#[test]
+fn analyze_workspace_keeps_public_redundant_leaf_context_for_semantic_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod stmt {
+    pub struct ExprStmt;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_redundant_leaf_context")
+            && diag.message.contains("stmt::ExprStmt")
+            && diag.message.contains("stmt::Expr")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_fragmentary_category_suffix_shortening() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/http")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod http;\n").expect("write lib");
+    fs::write(root.join("src/http.rs"), "pub mod response;\n").expect("write http");
+    fs::write(
+        root.join("src/http/response.rs"),
+        r#"
+pub struct IntoResponse;
+"#,
+    )
+    .expect("write response");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_redundant_category_suffix")
+            && diag.message.contains("IntoResponse")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_internal_fragmentary_redundant_leaf_context() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod test {
+    struct TestResult;
+}
+
+mod body {
+    struct BoxBody;
+}
+
+mod query {
+    struct OptionalQuery;
+}
+
+mod error {
+    struct IntoError;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        (diag.code() == Some("internal_redundant_leaf_context")
+            && (diag.message.contains("body::BoxBody")
+                || diag.message.contains("query::OptionalQuery")))
+            || (diag.code() == Some("internal_redundant_category_suffix")
+                && diag.message.contains("IntoError"))
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_internal_redundant_leaf_context_for_standalone_shorter_names() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod auth {
+    struct AuthStrategy;
+}
+
+mod config {
+    struct EpicConfig;
+}
+
+mod factory {
+    struct EhrClientFactory;
+}
+
+mod mock {
+    struct MockEhrClient;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_redundant_leaf_context")
+            && diag.message.contains("auth::AuthStrategy")
+            && diag.message.contains("auth::Strategy")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_redundant_leaf_context")
+            && diag.message.contains("config::EpicConfig")
+            && diag.message.contains("config::Epic")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_redundant_leaf_context")
+            && diag.message.contains("factory::EhrClientFactory")
+            && diag.message.contains("factory::EhrClient")
+    }));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_adapter_redundant_leaf_context")
+            && diag.message.contains("mock::MockEhrClient")
+            && diag.message.contains("mock::EhrClient")
     }));
 }
 

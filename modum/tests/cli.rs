@@ -885,6 +885,24 @@ fn cli_explain_maybe_some_includes_fix_guidance() {
 }
 
 #[test]
+fn cli_explain_unsupported_construct_reports_analysis_boundary() {
+    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
+        .args([
+            "--explain",
+            "api_candidate_semantic_module_unsupported_construct",
+        ])
+        .output()
+        .expect("run modum --explain");
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("api_candidate_semantic_module_unsupported_construct"));
+    assert!(stdout.contains("analysis boundary"));
+    assert!(stdout.contains("can't interpret authoritatively"));
+    assert!(!stdout.contains("Change the public boundary itself"));
+}
+
+#[test]
 fn cli_ignore_suppresses_matching_diagnostic_code() {
     let temp = write_policy_and_advisory_fixture();
     let root = temp.path();

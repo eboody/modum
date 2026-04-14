@@ -157,7 +157,7 @@ impl Diagnostic {
 
     pub fn guidance(&self) -> Option<DiagnosticGuidance> {
         let code = self.code()?;
-        diagnostic_guidance_for_code(code, self.fix.as_ref())
+        diagnostic_guidance_for_instance(code, &self.message, self.fix.as_ref())
     }
 
     pub fn level(&self) -> DiagnosticLevel {
@@ -241,10 +241,7 @@ impl Serialize for Diagnostic {
     }
 }
 
-pub fn diagnostic_guidance_for_code(
-    code: &str,
-    fix: Option<&DiagnosticFix>,
-) -> Option<DiagnosticGuidance> {
+fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'static str)> {
     let (why, address) = match code {
         "namespace_flat_use" | "namespace_flat_pub_use" | "namespace_flat_type_alias" => (
             "The imported leaf is generic enough that the path is carrying useful meaning; flattening it makes call sites harder to scan.",
@@ -342,6 +339,10 @@ pub fn diagnostic_guidance_for_code(
             "The sibling family looks like it wants one shared semantic module surface instead of repeating the family marker in every leaf or module name.",
             "Treat this as a design prompt, not a mandatory rewrite. Extract the semantic module only if it makes the resulting paths clearer and more stable for readers.",
         ),
+        "api_candidate_semantic_module_unsupported_construct" => (
+            "This scope contains constructs like macros, cfg gates, or includes that the current source-level pass can't interpret authoritatively.",
+            "Treat this as an analysis boundary, not a rewrite prompt. Inspect the expanded or real public surface manually, or upgrade the observation point, before making structural changes here.",
+        ),
         _ if code.starts_with("namespace_") => (
             "The current path shape is hiding meaning in the wrong place, so readers have to recover structure from longer leaves or flatter aliases.",
             "Move the meaning back into the path the lint points at. Prefer a clearer module surface over a rename whose only job is to silence the lint.",
@@ -357,9 +358,45 @@ pub fn diagnostic_guidance_for_code(
         _ => return None,
     };
 
+    Some((why, address))
+}
+
+pub fn diagnostic_guidance_for_code(
+    code: &str,
+    fix: Option<&DiagnosticFix>,
+) -> Option<DiagnosticGuidance> {
+    let (why, address) = diagnostic_guidance_parts_for_code(code)?;
+
     Some(DiagnosticGuidance {
         why: why.to_string(),
         address: append_direct_rewrite(address, fix),
+    })
+}
+
+fn diagnostic_guidance_for_instance(
+    code: &str,
+    message: &str,
+    fix: Option<&DiagnosticFix>,
+) -> Option<DiagnosticGuidance> {
+    let (why, base_address) = diagnostic_guidance_parts_for_code(code)?;
+    let mut address = base_address.to_string();
+
+    match code {
+        "api_semantic_string_scalar" => {
+            append_instance_address(&mut address, &semantic_string_scalar_address_hint(message));
+        }
+        "api_semantic_numeric_scalar" => {
+            append_instance_address(&mut address, &semantic_numeric_scalar_address_hint(message));
+        }
+        "api_raw_id_surface" => {
+            append_instance_address(&mut address, &raw_id_surface_address_hint(message));
+        }
+        _ => {}
+    }
+
+    Some(DiagnosticGuidance {
+        why: why.to_string(),
+        address: append_direct_rewrite(&address, fix),
     })
 }
 
@@ -371,6 +408,298 @@ fn append_direct_rewrite(address: &str, fix: Option<&DiagnosticFix>) -> String {
         "{address} For this site, the direct rewrite is `{}`.",
         fix.replacement
     )
+}
+
+fn append_instance_address(address: &mut String, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
+    address.push(' ');
+    address.push_str(extra);
+}
+
+fn semantic_string_scalar_address_hint(message: &str) -> String {
+    let (subject, fields) = message_subject_and_fields(message);
+    let mut hints = Vec::new();
+
+    for field in fields {
+        let lower = field.to_ascii_lowercase();
+        if lower.contains("url") {
+            let scoped = scoped_boundary_type_hint(subject.as_deref(), &field);
+            hints.push(match scoped {
+                Some(scoped) => format!(
+                    "For `{field}`, use a real URL boundary type. If the repo already has a matching wrapper, something like `{scoped}` is the right shape; otherwise use `url::Url` or a focused wrapper."
+                ),
+                None => format!(
+                    "For `{field}`, use a real URL boundary type like the repo's existing wrapper or `url::Url`."
+                ),
+            });
+        } else if lower.contains("email") {
+            hints.push(format!(
+                "For `{field}`, use the repo's email type if it exists, or a focused `Email` wrapper, instead of raw text."
+            ));
+        } else if lower.contains("path") {
+            hints.push(format!(
+                "For `{field}`, prefer `std::path::PathBuf` or the repo's path wrapper instead of raw text."
+            ));
+        }
+    }
+
+    hints.join(" ")
+}
+
+fn semantic_numeric_scalar_address_hint(message: &str) -> String {
+    let (_, fields) = message_subject_and_fields(message);
+    let mut hints = Vec::new();
+
+    for field in fields {
+        let lower = field.to_ascii_lowercase();
+        if looks_like_duration_field(&lower) {
+            hints.push(format!(
+                "For `{field}`, `std::time::Duration` is the natural boundary type."
+            ));
+        } else if lower.contains("port") {
+            hints.push(format!(
+                "For `{field}`, use a focused port wrapper or move it into a typed address or config surface instead of leaving it as a bare integer."
+            ));
+        }
+    }
+
+    hints.join(" ")
+}
+
+fn raw_id_surface_address_hint(message: &str) -> String {
+    let (subject, fields) = message_subject_and_fields(message);
+    let mut hints = Vec::new();
+
+    for field in fields {
+        if !field.to_ascii_lowercase().contains("id") {
+            continue;
+        }
+
+        let scoped = scoped_boundary_type_hint(subject.as_deref(), &field)
+            .unwrap_or_else(|| pascalize_identifier(&field));
+        hints.push(format!(
+            "For `{field}`, use the repo's matching id type if it exists; a type like `{scoped}` is the intended boundary shape."
+        ));
+    }
+
+    hints.join(" ")
+}
+
+fn message_subject_and_fields(message: &str) -> (Option<String>, Vec<String>) {
+    let chunks = backticked_chunks(message);
+    if chunks.is_empty() {
+        return (None, Vec::new());
+    }
+
+    let subject = chunks.first().cloned();
+    let fields = chunks
+        .into_iter()
+        .skip(1)
+        .filter(|chunk| {
+            !chunk.contains("::")
+                && chunk
+                    .chars()
+                    .any(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+        .collect::<Vec<_>>();
+    (subject, fields)
+}
+
+fn backticked_chunks(message: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut rest = message;
+
+    while let Some(start) = rest.find('`') {
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('`') else {
+            break;
+        };
+        chunks.push(after_start[..end].to_string());
+        rest = &after_start[end + 1..];
+    }
+
+    chunks
+}
+
+fn scoped_boundary_type_hint(subject: Option<&str>, field: &str) -> Option<String> {
+    let prefix = subject.and_then(boundary_subject_scope)?;
+    let field_type = pascalize_identifier(field);
+    if field_type.starts_with(&prefix) {
+        return None;
+    }
+    Some(format!("{prefix}{field_type}"))
+}
+
+fn boundary_subject_scope(subject: &str) -> Option<String> {
+    let segments = subject.split("::").collect::<Vec<_>>();
+    let owner = match segments.as_slice() {
+        [] => return None,
+        [single] => *single,
+        [.., prev, last]
+            if last
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_lowercase()) =>
+        {
+            *prev
+        }
+        [.., last] => *last,
+    };
+    let scope = ident_words(owner).last().cloned()?;
+    (!scope_word_is_generic(&scope)).then_some(scope)
+}
+
+fn pascalize_identifier(raw: &str) -> String {
+    ident_words(raw)
+        .into_iter()
+        .map(|word| {
+            let mut chars = word.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut rendered = String::new();
+            rendered.push(first.to_ascii_uppercase());
+            rendered.push_str(chars.as_str());
+            rendered
+        })
+        .collect::<String>()
+}
+
+fn ident_words(raw: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_was_lower_or_digit = false;
+
+    for ch in raw.chars() {
+        if matches!(ch, '_' | ':' | '-' | ' ') {
+            if !current.is_empty() {
+                words.push(current.clone());
+                current.clear();
+            }
+            prev_was_lower_or_digit = false;
+            continue;
+        }
+
+        if ch.is_ascii_uppercase() && prev_was_lower_or_digit && !current.is_empty() {
+            words.push(current.clone());
+            current.clear();
+        }
+
+        current.push(ch);
+        prev_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words
+}
+
+fn looks_like_duration_field(field: &str) -> bool {
+    field.contains("timeout")
+        || field.contains("interval")
+        || field.contains("backoff")
+        || field.ends_with("_secs")
+        || field.ends_with("_ms")
+        || field.ends_with("_millis")
+        || field.ends_with("_nanos")
+}
+
+fn scope_word_is_generic(scope: &str) -> bool {
+    let generic_scope_words = [
+        "adapter", "auth", "client", "config", "entry", "event", "hit", "id", "mock", "param",
+        "params", "payload", "profile", "record", "request", "response", "result", "state",
+        "vault",
+    ];
+    let normalized = scope.to_ascii_lowercase();
+    generic_scope_words.contains(&normalized.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Diagnostic, DiagnosticClass, diagnostic_guidance_for_code};
+
+    #[test]
+    fn instance_guidance_for_semantic_string_scalar_mentions_repo_shaped_url_type() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "api_semantic_string_scalar".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "public struct `SensitiveSandbox` carries semantic scalar field(s) `base_url` as raw strings; prefer typed boundary values or focused newtypes".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.address.contains("SandboxBaseUrl"));
+        assert!(guidance.address.contains("url::Url"));
+    }
+
+    #[test]
+    fn instance_guidance_for_raw_id_surface_mentions_repo_shaped_id_type() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "api_raw_id_surface".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "public struct `SensitiveSandbox` keeps raw id field(s) `client_id` as strings or primitive integers; prefer id newtypes at the boundary".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.address.contains("SandboxClientId"));
+    }
+
+    #[test]
+    fn instance_guidance_skips_generic_scope_prefixes_for_string_scalars() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "api_semantic_string_scalar".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "public struct `EpicConfig` carries semantic scalar field(s) `base_url` as raw strings; prefer typed boundary values or focused newtypes".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.address.contains("url::Url"));
+        assert!(!guidance.address.contains("ConfigBaseUrl"));
+    }
+
+    #[test]
+    fn instance_guidance_skips_duplicate_scope_prefixes_for_id_types() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "api_raw_id_surface".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "public struct `AuditRecord` keeps raw id field(s) `record_id` as strings or primitive integers; prefer id newtypes at the boundary".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.address.contains("RecordId"));
+        assert!(!guidance.address.contains("RecordRecordId"));
+    }
+
+    #[test]
+    fn generic_guidance_for_unsupported_construct_reports_analysis_boundary() {
+        let guidance = diagnostic_guidance_for_code(
+            "api_candidate_semantic_module_unsupported_construct",
+            None,
+        )
+        .expect("guidance");
+        assert!(guidance.why.contains("can't interpret authoritatively"));
+        assert!(guidance.address.contains("analysis boundary"));
+        assert!(!guidance.address.contains("Change the public boundary"));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -136,6 +136,12 @@ struct ChildModulePublicBindings {
     observation_gap_constructs: BTreeSet<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RedundantLeafContextOverlap {
+    Prefix,
+    Suffix,
+}
+
 #[derive(Clone)]
 struct ScopeModuleBinding {
     line: usize,
@@ -6102,6 +6108,9 @@ fn analyze_public_leaf(
     }
 
     if let Some(shorter_leaf) = redundant_category_suffix_leaf(parent_module, leaf_name, settings) {
+        if surface_category_suffix_is_not_actionable(parent_module, &shorter_leaf) {
+            return;
+        }
         diagnostics.push(Diagnostic::policy(
             Some(path.to_path_buf()),
             Some(line),
@@ -6121,7 +6130,12 @@ fn analyze_public_leaf(
         return;
     }
 
-    if let Some(shorter_leaf) = redundant_leaf_context_candidate(parent_module, leaf_name) {
+    if let Some((shorter_leaf, overlap)) =
+        redundant_leaf_context_candidate_with_overlap(parent_module, leaf_name)
+    {
+        if surface_leaf_context_is_not_actionable(parent_module, &shorter_leaf, overlap) {
+            return;
+        }
         diagnostics.push(Diagnostic::policy(
             Some(path.to_path_buf()),
             Some(line),
@@ -6164,6 +6178,9 @@ fn analyze_internal_leaf(
     }
 
     if let Some(shorter_leaf) = redundant_category_suffix_leaf(parent_module, leaf_name, settings) {
+        if surface_category_suffix_is_not_actionable(parent_module, &shorter_leaf) {
+            return;
+        }
         diagnostics.push(Diagnostic::policy(
             Some(path.to_path_buf()),
             Some(line),
@@ -6183,8 +6200,20 @@ fn analyze_internal_leaf(
         return;
     }
 
-    if let Some(shorter_leaf) = redundant_leaf_context_candidate(parent_module, leaf_name) {
+    if let Some((shorter_leaf, overlap)) =
+        redundant_leaf_context_candidate_with_overlap(parent_module, leaf_name)
+    {
         if internal_shorter_leaf_is_too_generic(&shorter_leaf) {
+            return;
+        }
+        if surface_leaf_context_is_not_actionable(parent_module, &shorter_leaf, overlap) {
+            return;
+        }
+        if internal_leaf_context_suffix_role_is_not_actionable(
+            parent_module,
+            &shorter_leaf,
+            overlap,
+        ) {
             return;
         }
         if internal_leaf_context_is_human_facing_machinery(module_path, leaf_name) {
@@ -6964,7 +6993,10 @@ fn redundant_category_suffix_leaf(
     None
 }
 
-fn redundant_leaf_context_candidate(parent_module: &str, leaf_name: &str) -> Option<String> {
+fn redundant_leaf_context_candidate_with_overlap(
+    parent_module: &str,
+    leaf_name: &str,
+) -> Option<(String, RedundantLeafContextOverlap)> {
     let module_segments = split_segments(parent_module)
         .into_iter()
         .map(|segment| normalize_segment(&segment))
@@ -6983,14 +7015,20 @@ fn redundant_leaf_context_candidate(parent_module: &str, leaf_name: &str) -> Opt
     if leaf_normalized.starts_with(&module_segments) {
         let shorter_segments = &leaf_segments[module_segments.len()..];
         if !shorter_segments.is_empty() {
-            return Some(render_segments(shorter_segments, style));
+            return Some((
+                render_segments(shorter_segments, style),
+                RedundantLeafContextOverlap::Prefix,
+            ));
         }
     }
 
     if leaf_normalized.ends_with(&module_segments) {
         let shorter_segments = &leaf_segments[..leaf_segments.len() - module_segments.len()];
         if !shorter_segments.is_empty() {
-            return Some(render_segments(shorter_segments, style));
+            return Some((
+                render_segments(shorter_segments, style),
+                RedundantLeafContextOverlap::Suffix,
+            ));
         }
     }
 
@@ -7092,6 +7130,74 @@ fn internal_leaf_context_is_adapter_policy(parent_module: &str, shorter_leaf: &s
         && shorter_tokens
             .last()
             .is_some_and(|token| adapter_role_tokens.contains(&token.as_str()))
+}
+
+fn internal_leaf_context_suffix_role_is_not_actionable(
+    parent_module: &str,
+    shorter_leaf: &str,
+    overlap: RedundantLeafContextOverlap,
+) -> bool {
+    if overlap != RedundantLeafContextOverlap::Suffix {
+        return false;
+    }
+
+    let role_tokens = [
+        "access", "action", "actions", "card", "cards", "copy", "copies",
+    ];
+    let parent_tokens = name_tokens(parent_module);
+    if !parent_tokens
+        .iter()
+        .any(|token| role_tokens.contains(&token.as_str()))
+    {
+        return false;
+    }
+
+    let shorter_tokens = name_tokens(shorter_leaf);
+    shorter_tokens.len() <= 2
+}
+
+fn surface_category_suffix_is_not_actionable(_parent_module: &str, shorter_leaf: &str) -> bool {
+    surface_shorter_leaf_is_too_generic(shorter_leaf)
+}
+
+fn surface_leaf_context_is_not_actionable(
+    _parent_module: &str,
+    shorter_leaf: &str,
+    overlap: RedundantLeafContextOverlap,
+) -> bool {
+    if surface_shorter_leaf_is_too_generic(shorter_leaf) {
+        return true;
+    }
+
+    let shorter_tokens = name_tokens(shorter_leaf);
+    overlap == RedundantLeafContextOverlap::Suffix
+        && shorter_tokens.len() == 1
+        && shorter_tokens
+            .last()
+            .is_some_and(|token| surface_fragment_tokens().contains(&token.as_str()))
+}
+
+fn surface_shorter_leaf_is_too_generic(shorter_leaf: &str) -> bool {
+    let tokens = name_tokens(shorter_leaf);
+    !tokens.is_empty()
+        && tokens
+            .iter()
+            .all(|token| surface_fragment_tokens().contains(&token.as_str()))
+}
+
+fn surface_fragment_tokens() -> &'static [&'static str] {
+    &[
+        "box",
+        "into",
+        "iter",
+        "layer",
+        "no",
+        "optional",
+        "parts",
+        "set",
+        "setup",
+        "statement",
+    ]
 }
 
 fn namespace_preserving_module_tail_candidate(

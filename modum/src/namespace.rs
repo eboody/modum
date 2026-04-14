@@ -1136,9 +1136,15 @@ fn redundant_leaf_context_candidate(
         }
     }
 
-    if leaf_normalized.ends_with(&module_segments)
-        && suffix_overlap_is_actionable(parent_module, full_path)
-    {
+    if leaf_normalized.ends_with(&module_segments) && {
+        let shorter_segments = &leaf_segments[..leaf_segments.len() - module_segments.len()];
+        !shorter_segments.is_empty()
+            && suffix_overlap_is_actionable(
+                parent_module,
+                full_path,
+                &render_segments(shorter_segments, style),
+            )
+    } {
         let shorter_segments = &leaf_segments[..leaf_segments.len() - module_segments.len()];
         if !shorter_segments.is_empty() {
             return Some(render_segments(shorter_segments, style));
@@ -1156,7 +1162,11 @@ fn redundant_leaf_context_candidate(
     if preserve_or_generic && leaf_normalized.starts_with(&module_segments) {
         let shorter_segments = &leaf_segments[module_segments.len()..];
         if !shorter_segments.is_empty() {
-            return Some(render_segments(shorter_segments, style));
+            let shorter_leaf = render_segments(shorter_segments, style);
+            if namespace_leaf_context_is_not_actionable(parent_module, &shorter_leaf) {
+                return None;
+            }
+            return Some(shorter_leaf);
         }
     }
 
@@ -1170,6 +1180,12 @@ fn prefix_overlap_is_actionable(
     is_reexport: bool,
     settings: &NamespaceSettings,
 ) -> bool {
+    let Some(parent_module) = full_path.iter().rev().nth(1) else {
+        return false;
+    };
+    if namespace_leaf_context_is_not_actionable(parent_module, shorter_leaf) {
+        return false;
+    }
     if is_unreadable_short_leaf(shorter_leaf) {
         return false;
     }
@@ -1213,8 +1229,15 @@ fn rename_overlap_is_actionable(
             .is_some_and(|segment| matches_generic_noun(segment, settings))
 }
 
-fn suffix_overlap_is_actionable(parent_module: &str, full_path: &[String]) -> bool {
+fn suffix_overlap_is_actionable(
+    parent_module: &str,
+    full_path: &[String],
+    shorter_leaf: &str,
+) -> bool {
     if full_path.len() > 3 {
+        return false;
+    }
+    if namespace_leaf_context_is_not_actionable(parent_module, shorter_leaf) {
         return false;
     }
 
@@ -1235,6 +1258,37 @@ fn is_unreadable_short_leaf(shorter_leaf: &str) -> bool {
         shorter_leaf.to_ascii_lowercase().as_str(),
         "buf" | "ref" | "into" | "from" | "system"
     )
+}
+
+fn namespace_leaf_context_is_not_actionable(_parent_module: &str, shorter_leaf: &str) -> bool {
+    let shorter_tokens = split_segments(shorter_leaf)
+        .into_iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if shorter_tokens.is_empty() {
+        return true;
+    }
+
+    let weak_tokens = [
+        "box",
+        "into",
+        "iter",
+        "layer",
+        "no",
+        "optional",
+        "parts",
+        "set",
+        "setup",
+        "statement",
+    ];
+    if shorter_tokens
+        .iter()
+        .all(|token| weak_tokens.contains(&token.as_str()))
+    {
+        return true;
+    }
+
+    false
 }
 
 fn matches_generic_noun(segment: &str, settings: &NamespaceSettings) -> bool {
