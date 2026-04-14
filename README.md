@@ -1,6 +1,6 @@
 <div align="center">
   <img alt="modum logo" src="https://raw.githubusercontent.com/eboody/modum/main/modum-logo.svg" width="360">
-  <p>Modum checks source-level namespace shape, public surface paths, and caller-facing boundary heuristics across a Rust workspace.</p>
+  <p>Modum is a Rust linter that catches names, module paths, and exports that make code harder to read than they need to be.</p>
   <p>
     <a href="https://github.com/eboody/modum/actions/workflows/ci.yml"><img src="https://github.com/eboody/modum/actions/workflows/ci.yml/badge.svg?branch=main&event=push" alt="build status" /></a>
     <a href="https://crates.io/crates/modum"><img src="https://img.shields.io/crates/v/modum.svg?logo=rust" alt="crates.io" /></a>
@@ -10,94 +10,98 @@
 
 # modum
 
-It is a lint tool. It reports diagnostics. It doesn't rewrite code.
-It analyzes parsed Rust source files. It doesn't expand macros, resolve `include!`, or prune `#[cfg]`.
-It centers namespace shape first, and it also nudges caller-facing boundary modeling when a public surface gets less truthful through flattened paths, raw scalars, or weak module structure.
+`modum` reports diagnostics. It doesn't rewrite code.
+It analyzes parsed Rust source with `syn`, not compiler-resolved semantics.
+It centers namespace shape first, and nudges caller-facing boundaries when APIs drift into raw or misleading forms.
 
 ## Start Here
 
-- Want the idea fast? Read [Why It Exists](#why-it-exists) and [Mental Model](#mental-model).
+- Want the idea fast? Read [Why It Exists](#why-it-exists).
 - Want to try it? Jump to [Quick Usage](#quick-usage).
+- Want the authority boundary? Read [Observation Model](#observation-model).
 - Want to tune it for a real repo? Start with [Configuration](#configuration) and the profile guide.
 - Want the full lint catalog? See [docs/lint-reference.md](docs/lint-reference.md).
 
 ## Why It Exists
 
-`modum` exists to catch two common Rust namespace-shape problems:
+`modum` optimizes for APIs and call sites that read through their module paths instead of compensating in leaf names.
 
-- flattened imports that hide useful context at call sites
-- redundant leaf names that repeat context the module path already provides
+`modum` spends most of its time on surfaces that callers see. The same pressure can still matter internally when the internal structure is drifting too.
 
-These call-site shapes are legal Rust, but they make signatures and public paths harder to scan:
+It mostly catches two things:
+
+- flattened imports or re-exports that hide useful context at call sites
+- leaf names that repeat context the path should already be carrying
+
+The payoff is usually not one isolated rename. It is a whole family collapsing into one semantic module.
+
+Codebases often drift into this over time:
 
 ```rust
-pub fn handle(repo: UserRepository) -> Result<StatusCode, Error> {
+pub struct UserRepository;
+pub struct UserService;
+pub struct UserId;
+pub struct UserController;
+pub struct UserDto;
+pub struct UserRequest;
+pub struct UserResponse;
+```
+
+That usually reads more clearly as:
+
+```rust
+pub mod user {
+    pub struct Repository;
+    pub struct Service;
+    pub struct Id;
+    pub struct Controller;
+    pub struct Dto;
+    pub struct Request;
+    pub struct Response;
+}
+```
+
+That drift also leaks into imports and public APIs:
+
+Before:
+
+```rust
+use user::UserRepository;
+use user::UserService;
+
+pub fn handle(repo: UserRepository) -> Result<UserResponse, Error> {
     todo!()
 }
 ```
 
-These usually read more clearly:
+After:
 
 ```rust
-pub fn handle(repo: user::Repository) -> Result<http::StatusCode, partials::Error> {
+use user;
+
+pub fn handle(repo: user::Repository) -> Result<user::Response, error::Error> {
     todo!()
 }
 ```
 
-The same pattern shows up in public API paths:
+That is the real move `modum` is trying to protect. The domain belongs in the path. Once the path is carrying it, leaves like `Repository`, `Service`, `Id`, `Request`, and `Response` can stay short and composable instead of each one compensating with `User...`.
+
+This only works when the parent path is actually doing real semantic work. If the parent is weak or technical, the longer leaf can still be better:
 
 ```rust
-user::Repository
-user::error::InvalidEmail
-partials::Error
-```
-
-instead of:
-
-```rust
-user::UserRepository
-user::error::InvalidEmailError
-partials::error::Error
-```
-
-The central comparison is often this:
-
-```rust
-user::Repository
+storage::Repository
 UserRepository
 ```
 
-In the abstract, `user::Repository` is usually better than `UserRepository`.
-
-Why:
-
-- The domain lives in the path, which is where Rust already gives you structure.
-- The leaf can stay generic and composable: `user::Repository`, `user::Service`, `user::Id`.
-- It scales better across a crate than baking the domain into every type name.
-
-That is also why `user::Repository` is usually better than `user::UserRepository`: once the path is doing the domain work, the leaf doesn't need to repeat it.
-
-The main caveat is that this only holds when `user` is a real semantic module. If the parent path is weak or technical, then a longer leaf can still be better. `UserRepository` is often clearer than `storage::Repository`.
+Here `UserRepository` is often clearer, because `storage` is technical and `user` is semantic.
 
 So the rule is:
 
 - strong semantic parent: prefer `user::Repository`
-- weak or technical parent: prefer the more descriptive leaf
+- weak or technical parent: keep the more descriptive leaf
+- fix the actual structure instead of rewarding cosmetic renames that only silence a lint
 
-`modum` checks that style across an entire workspace at the parsed-source level.
-
-## What It Is For
-
-`modum` exists to make Rust code read through its paths and surfaces instead of compensating prefixes, suffixes, and flattened aliases.
-
-- Put meaning in module paths when the path is where that meaning belongs.
-- Keep leaves short when a strong parent path already carries the domain.
-- Keep leaves specific when the parent path is weak or technical.
-- Fix the actual structure instead of rewarding cosmetic renames that only silence a lint.
-
-The target is clearer paths and a truer API shape, not one universal naming aesthetic and not shorter names for their own sake. A lint is only good when following it makes the path clearer and the surface more truthful.
-
-That is also why owned code and external crates are treated differently. For code you own, `modum` can suggest a better parent surface that you could create, such as re-exporting `domain::user::User` as `domain::User`. For external crates, it stays conservative and only relies on surfaces that already exist.
+Owned code and external crates are treated differently for the same reason. For code you own, `modum` can suggest a better parent surface that you could create, such as re-exporting `domain::user::User` as `domain::User`. For external crates, it stays conservative and only relies on surfaces that already exist.
 
 ## Observation Model
 
@@ -110,15 +114,6 @@ It doesn't observe:
 - `include!`-generated items
 
 When semantic-module family inference would depend on those constructs, `modum` skips `api_candidate_semantic_module` and emits `api_candidate_semantic_module_unsupported_construct` instead.
-
-## Mental Model
-
-`modum` follows four rules:
-
-1. Keep namespace context visible at call sites.
-2. Prefer a strong semantic parent with a short leaf: `user::Repository` over `UserRepository`.
-3. Keep a more descriptive leaf when the parent path is weak or technical.
-4. Use modules for domain boundaries, not file organization.
 
 ## Quick Usage
 
