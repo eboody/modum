@@ -1,6 +1,6 @@
 <div align="center">
   <img alt="modum logo" src="https://raw.githubusercontent.com/eboody/modum/main/modum-logo.svg" width="360">
-  <p>Modum checks source-level namespace shape, alias hygiene, module naming, and surface-path heuristics across a Rust workspace.</p>
+  <p>Modum checks source-level namespace shape, public surface paths, and caller-facing boundary heuristics across a Rust workspace.</p>
   <p>
     <a href="https://github.com/eboody/modum/actions/workflows/ci.yml"><img src="https://github.com/eboody/modum/actions/workflows/ci.yml/badge.svg?branch=main&event=push" alt="build status" /></a>
     <a href="https://crates.io/crates/modum"><img src="https://img.shields.io/crates/v/modum.svg?logo=rust" alt="crates.io" /></a>
@@ -10,8 +10,16 @@
 
 # modum
 
-It is a lint tool. It reports diagnostics. It does not rewrite code.
-It analyzes parsed Rust source files. It does not expand macros, resolve `include!`, or prune `#[cfg]`.
+It is a lint tool. It reports diagnostics. It doesn't rewrite code.
+It analyzes parsed Rust source files. It doesn't expand macros, resolve `include!`, or prune `#[cfg]`.
+It centers namespace shape first, and it also nudges caller-facing boundary modeling when a public surface gets less truthful through flattened paths, raw scalars, or weak module structure.
+
+## Start Here
+
+- Want the idea fast? Read [Why It Exists](#why-it-exists) and [Mental Model](#mental-model).
+- Want to try it? Jump to [Quick Usage](#quick-usage).
+- Want to tune it for a real repo? Start with [Configuration](#configuration) and the profile guide.
+- Want the full lint catalog? See [docs/lint-reference.md](docs/lint-reference.md).
 
 ## Why It Exists
 
@@ -67,7 +75,7 @@ Why:
 - The leaf can stay generic and composable: `user::Repository`, `user::Service`, `user::Id`.
 - It scales better across a crate than baking the domain into every type name.
 
-That is also why `user::Repository` is usually better than `user::UserRepository`: once the path is doing the domain work, the leaf does not need to repeat it.
+That is also why `user::Repository` is usually better than `user::UserRepository`: once the path is doing the domain work, the leaf doesn't need to repeat it.
 
 The main caveat is that this only holds when `user` is a real semantic module. If the parent path is weak or technical, then a longer leaf can still be better. `UserRepository` is often clearer than `storage::Repository`.
 
@@ -95,7 +103,7 @@ That is also why owned code and external crates are treated differently. For cod
 
 `modum` reads Rust source files with `syn` and reports source-level heuristics from the parsed AST.
 
-It does not observe:
+It doesn't observe:
 
 - cfg-pruned items
 - macro-expanded items
@@ -134,52 +142,6 @@ cargo modum check --root . --format json
 modum check --root .
 cargo modum check --root .
 ```
-
-### Neovim
-
-`modum` works well with `nvim-lint`. Use `--mode warn` so diagnostics do not fail the editor job, and use `--format json` for stable parsing.
-
-```lua
-local lint = require("lint")
-
-lint.linters.modum = {
-  cmd = "modum",
-  stdin = false,
-  stream = "stdout",
-  args = { "check", "--root", vim.fn.getcwd(), "--mode", "warn", "--format", "json" },
-  parser = function(output, bufnr)
-    if output == "" then
-      return {}
-    end
-
-    local decoded = vim.json.decode(output)
-    local current_file = vim.api.nvim_buf_get_name(bufnr)
-    local diagnostics = {}
-
-    for _, item in ipairs(((decoded or {}).report or {}).diagnostics or {}) do
-      if item.file == current_file then
-        diagnostics[#diagnostics + 1] = {
-          bufnr = bufnr,
-          lnum = math.max((item.line or 1) - 1, 0),
-          col = 0,
-          severity = item.level == "Error"
-            and vim.diagnostic.severity.ERROR
-            or vim.diagnostic.severity.WARN,
-          source = "modum",
-          code = item.code,
-          message = item.message,
-        }
-      end
-    end
-
-    return diagnostics
-  end,
-}
-
-lint.linters_by_ft.rust = { "modum" }
-```
-
-If you edit multiple crates from one Neovim session, replace `vim.fn.getcwd()` with your workspace root resolver. `modum` is workspace-oriented, so it is usually better to run it on save than on every `InsertLeave`.
 
 If you are developing `modum` itself:
 
@@ -235,6 +197,14 @@ For large repos that are adopting `modum` incrementally:
 - run: cargo install modum
 - run: cargo modum check --root . --baseline .modum-baseline.json
 ```
+
+## Editor Integration
+
+For editor setup, see [docs/editor-integration.md](docs/editor-integration.md). The short version is:
+
+- use `--mode warn` so diagnostics don't fail the editor job
+- use `--format json` for stable parsing
+- resolve the workspace root explicitly if one editor session spans several crates
 
 ## Exit Behavior
 
@@ -307,155 +277,23 @@ Adoption workflow:
 
 - start with `--profile core` or `--mode warn`
 - use `ignored_diagnostic_codes` for durable repo-specific exceptions
-- use `ignored_namespace_preserving_modules = ["components", "page", "partials"]` when a UI aggregator repo intentionally flattens those modules and you do not want to replace the full preserve-module default set
+- use `ignored_namespace_preserving_modules = ["components", "page", "partials"]` when a UI aggregator repo intentionally flattens those modules and you don't want to replace the full preserve-module default set
 - generate a baseline with `modum check --write-baseline .modum-baseline.json`
 - apply it in CI with `modum check --baseline .modum-baseline.json` or `metadata.modum.baseline = ".modum-baseline.json"`
 
 ## Lint Categories
 
-### Import Style
+The full catalog lives in [docs/lint-reference.md](docs/lint-reference.md). In the README, the important split is what each category is trying to protect:
 
-These warn when imports or re-exports flatten a namespace that should stay visible.
+- Import Style: keep namespace context visible at call sites and stop flattened imports or re-exports from erasing meaning that belongs in the path.
+- Public API Paths: keep public surfaces honest by preferring strong semantic parents, avoiding repeated leaf context, and surfacing obvious parent aliases when a child module is doing too much naming work.
+- Boundary Modeling: push caller-facing APIs away from raw strings, raw integers, raw id aliases, weak error surfaces, and other boundary shapes that leak semantics into primitives.
+- Module Boundaries: catch weak catch-all modules and repeated path segments that usually signal structure drift.
+- Structural Errors: block public paths like `partials::error::Error` when an organizational child module should be flattened back to the parent surface.
 
-- `namespace_flat_use`
-  Warning for flattened imports of generic nouns when there is an actionable namespace-visible call-site form that adds net context, such as `storage::Repository` or `http::StatusCode`. It skips cases where the only preserved form would still be redundant, such as `error::Error` or `response::Response`.
-- `namespace_flat_use_preserve_module`
-  Warning for flattened imports from configured namespace-preserving modules when the preserved call-site form still adds net context.
-- `namespace_flat_use_redundant_leaf_context`
-  Warning for flattened imports or actionable rename-heavy aliases whose leaf repeats parent context. For plain imports, this only fires when the shorter leaf would be an actionable generic noun such as `Repository`, `Error`, or `Id`. For rename aliases, this only fires when the qualified form would still preserve real context, such as `http::StatusCode` or `page::Event`.
-- `namespace_redundant_qualified_generic`
-  Warning for qualified call-site paths whose module only repeats a generic category already named by the leaf, such as `response::Response` or `error::Error`. When the written path resolves through an imported namespace and a nearer parent surface would read better, it can recommend that promotable parent surface for owned code even if the export does not exist yet. It does not invent new parent surfaces for external crates such as `std`, `core`, `serde`, or `axum`.
-- `namespace_prelude_glob_import`
-  Warning for `use ...::prelude::*` imports that hide the real source modules and flatten call-site context.
-- `namespace_glob_preserve_module`
-  Warning for glob imports from configured namespace-preserving modules such as `http::*`, when the import erases context the module name should carry at call sites.
-- `namespace_parent_surface`
-- `namespace_flat_pub_use`
-- `namespace_flat_pub_use_preserve_module`
-- `namespace_flat_pub_use_redundant_leaf_context`
+Use `modum --explain <code>` for one lint at a time, or open [docs/lint-reference.md](docs/lint-reference.md) when you want the full category-by-category catalog.
 
-Examples:
-
-- `use storage::Repository;`
-- `use http::Client;`
-- `use user::UserRepository;`
-- `response::Response`
-- `use crate::error::Error;` inside a crate whose root surface already exposes `Error`
-- `pub use auth::{login, logout};`
-- `use http::prelude::*;`
-- `use http::*;`
-
-Canonical parent-surface re-exports are allowed. `pub use error::{Error, Result};` is valid when that is how a module intentionally exposes `module::Error` and `module::Result`. The same applies to broader UI surfaces such as exposing both `components::Button` and `partials::Button`.
-
-A semantic child module namespace can also stay flat when it is already doing the call-site naming work. For example, `use components::tab_set;` with call sites like `tab_set::ContentProps` should not be forced into `components::tab_set::ContentProps`.
-
-### Public API Paths
-
-These warn when public leaves are too generic for a weak parent, when the path repeats context it already has, or when a flat family suggests a semantic module surface.
-
-For these surface-shape rules, shared crate-visible surfaces such as `pub(crate)` items and re-exports are treated the same way as fully public ones.
-
-- `api_missing_parent_surface_export`
-  Warning for public child modules that should also surface a readable parent alias, such as `components::Button` over `components::button::Button`, or `outcome::Toxicity` over `outcome::toxicity::Outcome`.
-- `api_weak_module_generic_leaf`
-- `api_redundant_leaf_context`
-  Warning for public leaves that repeat semantic module context already carried by the path, such as `user::UserRepository`, or that bake a sibling semantic module into a flat public leaf when `user::Repository` already exists.
-- `api_candidate_semantic_module`
-  Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, through select 2-member high-signal pairs like `TransactionId` plus `TransactionFailure` or `HttpRequest` plus `HttpResponse`, through a shared head plus tail that points to a nested surface like `case::launch::{Inbox, Detail, Audit}`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`. It works on parsed source only and does not see macro expansion or cfg-pruned items.
-- `api_candidate_semantic_module_unsupported_construct`
-  Advisory warning for scopes where semantic-module family inference was skipped because the parsed source includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`.
-- `api_manual_enum_string_helper`
-  Advisory warning for public enum string surfaces that are spelled manually, including bespoke non-const methods such as `label()` or `as_str()`, free helpers such as `scenario_label(&Scenario)`, and manual `Display` impls that only map variants to string literals.
-- `api_ad_hoc_parse_helper`
-  Advisory warning for public enum parse helpers, including free `parse_*` functions and inherent methods such as `Mode::parse(&str) -> Result<Self, _>`, when `FromStr` or `TryFrom<&str>` would be a better standard boundary.
-- `api_parallel_enum_metadata_helper`
-  Advisory warning for public enums that expose several parallel metadata helpers like `label()`, `code()`, and `source_term()` over repeated `match self` blocks, when a typed descriptor surface would model that metadata more cleanly.
-- `api_strum_serialize_all_candidate`
-  Warning for per-variant `strum` string attributes that could be replaced by one enum-level `serialize_all` rule without changing the external strings.
-- `api_builder_candidate`
-  Warning for public constructors or workflow entrypoints that take several positional weak parameters and would read better as a builder or typed options struct. It skips functions already marked with a builder surface.
-- `api_repeated_parameter_cluster`
-  Warning for repeated public constructor or workflow signatures that reuse the same ordered named parameter cluster across entrypoints, when a shared options type or `bon` builder would avoid duplicating the call shape.
-- `api_optional_parameter_builder`
-  Warning for builder-shaped public entrypoints that take positional `Option<_>` parameters and would read better as a `bon` builder, so callers can omit unset values instead of passing `None`.
-- `api_defaulted_optional_parameter`
-  Warning for builder-shaped public entrypoints that immediately default positional `Option<_>` parameters, when a `bon` builder would let callers omit those values entirely.
-- `callsite_maybe_some`
-  Advisory warning for `maybe_*` method calls that pass `Some(...)` directly, which usually defeats the point of having paired `x(...)` and `maybe_x(...)` builder setters.
-- `api_standalone_builder_surface`
-  Advisory warning for families of public `with_*` or `set_*` free functions that collectively behave like a builder surface for one type.
-- `api_boolean_protocol_decision`
-  Warning for public `bool` parameters or fields that encode a domain or protocol decision rather than a runtime toggle.
-- `api_forwarding_compat_wrapper`
-  Warning for explicit conversion helpers such as `to_*` or `into_*` methods that only forward to an existing `From` conversion already present in the crate.
-- `api_stringly_protocol_collection`
-  Advisory warning for public const or static collections that enumerate protocol, state, transition, artifact, gate, or step values as raw strings instead of typed enums or descriptor maps.
-- `api_stringly_model_scaffold`
-  Advisory warning for public structs that carry several semantic descriptor fields as raw strings, such as `state_path`, `kind_label`, and `next_machine`, when those concepts would read better as typed enums, newtypes, or a focused descriptor type.
-- `api_redundant_category_suffix`
-
-Examples:
-
-- `UserRepository`, `UserService`, `UserId`
-- `CompletedOutcome`, `RejectedOutcome`, `toxicity::Outcome`
-- `UserRepository` when `user::Repository` already exists
-- `partials::button::Button` when the intended surface should also expose `partials::Button`
-- `outcome::toxicity::Outcome` when the intended surface should also expose `outcome::Toxicity`
-- `storage::Repository`
-- `user::UserRepository`
-- `user::error::InvalidEmailError`
-
-Private organizational child modules are allowed to flatten their family items back to the parent surface. For example, `mod auth_shell; pub use auth_shell::{AuthShell, AuthShellVariant};` is treated as a valid parent-surface export shape.
-
-### Boundary Modeling
-
-These advisories push caller-facing types and signatures away from raw strings, raw integers, raw key-value bags, manual flag bits, and catch-all error surfaces.
-
-- `api_anyhow_error_surface`
-  Advisory warning for public or shared surfaces that expose `anyhow::Error` or `anyhow::Result` instead of a crate-owned typed error boundary.
-- `api_string_error_surface`
-  Advisory warning for public or shared surfaces that return `Result<_, String>` or store error text in raw string fields.
-- `api_manual_error_surface`
-  Advisory warning for public error types that manually expose both `Display` and `Error`, when the boundary may want a smaller focused error surface instead of more formatting boilerplate.
-- `api_semantic_string_scalar`
-  Advisory warning for caller-facing names like `email`, `url`, `path`, `locale`, or `currency` when they stay raw `String` or `&str`.
-- `api_semantic_numeric_scalar`
-  Advisory warning for caller-facing names like `duration`, `timestamp`, or `port` when they stay raw primitive integers.
-- `api_raw_key_value_bag`
-  Advisory warning for caller-facing `HashMap<String, String>`, `BTreeMap<String, String>`, or `Vec<(String, String)>` bags such as `metadata`, `headers`, `params`, or `tags`.
-- `api_boolean_flag_cluster`
-  Advisory warning for public structs or entrypoints that carry several booleans which jointly shape behavior.
-- `api_integer_protocol_parameter`
-  Advisory warning for protocol-like names such as `status`, `kind`, `mode`, or `phase` when they stay raw integers.
-- `api_raw_id_surface`
-  Advisory warning for raw id aliases, fields, parameters, or returns such as `UserId = String` or `request_id: u64`.
-- `api_manual_flag_set`
-  Advisory warning for parallel public `FLAG_*` integer constants, raw `flags` and `permissions` bit-mask boundaries, or repeated named bitmask checks and assembly in caller-facing code that suggest a typed flags surface.
-
-### Module Boundaries
-
-These catch weak or redundant public module structure.
-
-- `api_catch_all_module`
-- `api_repeated_module_segment`
-
-Examples:
-
-- `helpers`
-- `error::error`
-
-### Structural Errors
-
-This rule is an error, not a warning.
-
-- `api_organizational_submodule_flatten`
-
-Example:
-
-- `partials::error::Error` should usually be `partials::Error`
-- `response::Response` should usually be `Response`
-
-## What It Does Not Check
+## What It Doesn't Check
 
 Some naming-guide rules stay advisory because they are too semantic to lint reliably without compiler-grade context. `api_candidate_semantic_module` is also source-level only; if a scope relies on `#[cfg]`, item macros, or `include!`, `modum` emits `api_candidate_semantic_module_unsupported_construct` instead of pretending the inferred family is complete.
 
@@ -480,7 +318,7 @@ modum check --root . --include crates/api/src --include crates/domain/src
 
 ## False Positives And False Negatives
 
-The broader import-style lints only inspect module-scope `use` items. They do not scan local block imports inside functions or tight test scopes, because those scopes often benefit from flatter imports.
+The broader import-style lints only inspect module-scope `use` items. They don't scan local block imports inside functions or tight test scopes, because those scopes often benefit from flatter imports.
 
 To reduce false negatives:
 
@@ -488,3 +326,9 @@ To reduce false negatives:
 - use `extra_namespace_preserving_modules` or `ignored_namespace_preserving_modules` when the default preserve-module set is close but not quite right for your repo
 - keep `generic_nouns` aligned with the generic leaves your API actually uses
 - keep `organizational_modules` configured so `partials::error::Error`-style paths stay blocked
+
+## Read Next
+
+- [docs/lint-reference.md](docs/lint-reference.md): full lint catalog and category detail
+- [docs/editor-integration.md](docs/editor-integration.md): Neovim setup and editor-facing JSON usage
+- [docs/naming-guide.md](docs/naming-guide.md): naming rules that shape the tool's heuristics
