@@ -119,6 +119,20 @@ impl std::error::Error for RequestError {}
 pub fn load() -> std::result::Result<(), RequestError> {
     todo!()
 }
+
+pub mod workflow {
+    pub mod inbound {
+        pub mod source_update {
+            pub trait SourceUpdate {}
+        }
+    }
+}
+
+pub fn keep(
+    boundary: &dyn workflow::inbound::source_update::SourceUpdate,
+) -> &dyn workflow::inbound::source_update::SourceUpdate {
+    boundary
+}
 "#,
     )
     .expect("write source");
@@ -602,6 +616,12 @@ fn cli_json_output_includes_fix_metadata_for_direct_path_rewrites() {
     assert_eq!(diag["policy"].as_bool(), Some(true));
     assert_eq!(diag["fix"]["kind"].as_str(), Some("replace_path"));
     assert_eq!(diag["fix"]["replacement"].as_str(), Some("Response"));
+    assert!(diag["guidance"]["why"]
+        .as_str()
+        .is_some_and(|text| text.contains("generic category")));
+    assert!(diag["guidance"]["address"]
+        .as_str()
+        .is_some_and(|text| text.contains("direct rewrite is `Response`")));
 }
 
 #[test]
@@ -668,6 +688,8 @@ fn cli_text_output_shows_profile_and_fix_hint() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("namespace_redundant_qualified_generic, core"));
     assert!(stdout.contains("[fix: Response]"));
+    assert!(stdout.contains("why: The qualifier repeats a generic category"));
+    assert!(stdout.contains("address: Use the nearer parent surface"));
 }
 
 #[test]
@@ -694,6 +716,8 @@ fn cli_pretty_output_adds_formatting_and_color() {
     assert!(stripped.contains("namespace_redundant_qualified_generic"));
     assert!(stripped.contains("api_candidate_semantic_module"));
     assert!(stripped.contains("LINT"));
+    assert!(stripped.contains("WHY"));
+    assert!(stripped.contains("ADDRESS"));
     assert!(stripped.contains("CHANGE"));
     assert!(stripped.contains("replace with"));
     assert!(stripped.contains("FILE"));
@@ -722,12 +746,11 @@ fn cli_pretty_output_highlights_problem_and_recommended_code_spans() {
     assert!(stdout.contains("\u{1b}[1;31mRequestError\u{1b}[0m"));
     assert!(stdout.contains("\u{1b}[1;34mDisplay\u{1b}[0m"));
     assert!(stdout.contains("\u{1b}[1;34mError\u{1b}[0m"));
-    assert!(stdout.contains("\u{1b}[1;31mstd\u{1b}[0m"));
-    assert!(stdout.contains("\u{1b}[1;31mresult\u{1b}[0m"));
-    assert!(stdout.contains("\u{1b}[1;31mResult\u{1b}[0m"));
-    assert!(stdout.contains("\u{1b}[1;36mstd\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;31msource_update\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;31mSourceUpdate\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;36minbound\u{1b}[0m"));
     assert!(stdout.contains("\u{1b}[1;33m::\u{1b}[0m"));
-    assert!(stdout.contains("\u{1b}[1;32mResult\u{1b}[0m"));
+    assert!(stdout.contains("\u{1b}[1;32mSourceUpdate\u{1b}[0m"));
 }
 
 #[test]
@@ -804,6 +827,8 @@ fn cli_explain_prints_profile_and_summary() {
     assert!(stdout.contains("namespace_flat_use"));
     assert!(stdout.contains("profile: core"));
     assert!(stdout.contains("Flattened imports hide useful namespace context"));
+    assert!(stdout.contains("why:"));
+    assert!(stdout.contains("address:"));
     assert!(stdout.contains("suppression: use `--ignore namespace_flat_use`"));
     assert!(stdout.contains("write-baseline .modum-baseline.json"));
 }

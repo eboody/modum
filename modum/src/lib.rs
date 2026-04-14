@@ -261,6 +261,7 @@ struct NamespaceSettings {
     semantic_string_scalars: BTreeSet<String>,
     semantic_numeric_scalars: BTreeSet<String>,
     key_value_bag_names: BTreeSet<String>,
+    owned_crate_names: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +336,7 @@ impl Default for NamespaceSettings {
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect(),
+            owned_crate_names: BTreeSet::new(),
         }
     }
 }
@@ -354,6 +356,11 @@ pub fn render_diagnostic_explanation(code: &str) -> Option<String> {
         info.profile.as_str(),
         info.summary,
     );
+
+    if let Some(guidance) = diagnostic::diagnostic_guidance_for_code(code, None) {
+        let _ = write!(rendered, "\nwhy: {}", guidance.why);
+        let _ = write!(rendered, "\naddress: {}", guidance.address);
+    }
 
     if let Some(details) = diagnostic_explanation_details(code) {
         for detail in details {
@@ -526,7 +533,8 @@ pub fn analyze_workspace_with_settings(
     cli_settings: &AnalysisSettings,
 ) -> WorkspaceReport {
     let mut diagnostics = Vec::new();
-    let workspace_defaults = load_workspace_settings(root, &mut diagnostics);
+    let mut workspace_defaults = load_workspace_settings(root, &mut diagnostics);
+    workspace_defaults.owned_crate_names = workspace_owned_library_crate_names(root);
     let repo_profile = load_repo_profile(root, &mut diagnostics);
     let workspace_ignored_diagnostic_codes =
         load_repo_ignored_diagnostic_codes(root, &mut diagnostics);
@@ -1327,58 +1335,20 @@ fn render_relative_path(root: &Path, path: &Path) -> String {
 
 fn diagnostic_explanation_details(code: &str) -> Option<&'static [&'static str]> {
     match code {
-        "namespace_prelude_glob_import" => Some(&[
-            "why: prelude globs make it harder to see which module gives a name its meaning.",
-            "typical fixes: import the specific items you need or keep the preserving module visible at call sites.",
-        ]),
         "namespace_flat_use_preserve_module" | "namespace_flat_pub_use_preserve_module" => Some(&[
-            "why: flattening imports from modules like `http`, `page`, or `components` can erase the part of the path that explains the item's role.",
-            "typical fixes: keep the module qualifier visible at the call site or re-export surface.",
             "repo tuning: use `metadata.modum.extra_namespace_preserving_modules` or `metadata.modum.ignored_namespace_preserving_modules` to adjust which modules should stay visible.",
         ]),
         "namespace_glob_preserve_module" => Some(&[
-            "why: broad globs from modules like `http`, `error`, or `query` erase context that often helps readers scan call sites.",
-            "typical fixes: import only the concrete items you need or keep the module qualifier in local code.",
             "repo tuning: use `metadata.modum.extra_namespace_preserving_modules` or `metadata.modum.ignored_namespace_preserving_modules` to adjust which modules should stay visible.",
         ]),
-        "api_anyhow_error_surface" => Some(&[
-            "why: `anyhow` works well internally, but caller-facing boundaries usually read better when the crate owns the error type and variants.",
-            "typical fixes: return a crate-owned error enum or newtype and convert internal failures into that boundary type.",
-        ]),
-        "api_string_error_surface" => Some(&[
-            "why: raw string errors lose structure, variant names, and machine-readable context at the boundary.",
-            "typical fixes: model the boundary error as an enum, a focused struct, or another typed error value with named data.",
-        ]),
         "api_semantic_string_scalar" => Some(&[
-            "why: names like `email`, `url`, `path`, or `locale` usually carry domain rules that a plain `String` cannot express.",
-            "typical fixes: parse at the boundary into a domain newtype or another focused typed value.",
             "repo tuning: use `metadata.modum.extra_semantic_string_scalars` or `metadata.modum.ignored_semantic_string_scalars` to adjust the token family.",
         ]),
         "api_semantic_numeric_scalar" => Some(&[
-            "why: names like `duration`, `timestamp`, or `port` often want units or domain semantics, not a bare integer.",
-            "typical fixes: use a typed duration, timestamp, port, or small domain newtype at the boundary.",
             "repo tuning: use `metadata.modum.extra_semantic_numeric_scalars` or `metadata.modum.ignored_semantic_numeric_scalars` to adjust the token family.",
         ]),
         "api_raw_key_value_bag" => Some(&[
-            "why: bags like `metadata`, `headers`, or `params` often accrete hidden contracts that are easier to understand once they are typed.",
-            "typical fixes: introduce a focused options struct, metadata type, or dedicated collection wrapper.",
             "repo tuning: use `metadata.modum.extra_key_value_bag_names` or `metadata.modum.ignored_key_value_bag_names` to adjust the token family.",
-        ]),
-        "callsite_maybe_some" => Some(&[
-            "why: `maybe_*` setters are most useful when the caller already has an `Option<_>` to forward; wrapping a concrete value in `Some(...)` throws away that distinction.",
-            "typical fixes: call the non-`maybe_` setter when you already have a value, or keep the `Option<_>` intact and pass that directly.",
-        ]),
-        "api_boolean_flag_cluster" => Some(&[
-            "why: several booleans together usually encode modes or policy choices that are easier to name explicitly.",
-            "typical fixes: group the behavior into a typed options struct, an enum, or a smaller decision object.",
-        ]),
-        "api_manual_flag_set" => Some(&[
-            "why: parallel flag constants and repeated raw bitmask checks usually mean the boundary is modeling a flags type by hand.",
-            "typical fixes: introduce a focused typed flags surface or small domain wrapper instead of exposing raw integer masks.",
-        ]),
-        "api_raw_id_surface" => Some(&[
-            "why: ids often carry validation, formatting, or cross-system meaning that is easy to lose when they stay as bare strings or integers.",
-            "typical fixes: introduce a small id newtype and parse or validate at the boundary.",
         ]),
         _ => None,
     }
@@ -1522,6 +1492,10 @@ fn render_diagnostic_section<'a>(
                 let _ = writeln!(out, "- [{level}{code}] {}{fix}", diag.message);
             }
         }
+        if let Some(guidance) = diag.guidance() {
+            let _ = writeln!(out, "  why: {}", guidance.why);
+            let _ = writeln!(out, "  address: {}", guidance.address);
+        }
     }
     let _ = writeln!(out);
 }
@@ -1659,6 +1633,83 @@ fn collect_default_scan_roots(root: &Path) -> io::Result<Vec<PathBuf>> {
     }
 
     Ok(scan_roots.into_iter().collect())
+}
+
+fn workspace_owned_library_crate_names(root: &Path) -> BTreeSet<String> {
+    let Ok(package_roots) = collect_workspace_package_roots(root) else {
+        return BTreeSet::new();
+    };
+
+    package_roots
+        .into_iter()
+        .filter_map(|package_root| package_library_crate_name(&package_root))
+        .collect()
+}
+
+fn collect_workspace_package_roots(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
+    let mut package_roots = BTreeSet::new();
+    let manifest_path = root.join("Cargo.toml");
+
+    if !manifest_path.is_file() {
+        return Ok(package_roots);
+    }
+
+    let manifest_src = fs::read_to_string(&manifest_path)?;
+    let manifest: toml::Value = toml::from_str(&manifest_src).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse {}: {err}", manifest_path.display()),
+        )
+    })?;
+
+    let root_is_package = manifest.get("package").is_some_and(toml::Value::is_table);
+    if root_is_package {
+        package_roots.insert(root.to_path_buf());
+    }
+
+    if let Some(workspace) = manifest.get("workspace").and_then(toml::Value::as_table) {
+        let excluded = parse_workspace_patterns(workspace.get("exclude"));
+        for member_pattern in parse_workspace_patterns(workspace.get("members")) {
+            for member_root in resolve_workspace_member_pattern(root, &member_pattern)? {
+                if is_excluded_member(root, &member_root, &excluded)? {
+                    continue;
+                }
+                package_roots.insert(member_root);
+            }
+        }
+    }
+
+    Ok(package_roots)
+}
+
+fn package_library_crate_name(package_root: &Path) -> Option<String> {
+    let manifest_path = package_root.join("Cargo.toml");
+    let manifest_src = fs::read_to_string(&manifest_path).ok()?;
+    let manifest = toml::from_str::<toml::Value>(&manifest_src).ok()?;
+    let package = manifest.get("package")?.as_table()?;
+    let lib = manifest.get("lib").and_then(toml::Value::as_table);
+
+    let has_library_target = if let Some(lib) = lib {
+        lib.get("path")
+            .and_then(toml::Value::as_str)
+            .map(|path| package_root.join(path).is_file())
+            .unwrap_or_else(|| package_root.join("src/lib.rs").is_file())
+    } else {
+        package_root.join("src/lib.rs").is_file()
+    };
+    if !has_library_target {
+        return None;
+    }
+
+    lib.and_then(|lib| lib.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(|name| name.replace('-', "_"))
+        .or_else(|| {
+            package
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .map(|name| name.replace('-', "_"))
+        })
 }
 
 fn parse_workspace_patterns(value: Option<&toml::Value>) -> Vec<String> {

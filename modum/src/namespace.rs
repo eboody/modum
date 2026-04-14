@@ -710,6 +710,14 @@ fn promotable_parent_surface_candidate(
         let parent_surface_prefix = &full_path[..prefix_len];
         let resolved_parent_surface =
             resolve_qualified_parent_surface_path(current_module_path, parent_surface_prefix)?;
+        if !promotable_parent_surface_is_owned(
+            path,
+            full_path,
+            &resolved_parent_surface,
+            settings,
+        ) {
+            continue;
+        }
         if !resolved_parent_surface_adds_net_context(
             &resolved_parent_surface,
             leaf_name,
@@ -733,6 +741,21 @@ fn promotable_parent_surface_candidate(
     }
 
     None
+}
+
+fn promotable_parent_surface_is_owned(
+    path: &Path,
+    full_path: &[String],
+    resolved_parent_surface: &[String],
+    settings: &NamespaceSettings,
+) -> bool {
+    full_path
+        .first()
+        .is_some_and(|segment| is_relative_keyword(segment))
+        || module_path_exists_in_current_crate(path, resolved_parent_surface)
+        || full_path
+            .first()
+            .is_some_and(|segment| settings.owned_crate_names.contains(segment))
 }
 
 fn resolved_parent_surface_adds_net_context(
@@ -1464,6 +1487,24 @@ fn inline_module_items_for_module(path: &Path, module_path: &[String]) -> Option
     let nested_path = &module_path[current_module_path.len()..];
     let items = nested_inline_module_items(&parsed.items, nested_path)?;
     Some(items.to_vec())
+}
+
+fn module_path_exists_in_current_crate(path: &Path, module_path: &[String]) -> bool {
+    if module_path.is_empty() {
+        return true;
+    }
+
+    if inline_module_items_for_module(path, module_path).is_some() {
+        return true;
+    }
+
+    let Some(src_root) = source_root(path) else {
+        return false;
+    };
+
+    parent_module_files(&src_root, module_path)
+        .into_iter()
+        .any(|candidate| candidate.is_file())
 }
 
 fn collect_bindings(items: &[Item], public_only: bool) -> BTreeSet<String> {

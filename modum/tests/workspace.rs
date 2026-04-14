@@ -1333,6 +1333,123 @@ pub fn keep(boundary: &dyn source_update::SourceUpdate) -> &dyn source_update::S
 }
 
 #[test]
+fn analyze_workspace_prefers_promotable_parent_surface_for_owned_workspace_crates() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("app/src")).expect("create app src");
+    fs::create_dir_all(root.join("domain/src")).expect("create domain src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+resolver = "2"
+members = ["app", "domain"]
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("app/Cargo.toml"),
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .expect("write app manifest");
+    fs::write(
+        root.join("domain/Cargo.toml"),
+        r#"[package]
+name = "domain"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .expect("write domain manifest");
+    fs::write(
+        root.join("app/src/lib.rs"),
+        r#"
+pub fn keep(user: domain::user::User) -> domain::user::User {
+    user
+}
+"#,
+    )
+    .expect("write app source");
+    fs::write(root.join("domain/src/lib.rs"), "pub mod user;\n").expect("write domain lib");
+    fs::write(root.join("domain/src/user.rs"), "pub struct User;\n").expect("write domain user");
+
+    let report = analyze_workspace(root, &[]);
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diag| {
+            diag.code() == Some("namespace_redundant_qualified_generic")
+                && diag.message.contains("domain::user::User")
+        })
+        .expect("owned workspace crate diagnostic");
+    assert!(diagnostic.message.contains("prefer `domain::User`"));
+    assert!(diagnostic.fix.is_none());
+}
+
+#[test]
+fn analyze_workspace_prefers_promotable_parent_surface_for_owned_workspace_custom_lib_names() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("app/src")).expect("create app src");
+    fs::create_dir_all(root.join("domain/src")).expect("create domain src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+resolver = "2"
+members = ["app", "domain"]
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("app/Cargo.toml"),
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .expect("write app manifest");
+    fs::write(
+        root.join("domain/Cargo.toml"),
+        r#"[package]
+name = "domain-package"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "domain_api"
+"#,
+    )
+    .expect("write domain manifest");
+    fs::write(
+        root.join("app/src/lib.rs"),
+        r#"
+pub fn keep(user: domain_api::user::User) -> domain_api::user::User {
+    user
+}
+"#,
+    )
+    .expect("write app source");
+    fs::write(root.join("domain/src/lib.rs"), "pub mod user;\n").expect("write domain lib");
+    fs::write(root.join("domain/src/user.rs"), "pub struct User;\n").expect("write domain user");
+
+    let report = analyze_workspace(root, &[]);
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diag| {
+            diag.code() == Some("namespace_redundant_qualified_generic")
+                && diag.message.contains("domain_api::user::User")
+        })
+        .expect("owned workspace custom lib diagnostic");
+    assert!(diagnostic.message.contains("prefer `domain_api::User`"));
+    assert!(diagnostic.fix.is_none());
+}
+
+#[test]
 fn analyze_workspace_skips_promotable_parent_surface_when_ancestor_bindings_conflict() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -1368,6 +1485,29 @@ pub fn keep(boundary: &dyn source_update::SourceUpdate) -> &dyn source_update::S
     assert!(!report.diagnostics.iter().any(|diag| {
         diag.code() == Some("namespace_redundant_qualified_generic")
             && diag.message.contains("source_update::SourceUpdate")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_promote_parent_surface_for_external_crates() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn keep(value: axum::response::Response) -> axum::response::Response {
+    value
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_redundant_qualified_generic")
+            && diag.message.contains("axum::response::Response")
     }));
 }
 

@@ -472,6 +472,21 @@ fn render_pretty_diagnostic_section(
 
         render_pretty_lint_detail(out, &diagnostic.message);
 
+        if let Some(guidance) = diagnostic.guidance() {
+            render_pretty_guidance_detail(
+                out,
+                "WHY",
+                &guidance.why,
+                ANSI_BOLD_BLACK_ON_CYAN,
+            );
+            render_pretty_guidance_detail(
+                out,
+                "ADDRESS",
+                &guidance.address,
+                ANSI_BOLD_BLACK_ON_GREEN,
+            );
+        }
+
         if let Some(fix) = &diagnostic.fix {
             render_pretty_fix_detail(out, &fix.replacement);
         }
@@ -504,6 +519,15 @@ fn render_pretty_lint_detail(out: &mut String, message: &str) {
         out,
         "      {} {}",
         ansi_badge("LINT", ANSI_BOLD_BLACK_ON_YELLOW),
+        render_pretty_message(message)
+    );
+}
+
+fn render_pretty_guidance_detail(out: &mut String, label: &str, message: &str, style: &str) {
+    let _ = writeln!(
+        out,
+        "      {} {}",
+        ansi_badge(label, style),
         render_pretty_message(message)
     );
 }

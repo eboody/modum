@@ -78,6 +78,19 @@ So the rule is:
 
 `modum` checks that style across an entire workspace at the parsed-source level.
 
+## What It Is For
+
+`modum` exists to make Rust code read through its paths and surfaces instead of compensating prefixes, suffixes, and flattened aliases.
+
+- Put meaning in module paths when the path is where that meaning belongs.
+- Keep leaves short when a strong parent path already carries the domain.
+- Keep leaves specific when the parent path is weak or technical.
+- Fix the actual structure instead of rewarding cosmetic renames that only silence a lint.
+
+The target is clearer paths and a truer API shape, not one universal naming aesthetic and not shorter names for their own sake. A lint is only good when following it makes the path clearer and the surface more truthful.
+
+That is also why owned code and external crates are treated differently. For code you own, `modum` can suggest a better parent surface that you could create, such as re-exporting `domain::user::User` as `domain::User`. For external crates, it stays conservative and only relies on surfaces that already exist.
+
 ## Observation Model
 
 `modum` reads Rust source files with `syn` and reports source-level heuristics from the parsed AST.
@@ -311,7 +324,7 @@ These warn when imports or re-exports flatten a namespace that should stay visib
 - `namespace_flat_use_redundant_leaf_context`
   Warning for flattened imports or actionable rename-heavy aliases whose leaf repeats parent context. For plain imports, this only fires when the shorter leaf would be an actionable generic noun such as `Repository`, `Error`, or `Id`. For rename aliases, this only fires when the qualified form would still preserve real context, such as `http::StatusCode` or `page::Event`.
 - `namespace_redundant_qualified_generic`
-  Warning for qualified call-site paths whose module only repeats a generic category already named by the leaf, such as `response::Response` or `error::Error`. When the written path resolves through an imported namespace and a nearer parent surface would read better, it can recommend that promotable parent surface even if the export does not exist yet.
+  Warning for qualified call-site paths whose module only repeats a generic category already named by the leaf, such as `response::Response` or `error::Error`. When the written path resolves through an imported namespace and a nearer parent surface would read better, it can recommend that promotable parent surface for owned code even if the export does not exist yet. It does not invent new parent surfaces for external crates such as `std`, `core`, `serde`, or `axum`.
 - `namespace_prelude_glob_import`
   Warning for `use ...::prelude::*` imports that hide the real source modules and flatten call-site context.
 - `namespace_glob_preserve_module`
