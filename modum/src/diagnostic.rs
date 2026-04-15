@@ -752,8 +752,7 @@ fn scope_word_is_generic(scope: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Diagnostic, DiagnosticClass, DiagnosticFix, DiagnosticFixKind,
-        diagnostic_guidance_for_code,
+        Diagnostic, DiagnosticClass, DiagnosticFix, DiagnosticFixKind, diagnostic_guidance_for_code,
     };
 
     #[test]
@@ -806,7 +805,11 @@ mod tests {
 
         let guidance = diag.guidance().expect("guidance");
         assert!(guidance.why.contains("still needs `types::`"));
-        assert!(guidance.address.contains("Import `types::LogFieldKey` directly"));
+        assert!(
+            guidance
+                .address
+                .contains("Import `types::LogFieldKey` directly")
+        );
     }
 
     #[test]
@@ -826,7 +829,11 @@ mod tests {
 
         let guidance = diag.guidance().expect("guidance");
         assert!(guidance.why.contains("meaningful facet or family home"));
-        assert!(guidance.address.contains("Import `viewer::ViewerResolutionFlow` directly"));
+        assert!(
+            guidance
+                .address
+                .contains("Import `viewer::ViewerResolutionFlow` directly")
+        );
     }
 
     #[test]
@@ -846,7 +853,11 @@ mod tests {
 
         let guidance = diag.guidance().expect("guidance");
         assert!(guidance.why.contains("caller-facing surface"));
-        assert!(guidance.address.contains("Re-export through `layers::RequestLayerFlow`"));
+        assert!(
+            guidance
+                .address
+                .contains("Re-export through `layers::RequestLayerFlow`")
+        );
         assert!(guidance.address.contains("visible public facet"));
     }
 
