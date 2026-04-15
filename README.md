@@ -123,27 +123,27 @@ The call-site namespace checks are also source-level only. If keeping a path vis
 
 ```bash
 cargo install modum
-cargo modum check --root .
-cargo modum check --root . --mode warn
-cargo modum --explain namespace_flat_use
-cargo modum check --root . --ignore api_candidate_semantic_module
-cargo modum check --root . --write-baseline .modum-baseline.json
-cargo modum check --root . --baseline .modum-baseline.json
-cargo modum check --root . --exclude examples/high-coverage
-cargo modum check --root . --format json
+modum check
+modum check --mode warn
+modum --explain namespace_flat_use
+modum check --ignore api_candidate_semantic_module
+modum check --write-baseline .modum-baseline.json
+modum check --baseline .modum-baseline.json
+modum check --exclude examples/high-coverage
+modum check --format json
 ```
 
-`cargo install modum` installs both `modum` and the Cargo subcommand `cargo-modum`, so either of these is valid:
+`modum` is the primary command. `cargo install modum` also installs the Cargo subcommand `cargo-modum`, so `cargo modum ...` still works if you prefer it, but the docs use `modum ...`.
 
 ```bash
-modum check --root .
-cargo modum check --root .
+modum check
+cargo modum check
 ```
 
 If you are developing `modum` itself:
 
 ```bash
-cargo run -p modum -- check --root .
+cargo run -p modum -- check
 ```
 
 Environment:
@@ -174,7 +174,7 @@ You can explain any code without running analysis:
 
 ```bash
 modum --explain namespace_flat_use
-cargo modum --explain api_candidate_semantic_module
+modum --explain api_candidate_semantic_module
 ```
 
 ## CI Usage
@@ -183,14 +183,14 @@ Use `modum` the same way you would use `clippy` or `cargo-deny`: run it as a nor
 
 ```yaml
 - run: cargo install modum
-- run: cargo modum check --root .
+- run: modum check
 ```
 
 For large repos that are adopting `modum` incrementally:
 
 ```yaml
 - run: cargo install modum
-- run: cargo modum check --root . --baseline .modum-baseline.json
+- run: modum check --baseline .modum-baseline.json
 ```
 
 ## Editor Integration
@@ -296,7 +296,7 @@ Default discovery:
 Override discovery with `--include`:
 
 ```bash
-modum check --root . --include crates/api/src --include crates/domain/src
+modum check --include crates/api/src --include crates/domain/src
 ```
 
 ## False Positives And False Negatives
