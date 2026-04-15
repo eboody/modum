@@ -2823,6 +2823,81 @@ mod outer {
 }
 
 #[test]
+fn analyze_workspace_does_not_treat_private_imported_helpers_as_family_witnesses() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod external {
+    pub struct ResolutionState;
+    pub struct ResolutionOutcome;
+}
+
+mod viewer {
+    use crate::external::{ResolutionOutcome, ResolutionState};
+
+    pub struct ResolutionFlow;
+
+    pub fn helper(_: ResolutionState, _: ResolutionOutcome) {}
+}
+
+use viewer::ResolutionFlow;
+
+struct Demo(ResolutionFlow);
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use") && diag.message.contains("viewer::ResolutionFlow")
+    }));
+}
+
+#[test]
+fn analyze_workspace_reports_namespace_family_unsupported_constructs() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod viewer {
+    macro_rules! family {
+        () => {
+            pub struct ResolutionState;
+            pub struct ResolutionOutcome;
+        };
+    }
+
+    pub struct ResolutionFlow;
+
+    family!();
+}
+
+use viewer::ResolutionFlow;
+
+struct Demo(ResolutionFlow);
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_family_unsupported_construct")
+            && diag.is_advisory_warning()
+            && diag.message.contains("ResolutionFlow")
+    }));
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use") && diag.message.contains("viewer::ResolutionFlow")
+    }));
+}
+
+#[test]
 fn analyze_workspace_flags_relative_imports_with_real_parent_modules() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();

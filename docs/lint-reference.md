@@ -9,7 +9,7 @@ Use the README for the tool's thesis, quick usage, and configuration entry point
 These warn when imports or re-exports flatten a namespace that should stay visible.
 
 - `namespace_flat_use`
-  Warning for flattened imports of generic nouns when there is an actionable namespace-visible call-site form that adds net context, such as `storage::Repository` or `http::StatusCode`. It skips cases where the only preserved form would still be redundant, such as `error::Error` or `response::Response`.
+  Warning for flattened imports of generic nouns when there is an actionable namespace-visible call-site form that adds net context, such as `storage::Repository` or `http::StatusCode`. It also covers family leaves when parsed source shows a clear local witness that the namespace still matters at call sites, such as `viewer::ResolutionFlow` alongside `viewer::ResolutionState` and `viewer::ResolutionOutcome`. It skips cases where the only preserved form would still be redundant, such as `error::Error` or `response::Response`.
 - `namespace_flat_use_preserve_module`
   Warning for flattened imports from configured namespace-preserving modules when the preserved call-site form still adds net context.
 - `namespace_flat_use_redundant_leaf_context`
@@ -20,6 +20,8 @@ These warn when imports or re-exports flatten a namespace that should stay visib
   Warning for `use ...::prelude::*` imports that hide the real source modules and flatten call-site context.
 - `namespace_glob_preserve_module`
   Warning for glob imports from configured namespace-preserving modules such as `http::*`, when the import erases context the module name should carry at call sites.
+- `namespace_family_unsupported_construct`
+  Advisory warning for imports, re-exports, or type aliases where namespace-family call-site inference was skipped because the parsed source includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`.
 - `namespace_parent_surface`
 - `namespace_flat_pub_use`
 - `namespace_flat_pub_use_preserve_module`

@@ -271,6 +271,10 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
             "The local alias hides the real semantic module path and makes the call site read flatter and more technical than the source surface.",
             "Use the semantic module path directly, or for owned code promote the binding to the nearer parent surface the lint names and use that consistently. Don't keep the technical alias around as the de facto path.",
         ),
+        "namespace_family_unsupported_construct" => (
+            "This namespace family depends on constructs like macros, cfg gates, or includes that the current source-level pass can't interpret authoritatively.",
+            "Treat this as an analysis boundary. Keep the real module path visible until you've verified the family from the expanded or real surface. Don't flatten the path just because the current pass couldn't prove the family, and don't rewrite macros, includes, or cfg-driven code only to satisfy this lint.",
+        ),
         "namespace_parent_surface" => (
             "The parent module already exposes the readable caller-facing surface, so reaching through a child module bypasses the intended entrypoint.",
             "Import or re-export the binding from the parent surface named in the lint and make that the canonical caller-facing path. Keep the child path for implementation organization only; don't add the parent alias and then keep callers split across both surfaces.",
@@ -703,6 +707,20 @@ mod tests {
     }
 
     #[test]
+    fn generic_guidance_for_namespace_family_unsupported_construct_reports_analysis_boundary() {
+        let guidance = diagnostic_guidance_for_code("namespace_family_unsupported_construct", None)
+            .expect("guidance");
+        assert!(guidance.why.contains("can't interpret authoritatively"));
+        assert!(guidance.address.contains("analysis boundary"));
+        assert!(
+            guidance
+                .address
+                .contains("Keep the real module path visible")
+        );
+        assert!(guidance.address.contains("Don't flatten the path"));
+    }
+
+    #[test]
     fn generic_guidance_for_parent_surface_warns_against_split_canonical_paths() {
         let guidance =
             diagnostic_guidance_for_code("namespace_parent_surface", None).expect("guidance");
@@ -784,6 +802,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         "namespace_aliased_qualified_path" => (
             LintProfile::Core,
             "A namespace alias flattens a semantic path instead of keeping the real module visible.",
+        ),
+        "namespace_family_unsupported_construct" => (
+            LintProfile::Strict,
+            "Namespace-family call-site guidance was skipped because source-level analysis hit macros, cfg gates, or includes.",
         ),
         "namespace_parent_surface" => (
             LintProfile::Core,

@@ -86,6 +86,8 @@ pub fn handle(repo: user::Repository) -> Result<user::Response, error::Error> {
 
 That is the real move `modum` is trying to protect. The domain belongs in the path. Once the path is carrying it, leaves like `Repository`, `Service`, `Id`, `Request`, and `Response` can stay short and composable instead of each one compensating with `User...`.
 
+The call-site lints are strongest when the shorter leaf is generic or when parsed source shows a clear local family witness. `modum` doesn't assume every short single-segment leaf should stay qualified.
+
 This only works when the parent path is actually doing real semantic work. If the parent is weak or technical, the longer leaf can still be better:
 
 ```rust
@@ -114,6 +116,8 @@ It doesn't observe:
 - `include!`-generated items
 
 When semantic-module family inference would depend on those constructs, `modum` skips `api_candidate_semantic_module` and emits `api_candidate_semantic_module_unsupported_construct` instead.
+
+Namespace-family call-site inference is also source-level only. If keeping a path visible would depend on macro-generated or cfg-driven sibling bindings, `modum` fails closed and emits `namespace_family_unsupported_construct` instead of pretending the family is complete.
 
 ## Quick Usage
 

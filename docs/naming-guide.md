@@ -143,11 +143,13 @@ Codex should default to these behaviors:
 `modum` enforces the subset of this guide that can be checked reliably across a workspace:
 
 - `namespace_flat_use`
-  Warning. Flags flattened imports of generic nouns such as `Repository` or `Error` when there is an actionable namespace-visible call-site form that adds net context, such as `storage::Repository` or `http::StatusCode`. It skips cases where the only preserved form would still be redundant, such as `error::Error` or `response::Response`.
+  Warning. Flags flattened imports of generic nouns such as `Repository` or `Error`, and also family leaves when parsed source shows a clear local witness that the namespace still matters at call sites, such as `viewer::ResolutionFlow` alongside `viewer::ResolutionState` and `viewer::ResolutionOutcome`. It skips cases where the only preserved form would still be redundant, such as `error::Error` or `response::Response`.
 - `namespace_flat_use_preserve_module`
   Warning. Flags flattened imports from configured namespace-preserving modules such as `email`, `http`, `query`, or `storage` when the preserved call-site form still adds net context.
 - `namespace_flat_use_redundant_leaf_context`
   Warning. Flags flattened imports or actionable rename-heavy aliases such as `use user::UserRepository;` or `use playwright::api::page::Event as PageEvent;` where the child module already supplies the missing context. For plain imports, this only applies when the shorter leaf would land on an actionable generic noun such as `Repository`, `Error`, or `Id`. For rename aliases, this only applies when the preserved qualifier still adds real context at call sites.
+- `namespace_family_unsupported_construct`
+  Advisory warning. Flags imports, re-exports, or type aliases where namespace-family call-site inference was skipped because the parsed source for the sibling family includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`. `modum` emits this instead of pretending the family witness is complete.
 - `namespace_redundant_qualified_generic`
   Warning. Flags qualified call-site paths such as `response::Response` or `error::Error` when the qualifier only repeats a generic category that the leaf already names clearly. When the written path resolves through an imported namespace and the redundant canonical path could read better from a nearer parent surface, it can recommend that promotable parent surface for owned code even if that export does not exist yet. It does not invent new parent surfaces for external crates such as `std`, `core`, `serde`, or `axum`.
 - `namespace_aliased_qualified_path`
@@ -227,3 +229,4 @@ Observation model:
 - `modum` reads parsed Rust source files.
 - It does not expand macros, resolve `include!`, or prune `#[cfg]`.
 - When those constructs would weaken semantic-module family inference, it emits `api_candidate_semantic_module_unsupported_construct` instead of presenting `api_candidate_semantic_module` as complete.
+- When those constructs would weaken namespace-family call-site inference, it emits `namespace_family_unsupported_construct` instead of pretending the local family witness is complete.

@@ -43,6 +43,16 @@ struct QualifiedPathSurfaceCandidate {
     fixable: bool,
 }
 
+struct NamespaceFamilyBindingInfo {
+    bindings: BTreeSet<String>,
+    unsupported_constructs: BTreeSet<String>,
+}
+
+enum NamespaceVisibilityDependency {
+    Visible,
+    Unsupported(BTreeSet<String>),
+}
+
 pub(super) fn analyze_namespace_rules(
     path: &Path,
     parsed: &File,
@@ -259,6 +269,13 @@ fn analyze_use_item(
         };
         let visible_callsite_surface =
             visible_callsite_surface_candidate(analysis_path, source_leaf_name, settings);
+        let namespace_visibility_dependency = namespace_visibility_dependency(
+            path,
+            current_module_path,
+            &binding.full_path,
+            source_leaf_name,
+            settings,
+        );
         let binding_used_as_namespace =
             binding_is_used_as_namespace_in_scope(scope_items, &binding.binding_name);
 
@@ -278,12 +295,9 @@ fn analyze_use_item(
                     &shorter_leaf,
                 )
             } else if (settings.generic_nouns.contains(source_leaf_name)
-                || binding_depends_on_visible_namespace(
-                    path,
-                    current_module_path,
-                    &binding.full_path,
-                    source_leaf_name,
-                    settings,
+                || matches!(
+                    namespace_visibility_dependency,
+                    Some(NamespaceVisibilityDependency::Visible)
                 ))
                 && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
             {
@@ -301,16 +315,25 @@ fn analyze_use_item(
                     &binding.binding_name,
                     visible_callsite_surface,
                 )
+            } else if let Some(NamespaceVisibilityDependency::Unsupported(constructs)) =
+                namespace_visibility_dependency.as_ref()
+            {
+                namespace_family_unsupported_construct_message(
+                    is_reexport,
+                    &binding.source_name,
+                    visible_callsite_surface.as_deref(),
+                    constructs,
+                )
             } else {
                 continue;
             };
 
-        diagnostics.push(Diagnostic::policy(
-            Some(path.to_path_buf()),
-            Some(line),
-            code,
-            message,
-        ));
+        let diagnostic = if code == "namespace_family_unsupported_construct" {
+            Diagnostic::advisory(Some(path.to_path_buf()), Some(line), code, message)
+        } else {
+            Diagnostic::policy(Some(path.to_path_buf()), Some(line), code, message)
+        };
+        diagnostics.push(diagnostic);
     }
 }
 
@@ -355,6 +378,13 @@ fn analyze_type_alias_item(
         redundant_leaf_context_candidate(analysis_path, &binding_name, true, false, settings);
     let visible_callsite_surface =
         visible_callsite_surface_candidate(analysis_path, aliased_leaf_name, settings);
+    let namespace_visibility_dependency = namespace_visibility_dependency(
+        path,
+        current_module_path,
+        &full_path,
+        aliased_leaf_name,
+        settings,
+    );
 
     let Some((code, message)) = (if let Some(shorter_leaf) = redundant_leaf {
         Some((
@@ -364,12 +394,9 @@ fn analyze_type_alias_item(
             ),
         ))
     } else if (settings.generic_nouns.contains(aliased_leaf_name)
-        || binding_depends_on_visible_namespace(
-            path,
-            current_module_path,
-            &full_path,
-            aliased_leaf_name,
-            settings,
+        || matches!(
+            namespace_visibility_dependency,
+            Some(NamespaceVisibilityDependency::Visible)
         ))
         && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
     {
@@ -393,18 +420,39 @@ fn analyze_type_alias_item(
                 full_path.join("::"),
             ),
         ))
+    } else if let Some(NamespaceVisibilityDependency::Unsupported(constructs)) =
+        namespace_visibility_dependency.as_ref()
+    {
+        let rendered_path = full_path.join("::");
+        Some((
+            "namespace_family_unsupported_construct",
+            format!(
+                "skipped namespace-family inference for `{rendered_path}` because source-level analysis saw {}; keep the real module path visible unless you verify the family manually",
+                render_unsupported_constructs(constructs),
+            ),
+        ))
     } else {
         None
     }) else {
         return;
     };
 
-    diagnostics.push(Diagnostic::policy(
-        Some(path.to_path_buf()),
-        Some(item_type.span().start().line),
-        code,
-        message,
-    ));
+    let diagnostic = if code == "namespace_family_unsupported_construct" {
+        Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(item_type.span().start().line),
+            code,
+            message,
+        )
+    } else {
+        Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(item_type.span().start().line),
+            code,
+            message,
+        )
+    };
+    diagnostics.push(diagnostic);
 }
 
 fn analyze_glob_use_item(
@@ -1145,71 +1193,62 @@ fn visible_callsite_surface_candidate(
     Some(format!("{parent_module}::{binding_name}"))
 }
 
-fn binding_depends_on_visible_namespace(
+fn namespace_visibility_dependency(
     path: &Path,
     current_module_path: &[String],
     import_path: &[String],
     binding_name: &str,
     settings: &NamespaceSettings,
-) -> bool {
+) -> Option<NamespaceVisibilityDependency> {
+    let shared_prefix = namespace_family_shared_prefix(binding_name, settings)?;
+    let path_prefix = import_path.get(..import_path.len().saturating_sub(1))?;
+    let module_path = resolve_qualified_parent_surface_path(current_module_path, path_prefix)?;
+    if module_path.is_empty() {
+        return None;
+    }
+
+    let binding_info = namespace_family_binding_info_for_module(path, &module_path);
+    let has_visible_witness = binding_info.bindings.iter().any(|candidate| {
+        namespace_family_shared_prefix(candidate, settings).is_some_and(|candidate_prefix| {
+            candidate != binding_name && candidate_prefix == shared_prefix
+        })
+    });
+
+    if has_visible_witness {
+        return Some(NamespaceVisibilityDependency::Visible);
+    }
+
+    (!binding_info.unsupported_constructs.is_empty()).then_some(
+        NamespaceVisibilityDependency::Unsupported(binding_info.unsupported_constructs),
+    )
+}
+
+fn namespace_family_shared_prefix(
+    binding_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<Vec<String>> {
     let binding_segments = split_segments(binding_name);
     if binding_segments.len() < 2 {
-        return false;
+        return None;
     }
 
-    let Some(tail) = binding_segments.last() else {
-        return false;
-    };
+    let tail = binding_segments.last()?;
     if !namespace_visible_family_tail(tail, settings) {
-        return false;
+        return None;
     }
 
-    let shared_prefix = binding_segments[..binding_segments.len() - 1]
-        .iter()
-        .map(|segment| segment.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let Some(path_prefix) = import_path.get(..import_path.len().saturating_sub(1)) else {
-        return false;
-    };
-    let Some(module_path) = resolve_qualified_parent_surface_path(current_module_path, path_prefix)
-    else {
-        return false;
-    };
-    if module_path.is_empty() {
-        return false;
-    }
-
-    let bindings = module_bindings_for_module(path, &module_path);
-    if bindings.is_empty() {
-        return false;
-    }
-
-    bindings.into_iter().any(|candidate| {
-        if candidate == binding_name {
-            return false;
-        }
-
-        let candidate_segments = split_segments(&candidate);
-        if candidate_segments.len() < 2 {
-            return false;
-        }
-        let Some(candidate_tail) = candidate_segments.last() else {
-            return false;
-        };
-        if !namespace_visible_family_tail(candidate_tail, settings) {
-            return false;
-        }
-
-        candidate_segments[..candidate_segments.len() - 1]
+    Some(
+        binding_segments[..binding_segments.len() - 1]
             .iter()
             .map(|segment| segment.to_ascii_lowercase())
-            .eq(shared_prefix.iter().cloned())
-    })
+            .collect(),
+    )
 }
 
 fn namespace_visible_family_tail(segment: &str, settings: &NamespaceSettings) -> bool {
     matches_generic_noun(segment, settings)
-        || matches!(segment.to_ascii_lowercase().as_str(), "flow" | "state")
+        || (!is_unreadable_short_leaf(segment)
+            && !namespace_leaf_context_is_not_actionable("", segment))
 }
 
 fn redundant_leaf_context_candidate(
@@ -1495,12 +1534,68 @@ fn canonical_parent_surface_message(
     )
 }
 
+fn namespace_family_unsupported_construct_message(
+    is_reexport: bool,
+    source_name: &str,
+    visible_callsite_surface: Option<&str>,
+    constructs: &BTreeSet<String>,
+) -> (&'static str, String) {
+    let rendered_target = visible_callsite_surface.unwrap_or(source_name);
+    let action = if is_reexport { "re-export" } else { "import" };
+    (
+        "namespace_family_unsupported_construct",
+        format!(
+            "skipped namespace-family inference for `{source_name}` in this {action} because source-level analysis saw {}; keep `{rendered_target}` visible unless you verify the family manually",
+            render_unsupported_constructs(constructs),
+        ),
+    )
+}
+
+fn render_unsupported_constructs(constructs: &BTreeSet<String>) -> String {
+    constructs
+        .iter()
+        .map(|construct| format!("`{construct}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn public_bindings_for_module(path: &Path, module_path: &[String]) -> BTreeSet<String> {
     bindings_for_module(path, module_path, true)
 }
 
 fn module_bindings_for_module(path: &Path, module_path: &[String]) -> BTreeSet<String> {
     bindings_for_module(path, module_path, false)
+}
+
+fn namespace_family_binding_info_for_module(
+    path: &Path,
+    module_path: &[String],
+) -> NamespaceFamilyBindingInfo {
+    if let Some(info) = inline_namespace_family_binding_info_for_module(path, module_path) {
+        return info;
+    }
+
+    let Some(src_root) = source_root(path) else {
+        return NamespaceFamilyBindingInfo {
+            bindings: BTreeSet::new(),
+            unsupported_constructs: BTreeSet::new(),
+        };
+    };
+
+    for candidate in parent_module_files(&src_root, module_path) {
+        let Ok(src) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = syn::parse_file(&src) else {
+            continue;
+        };
+        return collect_namespace_family_binding_info(&parsed.items);
+    }
+
+    NamespaceFamilyBindingInfo {
+        bindings: BTreeSet::new(),
+        unsupported_constructs: BTreeSet::new(),
+    }
 }
 
 fn bindings_for_module(path: &Path, module_path: &[String], public_only: bool) -> BTreeSet<String> {
@@ -1624,6 +1719,24 @@ fn inline_module_bindings_for_module(
     Some(collect_bindings(items, public_only))
 }
 
+fn inline_namespace_family_binding_info_for_module(
+    path: &Path,
+    module_path: &[String],
+) -> Option<NamespaceFamilyBindingInfo> {
+    let current_module_path = inferred_file_module_path(path);
+    if module_path.len() < current_module_path.len()
+        || !module_path.starts_with(&current_module_path)
+    {
+        return None;
+    }
+
+    let src = fs::read_to_string(path).ok()?;
+    let parsed = syn::parse_file(&src).ok()?;
+    let nested_path = &module_path[current_module_path.len()..];
+    let items = nested_inline_module_items(&parsed.items, nested_path)?;
+    Some(collect_namespace_family_binding_info(items))
+}
+
 fn nested_inline_module_items<'a>(items: &'a [Item], path: &[String]) -> Option<&'a [Item]> {
     let Some((head, tail)) = path.split_first() else {
         return Some(items);
@@ -1703,6 +1816,101 @@ fn collect_bindings(items: &[Item], public_only: bool) -> BTreeSet<String> {
     }
 
     bindings
+}
+
+fn collect_namespace_family_binding_info(items: &[Item]) -> NamespaceFamilyBindingInfo {
+    let mut bindings = BTreeSet::new();
+    let mut unsupported_constructs = BTreeSet::new();
+
+    for item in items {
+        unsupported_constructs.extend(namespace_family_constructs_for_item(item));
+
+        match item {
+            Item::Use(item_use) if !matches!(item_use.vis, Visibility::Inherited) => {
+                let mut leaves = Vec::new();
+                flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+                for leaf in leaves {
+                    let binding = match leaf {
+                        UseLeaf::Direct(binding) | UseLeaf::Rename(binding) => binding,
+                        UseLeaf::Glob(_) => continue,
+                    };
+                    if !is_nonbinding_import(&binding.binding_name) {
+                        bindings.insert(binding.binding_name);
+                    }
+                }
+            }
+            _ => {
+                if let Some((binding_name, _)) = public_item_binding(item) {
+                    bindings.insert(binding_name);
+                }
+            }
+        }
+    }
+
+    NamespaceFamilyBindingInfo {
+        bindings,
+        unsupported_constructs,
+    }
+}
+
+fn namespace_family_constructs_for_item(item: &Item) -> BTreeSet<String> {
+    if !item_participates_in_namespace_family(item) {
+        return BTreeSet::new();
+    }
+
+    let mut constructs = BTreeSet::new();
+
+    for attr in namespace_item_attrs(item) {
+        if attr.path().is_ident("cfg") {
+            constructs.insert("#[cfg]".to_string());
+        }
+        if attr.path().is_ident("cfg_attr") {
+            constructs.insert("#[cfg_attr]".to_string());
+        }
+    }
+
+    if let Item::Macro(item_macro) = item {
+        constructs.insert(namespace_item_macro_observation_construct(item_macro).to_string());
+    }
+
+    constructs
+}
+
+fn item_participates_in_namespace_family(item: &Item) -> bool {
+    matches!(item, Item::Macro(_))
+        || public_item_binding(item).is_some()
+        || matches!(item, Item::Use(item_use) if !matches!(item_use.vis, Visibility::Inherited))
+}
+
+fn namespace_item_attrs(item: &Item) -> &[syn::Attribute] {
+    match item {
+        Item::Const(item_const) => &item_const.attrs,
+        Item::Enum(item_enum) => &item_enum.attrs,
+        Item::ExternCrate(item_extern_crate) => &item_extern_crate.attrs,
+        Item::Fn(item_fn) => &item_fn.attrs,
+        Item::ForeignMod(item_foreign_mod) => &item_foreign_mod.attrs,
+        Item::Impl(item_impl) => &item_impl.attrs,
+        Item::Macro(item_macro) => &item_macro.attrs,
+        Item::Mod(item_mod) => &item_mod.attrs,
+        Item::Static(item_static) => &item_static.attrs,
+        Item::Struct(item_struct) => &item_struct.attrs,
+        Item::Trait(item_trait) => &item_trait.attrs,
+        Item::TraitAlias(item_trait_alias) => &item_trait_alias.attrs,
+        Item::Type(item_type) => &item_type.attrs,
+        Item::Union(item_union) => &item_union.attrs,
+        Item::Use(item_use) => &item_use.attrs,
+        _ => &[],
+    }
+}
+
+fn namespace_item_macro_observation_construct(item_macro: &syn::ItemMacro) -> &'static str {
+    if item_macro.mac.path.is_ident("include") {
+        "include!"
+    } else if item_macro.mac.path.is_ident("macro_rules") {
+        "macro_rules!"
+    } else {
+        "item macro"
+    }
 }
 
 fn public_item_binding(item: &Item) -> Option<(String, bool)> {
