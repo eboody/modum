@@ -167,6 +167,12 @@ struct CandidateFacetFamilyMember {
     facet_module_name: String,
 }
 
+#[derive(Clone)]
+struct OwnedFacetCompanionErrorMember {
+    leaf_name: String,
+    flat_error_name: String,
+}
+
 pub(super) fn analyze_api_shape_rules(
     path: &Path,
     parsed: &File,
@@ -229,6 +235,14 @@ fn analyze_scope(
 ) {
     let public_bindings = collect_scope_public_bindings(items);
     analyze_candidate_facet_modules(path, items, module_path, diagnostics);
+    analyze_owned_facet_companion_errors(
+        path,
+        items,
+        module_path,
+        scope_flags,
+        settings,
+        diagnostics,
+    );
     let suppressed_child_module_exports = analyze_candidate_semantic_modules(
         path,
         items,
@@ -358,6 +372,48 @@ fn analyze_candidate_facet_modules(
         "api_candidate_facet_module",
         format!(
             "root boundary `{root_error_path}` sits beside flat leaf value-plus-error families {rendered_families}; consider owned facets like {rendered_facets} and keep `{root_error_path}` as the cross-facet boundary"
+        ),
+    ));
+}
+
+fn analyze_owned_facet_companion_errors(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+    scope_flags: ScopeFlags,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !scope_flags.path_is_public || module_path.len() < 2 {
+        return;
+    }
+    let Some(facet_name) = module_path.last() else {
+        return;
+    };
+    let normalized_facet = normalize_segment(facet_name);
+    if settings.weak_modules.contains(&normalized_facet)
+        || settings.catch_all_modules.contains(&normalized_facet)
+        || settings.organizational_modules.contains(&normalized_facet)
+    {
+        return;
+    }
+
+    let Some((line, members)) = owned_facet_companion_error_members(items) else {
+        return;
+    };
+    let error_path = render_public_path(module_path, "Error");
+    let rendered_members = members
+        .iter()
+        .map(|member| format!("`{}`/`{}`", member.leaf_name, member.flat_error_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let facet_path = module_path.join("::");
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(line),
+        "api_owned_facet_companion_error",
+        format!(
+            "owned facet `{facet_path}` keeps local leaf companion failure families {rendered_members} beside facet boundary `{error_path}`; keep `{error_path}` as the canonical failure surface"
         ),
     ));
 }
@@ -1161,6 +1217,43 @@ fn candidate_facet_module_members(
     (members.len() >= 2).then_some((root_module_path, boundary_line, members))
 }
 
+fn owned_facet_companion_error_members(
+    items: &[Item],
+) -> Option<(usize, Vec<OwnedFacetCompanionErrorMember>)> {
+    let local_leaf_candidates = local_public_companion_leaf_candidates(items);
+    if local_leaf_candidates.is_empty() {
+        return None;
+    }
+
+    for item in items {
+        let Item::Enum(item_enum) = item else {
+            continue;
+        };
+        if !is_public(&item_enum.vis)
+            || item_enum.ident != "Error"
+            || attrs_have_cfg_like(&item_enum.attrs)
+        {
+            continue;
+        }
+
+        let mut members = item_enum
+            .variants
+            .iter()
+            .filter_map(|variant| {
+                owned_facet_companion_error_member(variant, &local_leaf_candidates)
+            })
+            .filter(|member| !scope_imports_binding_name(items, &member.flat_error_name))
+            .collect::<Vec<_>>();
+        members.sort_by(|left, right| left.leaf_name.cmp(&right.leaf_name));
+        members.dedup_by(|left, right| left.leaf_name == right.leaf_name);
+        if !members.is_empty() {
+            return Some((item_enum.span().start().line, members));
+        }
+    }
+
+    None
+}
+
 fn flat_leaf_failure_boundary_members(
     items: &[Item],
     module_path: &[String],
@@ -1194,6 +1287,56 @@ fn flat_leaf_failure_boundary_members(
     }
 
     None
+}
+
+fn local_public_companion_leaf_candidates(items: &[Item]) -> BTreeSet<String> {
+    let mut leaves = BTreeSet::new();
+
+    for item in items {
+        let Some((_, leaf_name, is_item_public)) = public_item_leaf(item) else {
+            continue;
+        };
+        if !is_item_public || attrs_have_cfg_like(item_attrs(item)) || leaf_name == "Error" {
+            continue;
+        }
+        if item_is_single_field_tuple_struct(item) {
+            leaves.insert(leaf_name);
+        }
+    }
+
+    leaves
+}
+
+fn owned_facet_companion_error_member(
+    variant: &syn::Variant,
+    local_leaf_candidates: &BTreeSet<String>,
+) -> Option<OwnedFacetCompanionErrorMember> {
+    if attrs_have_cfg_like(&variant.attrs) {
+        return None;
+    }
+    let flat_error_name = variant_source_error_name(variant)?;
+    let companion_leaf = flat_error_name.strip_suffix("Error")?;
+    if companion_leaf.is_empty() || !local_leaf_candidates.contains(companion_leaf) {
+        return None;
+    }
+
+    Some(OwnedFacetCompanionErrorMember {
+        leaf_name: companion_leaf.to_string(),
+        flat_error_name,
+    })
+}
+
+fn scope_imports_binding_name(items: &[Item], binding_name: &str) -> bool {
+    items.iter().any(|item| {
+        let Item::Use(item_use) = item else {
+            return false;
+        };
+        let mut leaves = Vec::new();
+        flatten_public_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+        leaves
+            .into_iter()
+            .any(|leaf| leaf.binding_name == binding_name)
+    })
 }
 
 fn flat_leaf_failure_family_member(variant: &syn::Variant) -> Option<CandidateFacetFamilyMember> {
@@ -7191,6 +7334,16 @@ fn item_macro_observation_construct(item_macro: &ItemMacro) -> &'static str {
     } else {
         "item macro"
     }
+}
+
+fn item_is_single_field_tuple_struct(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Struct(ItemStruct {
+            fields: syn::Fields::Unnamed(fields),
+            ..
+        }) if fields.unnamed.len() == 1
+    )
 }
 
 fn note_semantic_inference_construct(

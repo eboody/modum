@@ -55,6 +55,10 @@ For these surface-shape rules, shared crate-visible surfaces such as `pub(crate)
   Warning for public leaves that repeat semantic module context already carried by the path, such as `user::UserRepository`, or that bake a sibling semantic module into a flat public leaf when `user::Repository` already exists.
 - `api_candidate_semantic_module`
   Advisory warning for public item families that suggest a semantic module surface, either through a shared head across at least three siblings like `UserRepository`, `UserService`, and `UserId`, through select 2-member high-signal pairs like `TransactionId` plus `TransactionFailure` or `HttpRequest` plus `HttpResponse`, through a shared head plus tail that points to a nested surface like `case::launch::{Inbox, Detail, Audit}`, or through a shared generic tail like `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome`. It works on parsed source only and doesn't see macro expansion or cfg-pruned items.
+- `api_candidate_facet_module`
+  Advisory warning for root modules that flatten several leaf value-plus-error families next to a broader root `Error`, such as `user::{Email, EmailError, Username, UsernameError, Error}`. It points toward owned facets like `user::email` and `user::username`, with the root keeping the cross-facet boundary.
+- `api_owned_facet_companion_error`
+  Advisory warning for already-owned public facets that define a local `Error` and also rely on a same-leaf companion failure like `TextError` for a local tuple-wrapper leaf such as `Text`. It points toward one canonical facet-local failure surface like `room::name::Error` instead of exporting both `TextError` and `Error` from the same owner.
 - `api_candidate_semantic_module_unsupported_construct`
   Advisory warning for scopes where semantic-module family inference was skipped because the parsed source includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`.
 - `api_manual_enum_string_helper`
@@ -90,6 +94,8 @@ For these surface-shape rules, shared crate-visible surfaces such as `pub(crate)
 Examples:
 
 - `UserRepository`, `UserService`, `UserId`
+- `user::{Email, EmailError, Username, UsernameError, Error}`
+- `room::name::{Text, Error}` with a companion `TextError`
 - `CompletedOutcome`, `RejectedOutcome`, `toxicity::Outcome`
 - `UserRepository` when `user::Repository` already exists
 - `partials::button::Button` when the intended surface should also expose `partials::Button`

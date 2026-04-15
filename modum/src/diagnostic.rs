@@ -355,6 +355,10 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
             "The root module is carrying both leaf-specific value-plus-error families and the broader boundary error, so facet ownership is being flattened together.",
             "Move each leaf value-plus-error family under its owning facet and let the root keep the cross-facet boundary. Re-export the good leaf value back out only if it improves ergonomics, but don't flatten the leaf error back next to the root `Error`.",
         ),
+        "api_owned_facet_companion_error" => (
+            "This owner already has its own `Error`, so a parallel leaf-specific companion like `TextError` creates two failure surfaces for the same facet.",
+            "Keep the owner's `Error` as the caller-visible failure surface. Leave the companion error as construction detail or generated internals, or split the leaf into a deeper facet only if callers truly need a separate error boundary. Don't export both `TextError`-style companions and `Error` as parallel public answers from the same owner.",
+        ),
         "api_candidate_semantic_module_unsupported_construct" => (
             "This scope contains constructs like macros, cfg gates, or includes that the current source-level pass can't interpret authoritatively.",
             "Treat this as an analysis boundary. Inspect the expanded or real surface manually, or upgrade the observation point, before making structural changes here. Don't rewrite macros, includes, or cfg-driven code just to satisfy the current pass.",
@@ -1094,6 +1098,15 @@ mod tests {
         assert!(guidance.why.contains("value-plus-error families"));
         assert!(guidance.address.contains("cross-facet boundary"));
         assert!(guidance.address.contains("don't flatten the leaf error"));
+    }
+
+    #[test]
+    fn generic_guidance_for_owned_facet_companion_error_keeps_one_canonical_error_surface() {
+        let guidance = diagnostic_guidance_for_code("api_owned_facet_companion_error", None)
+            .expect("guidance");
+        assert!(guidance.why.contains("same facet"));
+        assert!(guidance.address.contains("caller-visible failure surface"));
+        assert!(guidance.address.contains("parallel public answers"));
     }
 
     #[test]

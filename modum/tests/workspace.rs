@@ -4660,6 +4660,103 @@ pub enum Error {
 }
 
 #[test]
+fn analyze_workspace_reports_owned_facet_companion_error_for_nested_leaf_owner() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat/room")).expect("create room module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod room;\n").expect("write chat mod");
+    fs::write(root.join("src/chat/room.rs"), "pub mod name;\n").expect("write room mod");
+    fs::write(
+        root.join("src/chat/room/name.rs"),
+        r#"
+pub struct Text(String);
+
+pub enum Error {
+    Invalid { source: TextError },
+}
+"#,
+    )
+    .expect("write name module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_owned_facet_companion_error")
+            && diag.message.contains("chat::room::name")
+            && diag.message.contains("TextError")
+            && diag.message.contains("chat::room::name::Error")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_report_owned_facet_companion_error_for_root_module_surface() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod value;\n").expect("write lib");
+    fs::write(
+        root.join("src/value.rs"),
+        r#"
+pub struct Text(String);
+
+pub enum Error {
+    Invalid { source: TextError },
+}
+"#,
+    )
+    .expect("write value module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_owned_facet_companion_error"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_report_owned_facet_companion_error_for_imported_companion_name() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat/room")).expect("create room module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\npub mod support;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod room;\n").expect("write chat mod");
+    fs::write(root.join("src/chat/room.rs"), "pub mod config;\n").expect("write room mod");
+    fs::write(
+        root.join("src/chat/room/config.rs"),
+        r#"
+use crate::support::ConfigError;
+
+pub struct Config(String);
+
+pub enum Error {
+    Invalid { source: ConfigError },
+}
+"#,
+    )
+    .expect("write config module");
+    fs::write(
+        root.join("src/support.rs"),
+        r#"
+pub struct ConfigError;
+"#,
+    )
+    .expect("write support module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_owned_facet_companion_error"))
+    );
+}
+
+#[test]
 fn analyze_workspace_skips_internal_candidate_semantic_module_for_macro_generated_internal_items() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
