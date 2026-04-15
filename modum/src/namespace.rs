@@ -80,6 +80,12 @@ struct ErrorSurfaceFollowThroughCandidate {
     target_exists: bool,
 }
 
+#[derive(Clone)]
+struct ChildFacetValueFollowThroughCandidate {
+    preferred_path: String,
+    target_exists: bool,
+}
+
 enum NamespaceVisibilityDependency {
     Visible,
     Unsupported(BTreeSet<String>),
@@ -318,6 +324,13 @@ fn analyze_use_item(
             settings,
             &[],
         );
+        let child_facet_value_follow_through = child_facet_value_follow_through_candidate(
+            path,
+            current_module_path,
+            &binding.full_path,
+            settings,
+            &[],
+        );
 
         let (code, message) =
             if let Some(error_surface_follow_through) = error_surface_follow_through.as_ref() {
@@ -326,6 +339,15 @@ fn analyze_use_item(
                     &binding.full_path.join("::"),
                     &error_surface_follow_through.preferred_path,
                     error_surface_follow_through.target_exists,
+                )
+            } else if let Some(child_facet_value_follow_through) =
+                child_facet_value_follow_through.as_ref()
+            {
+                child_facet_value_follow_through_use_message(
+                    is_reexport,
+                    &binding.full_path.join("::"),
+                    &child_facet_value_follow_through.preferred_path,
+                    child_facet_value_follow_through.target_exists,
                 )
             } else if let Some(canonical_parent_surface) = canonical_parent_surface.as_deref() {
                 canonical_parent_surface_message(
@@ -376,10 +398,14 @@ fn analyze_use_item(
 
         let diagnostic = if code == "namespace_family_unsupported_construct"
             || (code.starts_with("namespace_")
-                && code.contains("error_surface_follow_through")
-                && error_surface_follow_through
-                    .as_ref()
-                    .is_some_and(|candidate| !candidate.target_exists))
+                && ((code.contains("error_surface_follow_through")
+                    && error_surface_follow_through
+                        .as_ref()
+                        .is_some_and(|candidate| !candidate.target_exists))
+                    || (code.contains("child_facet_follow_through")
+                        && child_facet_value_follow_through
+                            .as_ref()
+                            .is_some_and(|candidate| !candidate.target_exists))))
         {
             Diagnostic::advisory(Some(path.to_path_buf()), Some(line), code, message)
         } else {
@@ -455,6 +481,13 @@ fn analyze_type_alias_item(
         settings,
         &[],
     );
+    let child_facet_value_follow_through = child_facet_value_follow_through_candidate(
+        path,
+        current_module_path,
+        &full_path,
+        settings,
+        &[],
+    );
     let namespace_visibility_dependency = namespace_visibility_dependency(
         path,
         current_module_path,
@@ -471,6 +504,15 @@ fn analyze_type_alias_item(
             &full_path.join("::"),
             &error_surface_follow_through.preferred_path,
             error_surface_follow_through.target_exists,
+        ))
+    } else if let Some(child_facet_value_follow_through) =
+        child_facet_value_follow_through.as_ref()
+    {
+        Some(child_facet_value_follow_through_alias_message(
+            &binding_name,
+            &full_path.join("::"),
+            &child_facet_value_follow_through.preferred_path,
+            child_facet_value_follow_through.target_exists,
         ))
     } else if let Some(shorter_leaf) = redundant_leaf {
         Some((
@@ -524,6 +566,10 @@ fn analyze_type_alias_item(
     let diagnostic = if code == "namespace_family_unsupported_construct"
         || (code == "namespace_flat_type_alias_error_surface_follow_through"
             && error_surface_follow_through
+                .as_ref()
+                .is_some_and(|candidate| !candidate.target_exists))
+        || (code == "namespace_flat_type_alias_child_facet_follow_through"
+            && child_facet_value_follow_through
                 .as_ref()
                 .is_some_and(|candidate| !candidate.target_exists))
     {
@@ -676,6 +722,39 @@ fn analyze_qualified_generic_path(
         }
         return;
     }
+    if let Some(child_facet_value_follow_through) = child_facet_value_follow_through_candidate(
+        file,
+        current_module_path,
+        &analysis_path,
+        settings,
+        scope_use_bindings,
+    ) {
+        let diagnostic = if child_facet_value_follow_through.target_exists {
+            Diagnostic::policy(
+                Some(file.to_path_buf()),
+                Some(path.span().start().line),
+                "namespace_qualified_child_facet_follow_through",
+                format!(
+                    "`{rendered_path}` keeps a broader leaf path than the child facet owner; prefer `{}`",
+                    child_facet_value_follow_through.preferred_path
+                ),
+            )
+        } else {
+            Diagnostic::advisory(
+                Some(file.to_path_buf()),
+                Some(path.span().start().line),
+                "namespace_qualified_child_facet_follow_through",
+                format!(
+                    "`{rendered_path}` keeps a broader leaf path; prefer a child-facet path under `{}` once that facet exists",
+                    child_facet_value_follow_through.preferred_path
+                ),
+            )
+        };
+        if !namespace_diagnostic_already_emitted(diagnostics, &diagnostic) {
+            diagnostics.push(diagnostic);
+        }
+        return;
+    }
     let Some(preferred_path) =
         preferred_qualified_path_surface(file, current_module_path, &analysis_path, settings)
     else {
@@ -737,6 +816,62 @@ fn analyze_qualified_generic_path(
     };
     if !namespace_diagnostic_already_emitted(diagnostics, &diagnostic) {
         diagnostics.push(diagnostic);
+    }
+}
+
+fn child_facet_value_follow_through_use_message(
+    is_reexport: bool,
+    source_path: &str,
+    preferred_path: &str,
+    target_exists: bool,
+) -> (&'static str, String) {
+    let code = if is_reexport {
+        "namespace_flat_pub_use_child_facet_follow_through"
+    } else {
+        "namespace_flat_use_child_facet_follow_through"
+    };
+    let subject = if is_reexport {
+        "flattened re-export"
+    } else {
+        "flattened import"
+    };
+    if target_exists {
+        (
+            code,
+            format!(
+                "{subject} keeps broader leaf path `{source_path}`; prefer `{preferred_path}`"
+            ),
+        )
+    } else {
+        (
+            code,
+            format!(
+                "{subject} keeps broader leaf path `{source_path}`; prefer a child-facet path under `{preferred_path}` once that facet exists"
+            ),
+        )
+    }
+}
+
+fn child_facet_value_follow_through_alias_message(
+    binding_name: &str,
+    source_path: &str,
+    preferred_path: &str,
+    target_exists: bool,
+) -> (&'static str, String) {
+    if target_exists {
+        (
+            "namespace_flat_type_alias_child_facet_follow_through",
+            format!(
+                "type alias `{binding_name}` keeps broader leaf path `{source_path}`; prefer `{preferred_path}`"
+            ),
+        )
+    } else {
+        (
+            "namespace_flat_type_alias_child_facet_follow_through",
+            format!(
+                "type alias `{binding_name}` keeps broader leaf path `{source_path}`; prefer a child-facet path under `{preferred_path}` once that facet exists"
+            ),
+        )
     }
 }
 
@@ -1629,7 +1764,7 @@ fn error_surface_follow_through_candidate(
 
     let (preferred_absolute_path, target_exists) =
         error_surface_follow_through_target(path, &module_path, leaf_name, settings)?;
-    let preferred_path = preferred_error_surface_visible_path(
+    let preferred_path = preferred_owned_surface_visible_path(
         path,
         current_module_path,
         &preferred_absolute_path,
@@ -1643,7 +1778,7 @@ fn error_surface_follow_through_candidate(
     })
 }
 
-fn preferred_error_surface_visible_path(
+fn preferred_owned_surface_visible_path(
     file: &Path,
     current_module_path: &[String],
     absolute_target_path: &[String],
@@ -1656,6 +1791,44 @@ fn preferred_error_surface_visible_path(
     )
     .map(|candidate| candidate.rendered_path)
     .unwrap_or_else(|| absolute_target_path.join("::"))
+}
+
+fn child_facet_value_follow_through_candidate(
+    path: &Path,
+    current_module_path: &[String],
+    full_path: &[String],
+    settings: &NamespaceSettings,
+    scope_use_bindings: &[ScopeUseBinding],
+) -> Option<ChildFacetValueFollowThroughCandidate> {
+    let analysis_path = trim_relative_prefix(full_path);
+    if analysis_path.len() < 2 {
+        return None;
+    }
+
+    let leaf_name = analysis_path.last()?;
+    if *leaf_name == "Error" || leaf_name.ends_with("Error") {
+        return None;
+    }
+    let import_prefix = full_path.get(..full_path.len().saturating_sub(1))?;
+    let module_path = resolve_qualified_parent_surface_path(current_module_path, import_prefix)?;
+    if module_path.is_empty() {
+        return None;
+    }
+
+    let (preferred_absolute_path, target_exists) =
+        child_facet_value_follow_through_target(path, &module_path, leaf_name, settings)?;
+    let preferred_path = preferred_owned_surface_visible_path(
+        path,
+        current_module_path,
+        &preferred_absolute_path,
+        settings,
+        scope_use_bindings,
+    );
+
+    Some(ChildFacetValueFollowThroughCandidate {
+        preferred_path,
+        target_exists,
+    })
 }
 
 fn error_surface_follow_through_target(
@@ -1704,6 +1877,31 @@ fn error_surface_follow_through_target(
     let target_exists =
         public_bindings_for_owned_module(path, &facet_module_path, settings).contains("Error");
     Some((preferred_path, target_exists))
+}
+
+fn child_facet_value_follow_through_target(
+    path: &Path,
+    module_path: &[String],
+    leaf_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<(Vec<String>, bool)> {
+    let items = module_items_for_module(path, module_path, settings)?;
+    let (child_module_name, candidate_leaf_name) =
+        candidate_child_facet_module_target(&items, module_path, settings)?;
+    if candidate_leaf_name != leaf_name {
+        return None;
+    }
+
+    let mut child_module_path = module_path.to_vec();
+    child_module_path.push(child_module_name);
+    let public_bindings = public_bindings_for_owned_module(path, &child_module_path, settings);
+    if public_bindings.contains(leaf_name) {
+        let mut preferred_path = child_module_path.clone();
+        preferred_path.push(leaf_name.to_string());
+        return Some((preferred_path, true));
+    }
+
+    Some((child_module_path, false))
 }
 
 fn module_items_for_module(

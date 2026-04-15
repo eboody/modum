@@ -254,6 +254,13 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
             "The path is still pointing at a flatter `*Error` surface even though the owning facet or owned `Error` boundary now carries the real failure shape.",
             "Move callers to the owned `Error` surface named in the lint and keep that path visible instead of preserving the old flat `*Error` path. If the deeper facet does not exist yet, create it for real, move the leaf value and failure surface together, and then migrate callers. Don't keep the flat `*Error` as a parallel public answer, and don't hide the mismatch with aliases, type aliases, or `#[path = ...]` shims.",
         ),
+        "namespace_flat_use_child_facet_follow_through"
+        | "namespace_flat_pub_use_child_facet_follow_through"
+        | "namespace_flat_type_alias_child_facet_follow_through"
+        | "namespace_qualified_child_facet_follow_through" => (
+            "The path is still going through the broader owner even though the leaf family now points toward a deeper child facet.",
+            "Once the child facet is real, keep that facet visible in the value or type path instead of preserving the broader owner path. Move the leaf value and failure surface together, and don't keep the old broader path alive as a parallel canonical answer. Don't hide the mismatch with aliases, type aliases, or `#[path = ...]` shims.",
+        ),
         "namespace_flat_use_preserve_module"
         | "namespace_flat_pub_use_preserve_module"
         | "namespace_flat_type_alias_preserve_module"
@@ -436,6 +443,17 @@ fn diagnostic_guidance_for_instance(
         | "namespace_qualified_error_surface_follow_through" => {
             if let Some((instance_why, instance_address)) =
                 error_surface_follow_through_guidance(code, message)
+            {
+                why = instance_why;
+                address = instance_address;
+            }
+        }
+        "namespace_flat_use_child_facet_follow_through"
+        | "namespace_flat_pub_use_child_facet_follow_through"
+        | "namespace_flat_type_alias_child_facet_follow_through"
+        | "namespace_qualified_child_facet_follow_through" => {
+            if let Some((instance_why, instance_address)) =
+                child_facet_value_follow_through_guidance(code, message)
             {
                 why = instance_why;
                 address = instance_address;
@@ -692,6 +710,79 @@ fn error_surface_follow_through_guidance(code: &str, message: &str) -> Option<(S
             } else {
                 format!(
                     "Import or use `{preferred}` so callers see the owner's `Error` surface directly. Don't keep the flatter `*Error` path around as a parallel answer from the same family."
+                )
+            }
+        }
+    };
+
+    Some((why, address))
+}
+
+fn child_facet_value_follow_through_guidance(
+    code: &str,
+    message: &str,
+) -> Option<(String, String)> {
+    let chunks = backticked_chunks(message);
+    if chunks.len() < 2 {
+        return None;
+    }
+
+    let current = chunks.first()?;
+    let preferred = chunks.get(1)?;
+    let pending_facet = message.contains("once that facet exists");
+
+    let why = if pending_facet {
+        format!(
+            "`{current}` is still using the broader owner path even though `{preferred}` is the child facet this leaf family is trying to grow toward."
+        )
+    } else {
+        format!(
+            "`{current}` is bypassing the child facet `{preferred}`, so callers are still reading the leaf through the broader owner path."
+        )
+    };
+
+    let address = match code {
+        "namespace_flat_pub_use_child_facet_follow_through" => {
+            if pending_facet {
+                format!(
+                    "Re-export through a path under `{preferred}` once that facet exists for real, and then treat that child facet as the public home for the leaf family. Don't keep re-exporting the broader owner path as a parallel public answer."
+                )
+            } else {
+                format!(
+                    "Re-export through `{preferred}` and treat that child facet as the public home for the leaf family. Don't keep the broader owner path alive as a parallel public surface."
+                )
+            }
+        }
+        "namespace_flat_type_alias_child_facet_follow_through" => {
+            if pending_facet {
+                format!(
+                    "Once `{preferred}` exists for real, point the alias at a path under that child facet or remove the alias if it only preserves the broader owner path. Don't hide the ownership move behind a compensating alias name."
+                )
+            } else {
+                format!(
+                    "Point the alias at `{preferred}` or remove it if the alias is only preserving the broader owner path. Don't keep the old surface alive behind a local alias."
+                )
+            }
+        }
+        "namespace_qualified_child_facet_follow_through" => {
+            if pending_facet {
+                format!(
+                    "Grow `{preferred}` as the real child facet, move the leaf value and failure surface there together, and then switch call sites into that facet instead of freezing the broader owner path just because it is shorter today."
+                )
+            } else {
+                format!(
+                    "Call through `{preferred}` so the code uses the child facet directly. Don't keep spelling the broader owner path at call sites, and don't patch over it with aliases."
+                )
+            }
+        }
+        _ => {
+            if pending_facet {
+                format!(
+                    "Import or use a path under `{preferred}` once that child facet exists for real, and move the leaf value and failure surface there together. Don't keep importing the broader owner path and call that good enough."
+                )
+            } else {
+                format!(
+                    "Import or use `{preferred}` so callers see the child facet directly. Don't keep the broader owner path around as a parallel answer from the same family."
                 )
             }
         }
@@ -1352,6 +1443,34 @@ mod tests {
     }
 
     #[test]
+    fn generic_guidance_for_child_facet_value_follow_through_keeps_child_visible() {
+        let guidance =
+            diagnostic_guidance_for_code("namespace_flat_use_child_facet_follow_through", None)
+                .expect("guidance");
+        assert!(guidance.why.contains("deeper child facet"));
+        assert!(guidance.address.contains("Move the leaf value and failure surface together"));
+        assert!(guidance.address.contains("#[path = ...]"));
+    }
+
+    #[test]
+    fn instance_guidance_for_child_facet_value_follow_through_names_child_owner() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "namespace_qualified_child_facet_follow_through".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "`domain::chat::message::Body` keeps a broader leaf path; prefer a child-facet path under `message::body` once that facet exists".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.why.contains("`domain::chat::message::Body`"));
+        assert!(guidance.why.contains("`message::body`"));
+        assert!(guidance.address.contains("child facet"));
+    }
+
+    #[test]
     fn generic_guidance_for_owned_facet_companion_error_keeps_one_canonical_error_surface() {
         let guidance = diagnostic_guidance_for_code("api_owned_facet_companion_error", None)
             .expect("guidance");
@@ -1395,6 +1514,21 @@ mod tests {
         let diag = Diagnostic {
             class: DiagnosticClass::AdvisoryWarning {
                 code: "namespace_flat_use_error_surface_follow_through".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: String::new(),
+        };
+
+        assert_eq!(diag.profile(), Some(super::LintProfile::Strict));
+    }
+
+    #[test]
+    fn child_facet_value_follow_through_has_strict_profile_metadata() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "namespace_flat_use_child_facet_follow_through".to_string(),
             },
             file: None,
             line: None,
@@ -1492,6 +1626,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
             LintProfile::Strict,
             "A flattened import keeps an older flat `*Error` path even though ownership now points at a deeper or owned `Error` surface.",
         ),
+        "namespace_flat_use_child_facet_follow_through" => (
+            LintProfile::Strict,
+            "A flattened import keeps the broader owner path even though the leaf family points at a deeper child facet.",
+        ),
         "namespace_flat_use_preserve_module" => (
             LintProfile::Core,
             "Flattened imports hide a module that should stay visible at call sites.",
@@ -1507,6 +1645,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         "namespace_qualified_error_surface_follow_through" => (
             LintProfile::Strict,
             "A qualified path is still spelling the flatter `*Error` surface instead of the owned or faceted `Error` path.",
+        ),
+        "namespace_qualified_child_facet_follow_through" => (
+            LintProfile::Strict,
+            "A qualified path is still spelling the broader owner path instead of the deeper child facet the leaf family points toward.",
         ),
         "namespace_overqualified_callsite_path" => (
             LintProfile::Strict,
@@ -1531,6 +1673,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         "namespace_flat_type_alias_error_surface_follow_through" => (
             LintProfile::Strict,
             "A type alias preserves an older flat `*Error` path instead of the owned or faceted `Error` surface.",
+        ),
+        "namespace_flat_type_alias_child_facet_follow_through" => (
+            LintProfile::Strict,
+            "A type alias preserves the broader owner path instead of the deeper child facet the leaf family points toward.",
         ),
         "namespace_flat_type_alias_preserve_module" => (
             LintProfile::Core,
@@ -1603,6 +1749,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         "namespace_flat_pub_use_error_surface_follow_through" => (
             LintProfile::Strict,
             "A re-export preserves a flatter `*Error` path instead of the owned or faceted `Error` surface.",
+        ),
+        "namespace_flat_pub_use_child_facet_follow_through" => (
+            LintProfile::Strict,
+            "A re-export preserves the broader owner path instead of the deeper child facet the leaf family points toward.",
         ),
         "namespace_flat_pub_use_preserve_module" => (
             LintProfile::Surface,

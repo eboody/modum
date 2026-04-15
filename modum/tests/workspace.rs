@@ -3883,6 +3883,263 @@ pub fn decode(_: crate::chat::message::BodyError) {}
 }
 
 #[test]
+fn analyze_workspace_reports_flat_import_child_facet_value_follow_through() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\nmod caller;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod message;\n").expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+    fs::write(
+        root.join("src/caller.rs"),
+        r#"
+use crate::chat::message::Body;
+
+struct Demo(Body);
+"#,
+    )
+    .expect("write caller");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use_child_facet_follow_through")
+            && diag.message.contains("crate::chat::message::Body")
+            && diag.message.contains("message::body")
+    }));
+}
+
+#[test]
+fn analyze_workspace_reports_public_reexport_child_facet_value_follow_through() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod chat;\npub use crate::chat::message::Body;\n",
+    )
+    .expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod message;\n").expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_pub_use_child_facet_follow_through")
+            && diag.message.contains("crate::chat::message::Body")
+            && diag.message.contains("message::body")
+    }));
+}
+
+#[test]
+fn analyze_workspace_reports_flat_type_alias_child_facet_value_follow_through() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod chat;\ntype BodyValue = crate::chat::message::Body;\n",
+    )
+    .expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod message;\n").expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_type_alias_child_facet_follow_through")
+            && diag.message.contains("crate::chat::message::Body")
+            && diag.message.contains("message::body")
+    }));
+}
+
+#[test]
+fn analyze_workspace_reports_qualified_child_facet_value_follow_through() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\nmod helper;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod message;\n").expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+    fs::write(
+        root.join("src/helper.rs"),
+        r#"
+pub fn decode(_: crate::chat::message::Body) {}
+"#,
+    )
+    .expect("write helper");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_qualified_child_facet_follow_through")
+            && diag.message.contains("crate::chat::message::Body")
+            && diag.message.contains("message::body")
+    }));
+}
+
+#[test]
+fn analyze_workspace_reports_cross_crate_qualified_child_facet_value_follow_through() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("domain/src/chat")).expect("create domain src");
+    fs::create_dir_all(root.join("app/src")).expect("create app src");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+resolver = "2"
+members = ["domain", "app"]
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("domain/Cargo.toml"),
+        r#"[package]
+name = "domain"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .expect("write domain manifest");
+    fs::write(root.join("domain/src/lib.rs"), "pub mod chat;\n").expect("write domain lib");
+    fs::write(root.join("domain/src/chat/mod.rs"), "pub mod message;\n").expect("write chat mod");
+    fs::write(
+        root.join("domain/src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+    fs::write(
+        root.join("app/Cargo.toml"),
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+domain = { path = "../domain" }
+"#,
+    )
+    .expect("write app manifest");
+    fs::write(
+        root.join("app/src/lib.rs"),
+        r#"
+pub fn decode(_: domain::chat::message::Body) {}
+"#,
+    )
+    .expect("write app lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_qualified_child_facet_follow_through")
+            && diag.message.contains("domain::chat::message::Body")
+            && diag.message.contains("message::body")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_report_root_value_child_facet_follow_through() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/user")).expect("create user module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod user;\nmod caller;\n").expect("write lib");
+    fs::write(
+        root.join("src/user/mod.rs"),
+        r#"
+pub mod error;
+pub use error::Error;
+
+pub struct Username(String);
+pub struct Email(String);
+"#,
+    )
+    .expect("write user mod");
+    fs::write(
+        root.join("src/user/error.rs"),
+        r#"
+use crate::user::{EmailError, UsernameError};
+
+pub enum Error {
+    Username { source: UsernameError },
+    Email { source: EmailError },
+}
+"#,
+    )
+    .expect("write user error");
+    fs::write(
+        root.join("src/caller.rs"),
+        r#"
+use crate::user::Email;
+
+struct Demo(Email);
+"#,
+    )
+    .expect("write caller");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        matches!(
+            diag.code(),
+            Some("namespace_flat_use_child_facet_follow_through")
+                | Some("namespace_flat_pub_use_child_facet_follow_through")
+                | Some("namespace_flat_type_alias_child_facet_follow_through")
+                | Some("namespace_qualified_child_facet_follow_through")
+        )
+    }));
+}
+
+#[test]
 fn analyze_workspace_flags_relative_imports_with_real_parent_modules() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();

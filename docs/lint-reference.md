@@ -12,6 +12,8 @@ These warn when imports or re-exports flatten a namespace that should stay visib
   Warning for flattened imports of generic nouns when there is an actionable namespace-visible call-site form that adds net context, such as `storage::Repository` or `http::StatusCode`. It also covers family leaves when parsed source shows a clear local witness that the namespace still matters at call sites, such as `viewer::ResolutionFlow` alongside `viewer::ResolutionState` and `viewer::ResolutionOutcome`. It skips cases where the only preserved form would still be redundant, such as `error::Error` or `response::Response`.
 - `namespace_flat_use_error_surface_follow_through`
   Advisory warning for flattened imports that preserve an older flat `*Error` path even though parsed source now points at an owned or faceted `Error` surface instead, such as `user::EmailError` when the family is really trying to move toward `user::email::Error`, or `message::BodyError` when the real owner wants `message::body::Error`.
+- `namespace_flat_use_child_facet_follow_through`
+  Advisory warning for flattened imports that preserve the broader owner path even though parsed source says the leaf family wants a deeper child facet, such as `message::Body` when the real owner wants a `message::body::...` surface.
 - `namespace_flat_use_preserve_module`
   Warning for flattened imports from configured namespace-preserving modules when the preserved call-site form still adds net context.
 - `namespace_flat_use_redundant_leaf_context`
@@ -20,6 +22,8 @@ These warn when imports or re-exports flatten a namespace that should stay visib
   Warning for qualified call-site paths whose module only repeats a generic category already named by the leaf, such as `response::Response` or `error::Error`. When the written path resolves through an imported namespace and a nearer parent surface would read better, it can recommend that promotable parent surface for owned code even if the export does not exist yet. It doesn't invent new parent surfaces for external crates such as `std`, `core`, `serde`, or `axum`.
 - `namespace_qualified_error_surface_follow_through`
   Advisory warning for qualified paths that still spell the flatter `*Error` surface after ownership pressure has already established a better owned or faceted `Error` path, such as `domain::chat::message::BodyError` when the family really wants `message::body::Error`.
+- `namespace_qualified_child_facet_follow_through`
+  Advisory warning for qualified paths that still spell the broader owner path after ownership pressure has already established a deeper child facet, such as `domain::chat::message::Body` when the family really wants a `message::body::...` surface.
 - `namespace_prelude_glob_import`
   Warning for `use ...::prelude::*` imports that hide the real source modules and flatten call-site context.
 - `namespace_glob_preserve_module`
@@ -29,9 +33,11 @@ These warn when imports or re-exports flatten a namespace that should stay visib
 - `namespace_parent_surface`
 - `namespace_flat_pub_use`
 - `namespace_flat_pub_use_error_surface_follow_through`
+- `namespace_flat_pub_use_child_facet_follow_through`
 - `namespace_flat_pub_use_preserve_module`
 - `namespace_flat_pub_use_redundant_leaf_context`
 - `namespace_flat_type_alias_error_surface_follow_through`
+- `namespace_flat_type_alias_child_facet_follow_through`
 
 Examples:
 
@@ -39,8 +45,11 @@ Examples:
 - `use http::Client;`
 - `use user::UserRepository;`
 - `use crate::user::EmailError;`
+- `use crate::chat::message::Body;`
 - `type DecodeBody = crate::chat::message::BodyError;`
+- `type BodyValue = crate::chat::message::Body;`
 - `domain::chat::message::BodyError`
+- `domain::chat::message::Body`
 - `response::Response`
 - `use crate::error::Error;` inside a crate whose root surface already exposes `Error`
 - `pub use auth::{login, logout};`
