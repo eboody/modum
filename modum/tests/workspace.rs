@@ -4660,6 +4660,202 @@ pub enum Error {
 }
 
 #[test]
+fn analyze_workspace_reports_candidate_child_facet_module_for_broader_message_owner() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod message;\n").expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(
+    sanitize(trim),
+    validate(not_empty, len_char_max = 1000),
+    derive(Debug, Clone, PartialEq, Eq, AsRef)
+)]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_child_facet_module")
+            && diag.message.contains("chat::message")
+            && diag.message.contains("chat::message::Body")
+            && diag.message.contains("chat::message::body")
+            && diag.message.contains("`Message`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_reports_candidate_child_facet_module_for_trait_and_struct_owner() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod moderation;\n").expect("write chat mod");
+    fs::write(
+        root.join("src/chat/moderation.rs"),
+        r#"
+#[nutype(validate(len_char_max = 200))]
+pub struct Reason(String);
+
+pub struct Item {
+    pub reason: Reason,
+}
+
+pub trait Queue {
+    fn enqueue(&self, reason: &Reason);
+}
+"#,
+    )
+    .expect("write moderation module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_child_facet_module")
+            && diag.message.contains("chat::moderation")
+            && diag.message.contains("chat::moderation::Reason")
+            && diag.message.contains("chat::moderation::reason")
+            && diag.message.contains("`Item`")
+            && diag.message.contains("`Queue`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_report_candidate_child_facet_module_for_leaf_only_owner() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod client;\n").expect("write chat mod");
+    fs::write(
+        root.join("src/chat/client.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Id(String);
+"#,
+    )
+    .expect("write client module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_child_facet_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_report_candidate_child_facet_module_for_helper_function_only() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod message;\n").expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub fn parse(body: Body) -> Body {
+    body
+}
+"#,
+    )
+    .expect("write message module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_child_facet_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_report_candidate_child_facet_module_for_multiple_validated_leaves() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod message;\n").expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+#[nutype(validate(not_empty))]
+pub struct Summary(String);
+
+pub struct Message {
+    pub body: Body,
+    pub summary: Summary,
+}
+"#,
+    )
+    .expect("write message module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_child_facet_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_report_candidate_child_facet_module_when_owner_already_has_error() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat/room")).expect("create room module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(root.join("src/chat/mod.rs"), "pub mod room;\n").expect("write chat mod");
+    fs::write(root.join("src/chat/room.rs"), "pub mod name;\n").expect("write room mod");
+    fs::write(
+        root.join("src/chat/room/name.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Text(String);
+
+pub struct Name {
+    pub text: Text,
+}
+
+pub enum Error {
+    Invalid { source: TextError },
+}
+"#,
+    )
+    .expect("write name module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_child_facet_module"))
+    );
+}
+
+#[test]
 fn analyze_workspace_reports_owned_facet_companion_error_for_nested_leaf_owner() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();

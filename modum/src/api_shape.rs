@@ -173,6 +173,21 @@ struct OwnedFacetCompanionErrorMember {
     flat_error_name: String,
 }
 
+#[derive(Clone)]
+struct CandidateChildFacetModule {
+    line: usize,
+    leaf_name: String,
+    child_module_name: String,
+    broader_items: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ValidatedLeafWrapperCandidate {
+    line: usize,
+    leaf_name: String,
+    child_module_name: String,
+}
+
 pub(super) fn analyze_api_shape_rules(
     path: &Path,
     parsed: &File,
@@ -235,6 +250,14 @@ fn analyze_scope(
 ) {
     let public_bindings = collect_scope_public_bindings(items);
     analyze_candidate_facet_modules(path, items, module_path, diagnostics);
+    analyze_candidate_child_facet_modules(
+        path,
+        items,
+        module_path,
+        scope_flags,
+        settings,
+        diagnostics,
+    );
     analyze_owned_facet_companion_errors(
         path,
         items,
@@ -372,6 +395,41 @@ fn analyze_candidate_facet_modules(
         "api_candidate_facet_module",
         format!(
             "root boundary `{root_error_path}` sits beside flat leaf value-plus-error families {rendered_families}; consider owned facets like {rendered_facets} and keep `{root_error_path}` as the cross-facet boundary"
+        ),
+    ));
+}
+
+fn analyze_candidate_child_facet_modules(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+    scope_flags: ScopeFlags,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !scope_flags.path_is_public || module_path.is_empty() {
+        return;
+    }
+
+    let Some(candidate) = candidate_child_facet_module(items, module_path, settings) else {
+        return;
+    };
+    let owner_path = module_path.join("::");
+    let leaf_path = render_public_path(module_path, &candidate.leaf_name);
+    let child_path = format!("{owner_path}::{}", candidate.child_module_name);
+    let broader_items = candidate
+        .broader_items
+        .iter()
+        .map(|item| format!("`{item}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(candidate.line),
+        "api_candidate_child_facet_module",
+        format!(
+            "public module `{owner_path}` mixes broader surface {broader_items} with validated leaf `{leaf_path}`; consider an owned child facet like `{child_path}` so the leaf value and failure surface can live together"
         ),
     ));
 }
@@ -1254,6 +1312,44 @@ fn owned_facet_companion_error_members(
     None
 }
 
+fn candidate_child_facet_module(
+    items: &[Item],
+    module_path: &[String],
+    settings: &NamespaceSettings,
+) -> Option<CandidateChildFacetModule> {
+    let parent_normalized = normalize_segment(module_path.last()?);
+    if settings.weak_modules.contains(&parent_normalized)
+        || settings.catch_all_modules.contains(&parent_normalized)
+        || settings.organizational_modules.contains(&parent_normalized)
+        || scope_has_public_error_enum(items)
+    {
+        return None;
+    }
+
+    let mut leaves = validated_leaf_wrapper_candidates(items);
+    if leaves.len() != 1 {
+        return None;
+    }
+    let leaf = leaves.pop()?;
+    if normalize_segment(&leaf.child_module_name) == parent_normalized
+        || scope_has_child_module_named(items, &leaf.child_module_name)
+    {
+        return None;
+    }
+
+    let broader_items = public_items_using_leaf(items, &leaf.leaf_name);
+    if broader_items.is_empty() {
+        return None;
+    }
+
+    Some(CandidateChildFacetModule {
+        line: leaf.line,
+        leaf_name: leaf.leaf_name,
+        child_module_name: leaf.child_module_name,
+        broader_items,
+    })
+}
+
 fn flat_leaf_failure_boundary_members(
     items: &[Item],
     module_path: &[String],
@@ -1307,6 +1403,32 @@ fn local_public_companion_leaf_candidates(items: &[Item]) -> BTreeSet<String> {
     leaves
 }
 
+fn validated_leaf_wrapper_candidates(items: &[Item]) -> Vec<ValidatedLeafWrapperCandidate> {
+    let mut leaves = Vec::new();
+
+    for item in items {
+        let Item::Struct(item_struct) = item else {
+            continue;
+        };
+        if !is_public(&item_struct.vis)
+            || attrs_have_cfg_like(&item_struct.attrs)
+            || !item_is_single_field_tuple_struct(item)
+            || !attrs_have_nutype_validate(&item_struct.attrs)
+        {
+            continue;
+        }
+
+        let leaf_name = item_struct.ident.to_string();
+        leaves.push(ValidatedLeafWrapperCandidate {
+            line: item_struct.span().start().line,
+            child_module_name: render_segments(&split_segments(&leaf_name), NameStyle::Snake),
+            leaf_name,
+        });
+    }
+
+    leaves
+}
+
 fn owned_facet_companion_error_member(
     variant: &syn::Variant,
     local_leaf_candidates: &BTreeSet<String>,
@@ -1324,6 +1446,70 @@ fn owned_facet_companion_error_member(
         leaf_name: companion_leaf.to_string(),
         flat_error_name,
     })
+}
+
+fn scope_has_public_error_enum(items: &[Item]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            Item::Enum(ItemEnum {
+                ident,
+                vis,
+                attrs,
+                ..
+            }) if ident == "Error" && is_public(vis) && !attrs_have_cfg_like(attrs)
+        )
+    })
+}
+
+fn scope_has_child_module_named(items: &[Item], module_name: &str) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            Item::Mod(ItemMod { ident, attrs, .. })
+                if !attrs_have_cfg_like(attrs)
+                    && normalize_segment(&ident.to_string()) == normalize_segment(module_name)
+        )
+    })
+}
+
+fn public_items_using_leaf(items: &[Item], leaf_name: &str) -> Vec<String> {
+    let mut broader_items = Vec::new();
+
+    for item in items {
+        let Some((_, item_name, is_item_public)) = public_item_leaf(item) else {
+            continue;
+        };
+        if !is_item_public
+            || item_name == leaf_name
+            || item_name == "Error"
+            || !item_is_child_facet_owner_candidate(item)
+        {
+            continue;
+        }
+        if attrs_have_cfg_like(item_attrs(item)) {
+            continue;
+        }
+        if public_item_mentions_leaf(item, leaf_name) {
+            broader_items.push(item_name);
+        }
+    }
+
+    broader_items.sort();
+    broader_items.dedup();
+    broader_items
+}
+
+fn item_is_child_facet_owner_candidate(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Struct(_)
+            | Item::Enum(_)
+            | Item::Trait(_)
+            | Item::TraitAlias(_)
+            | Item::Type(_)
+            | Item::Union(_)
+    )
 }
 
 fn scope_imports_binding_name(items: &[Item], binding_name: &str) -> bool {
@@ -7344,6 +7530,47 @@ fn item_is_single_field_tuple_struct(item: &Item) -> bool {
             ..
         }) if fields.unnamed.len() == 1
     )
+}
+
+fn attrs_have_nutype_validate(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("nutype"))
+        .any(|attr| match &attr.meta {
+            syn::Meta::List(list) => list.tokens.clone().into_iter().any(|token| {
+                matches!(
+                    token,
+                    proc_macro2::TokenTree::Ident(ident) if ident == "validate"
+                )
+            }),
+            _ => false,
+        })
+}
+
+fn public_item_mentions_leaf(item: &Item, leaf_name: &str) -> bool {
+    struct LeafMentionVisitor<'a> {
+        leaf_name: &'a str,
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for LeafMentionVisitor<'_> {
+        fn visit_type_path(&mut self, type_path: &'ast syn::TypePath) {
+            if let Some(ident) = type_path.path.segments.last()
+                && ident.ident == self.leaf_name
+            {
+                self.found = true;
+                return;
+            }
+            syn::visit::visit_type_path(self, type_path);
+        }
+    }
+
+    let mut visitor = LeafMentionVisitor {
+        leaf_name,
+        found: false,
+    };
+    visitor.visit_item(item);
+    visitor.found
 }
 
 fn note_semantic_inference_construct(

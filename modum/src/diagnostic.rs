@@ -269,7 +269,7 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
         ),
         "namespace_overqualified_callsite_path" => (
             "The call site is spelling more of the module scaffolding than it needs, which makes the code heavier without adding comparable meaning.",
-            "Import the smallest semantic parent module and call through that instead of keeping the full absolute or deep path inline. Don't flatten all the way to the bare leaf, and don't keep the whole path just because it is technically correct. If the shortest meaningful module still reads badly, the canonical surface likely wants work.",
+            "Import the smallest semantic parent module and call through that instead of keeping the full absolute or deep path inline. Don't flatten all the way to the bare leaf, and don't keep the whole path just because it is technically correct. If the shortest meaningful module still reads badly, the canonical surface likely wants work, and if the owner itself is too broad for the leaf, grow the child facet first instead of freezing the shorter path.",
         ),
         "namespace_aliased_qualified_path" => (
             "The local alias hides the real semantic module path and makes the call site read flatter and more technical than the source surface.",
@@ -354,6 +354,10 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
         "api_candidate_facet_module" => (
             "The root module is carrying both leaf-specific value-plus-error families and the broader boundary error, so facet ownership is being flattened together.",
             "Move each leaf value-plus-error family under its owning facet and let the root keep the cross-facet boundary. Re-export the good leaf value back out only if it improves ergonomics, but don't flatten the leaf error back next to the root `Error`.",
+        ),
+        "api_candidate_child_facet_module" => (
+            "The module is mixing broader aggregate surface with one validated leaf that likely wants its own owned facet and failure surface.",
+            "Create the child facet the lint names only if it becomes the canonical owner for that leaf, move the leaf value and failure surface into it, and let the broader parent keep the aggregate items that depend on it. Do the filesystem refactor for real instead of using `#[path = ...]` shims, and don't keep both the flat module and the new child facet as equal canonical homes for the same leaf family.",
         ),
         "api_owned_facet_companion_error" => (
             "This owner already has its own `Error`, so a parallel leaf-specific companion like `TextError` creates two failure surfaces for the same facet.",
@@ -441,6 +445,14 @@ fn diagnostic_guidance_for_instance(
         }
         "api_raw_id_surface" => {
             append_instance_address(&mut address, &raw_id_surface_address_hint(message));
+        }
+        "api_candidate_child_facet_module" => {
+            if let Some((instance_why, instance_address)) =
+                candidate_child_facet_module_guidance(message)
+            {
+                why = instance_why;
+                address = instance_address;
+            }
         }
         "namespace_family_unsupported_construct" => {
             append_instance_address(
@@ -596,13 +608,35 @@ fn overqualified_callsite_guidance(message: &str) -> Option<(String, String)> {
     );
     let address = if message.contains("call through existing") {
         format!(
-            "Call through the existing `{qualifier}` namespace and prefer `{preferred}` so the call site keeps the semantic facet without paying the whole absolute path cost. Don't flatten all the way to the bare leaf, and don't keep the full path inline just because it compiles."
+            "Call through the existing `{qualifier}` namespace and prefer `{preferred}` so the call site keeps the semantic facet without paying the whole absolute path cost. Don't flatten all the way to the bare leaf, and don't keep the full path inline just because it compiles. If `{parent}` is still too broad for the leaf family, grow the child facet first instead of freezing this shorter path."
         )
     } else {
         format!(
-            "Import `{qualifier}` and call through `{preferred}` so the call site keeps the semantic facet without paying the whole absolute path cost. Don't flatten all the way to the bare leaf, and don't keep the full path inline just because it compiles."
+            "Import `{qualifier}` and call through `{preferred}` so the call site keeps the semantic facet without paying the whole absolute path cost. Don't flatten all the way to the bare leaf, and don't keep the full path inline just because it compiles. If `{parent}` is still too broad for the leaf family, grow the child facet first instead of freezing this shorter path."
         )
     };
+
+    Some((why, address))
+}
+
+fn candidate_child_facet_module_guidance(message: &str) -> Option<(String, String)> {
+    let chunks = backticked_chunks(message);
+    if chunks.len() < 4 {
+        return None;
+    }
+
+    let owner = chunks.first()?;
+    let child = chunks.last()?;
+    let leaf = chunks.get(chunks.len().checked_sub(2)?)?;
+    let broader_items = chunks[1..chunks.len() - 2].join(", ");
+    let leaf_name = leaf.rsplit("::").next()?;
+
+    let why = format!(
+        "`{owner}` is carrying broader surface like `{broader_items}` and a validated leaf `{leaf_name}` at the same level, which is a sign the leaf may want its own owned facet and failure surface."
+    );
+    let address = format!(
+        "If `{child}` becomes the real owner for this leaf family, move `{leaf_name}` and its failure surface there and let `{owner}` keep the broader aggregate surface like `{broader_items}`. Do the filesystem refactor for real instead of using `#[path = ...]` shims, and don't keep both `{leaf}` and `{child}::{leaf_name}` as equal canonical homes."
+    );
 
     Some((why, address))
 }
@@ -968,6 +1002,7 @@ mod tests {
         assert!(guidance.address.contains(
             "Call through the existing `chat` namespace and prefer `chat::room::name::Error`"
         ));
+        assert!(guidance.address.contains("grow the child facet first"));
     }
 
     #[test]
@@ -1101,12 +1136,59 @@ mod tests {
     }
 
     #[test]
+    fn generic_guidance_for_candidate_child_facet_module_demands_real_child_owner() {
+        let guidance = diagnostic_guidance_for_code("api_candidate_child_facet_module", None)
+            .expect("guidance");
+        assert!(guidance.why.contains("validated leaf"));
+        assert!(guidance.address.contains("canonical owner"));
+        assert!(guidance.address.contains("#[path = ...]"));
+        assert!(guidance.address.contains("equal canonical homes"));
+    }
+
+    #[test]
+    fn instance_guidance_for_candidate_child_facet_module_names_owner_and_child() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "api_candidate_child_facet_module".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "public module `chat::message` mixes broader surface `Message` with validated leaf `chat::message::Body`; consider an owned child facet like `chat::message::body` so the leaf value and failure surface can live together".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(
+            guidance
+                .why
+                .contains("`chat::message` is carrying broader surface")
+        );
+        assert!(guidance.address.contains("`chat::message::body`"));
+        assert!(guidance.address.contains("`chat::message::Body`"));
+    }
+
+    #[test]
     fn generic_guidance_for_owned_facet_companion_error_keeps_one_canonical_error_surface() {
         let guidance = diagnostic_guidance_for_code("api_owned_facet_companion_error", None)
             .expect("guidance");
         assert!(guidance.why.contains("same facet"));
         assert!(guidance.address.contains("caller-visible failure surface"));
         assert!(guidance.address.contains("parallel public answers"));
+    }
+
+    #[test]
+    fn owned_facet_companion_error_has_strict_profile_metadata() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "api_owned_facet_companion_error".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: String::new(),
+        };
+
+        assert_eq!(diag.profile(), Some(super::LintProfile::Strict));
     }
 
     #[test]
@@ -1343,6 +1425,14 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         "api_candidate_facet_module" => (
             LintProfile::Strict,
             "A root boundary is sitting beside flat leaf value-plus-error families that likely want owned facets.",
+        ),
+        "api_candidate_child_facet_module" => (
+            LintProfile::Strict,
+            "A broader public module likely wants a child facet for one validated leaf and its failure surface.",
+        ),
+        "api_owned_facet_companion_error" => (
+            LintProfile::Strict,
+            "An owned facet is exposing both a local companion error and a facet-level `Error` as parallel failure surfaces.",
         ),
         "api_candidate_semantic_module_unsupported_construct" => (
             LintProfile::Strict,
