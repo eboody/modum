@@ -43,6 +43,18 @@ struct QualifiedPathSurfaceCandidate {
     fixable: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct OverqualifiedCallsiteCandidate {
+    action: OverqualifiedCallsiteAction,
+    rendered_path: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum OverqualifiedCallsiteAction {
+    ImportParent { import_path: String },
+    UseExistingBinding { binding_name: String },
+}
+
 struct NamespaceFamilyBindingInfo {
     bindings: BTreeSet<String>,
     unsupported_constructs: BTreeSet<String>,
@@ -557,6 +569,30 @@ fn analyze_qualified_generic_path(
     let Some(preferred_path) =
         preferred_qualified_path_surface(file, current_module_path, &analysis_path, settings)
     else {
+        if let Some(preferred_path) = preferred_overqualified_callsite_candidate(
+            existing_namespace_callsite_candidate(&full_path, settings, scope_use_bindings),
+            overqualified_callsite_candidate(file, current_module_path, &full_path, settings),
+        ) {
+            let message = match &preferred_path.action {
+                OverqualifiedCallsiteAction::ImportParent { import_path } => format!(
+                    "`{rendered_path}` keeps too much module scaffolding at the call site; import `{import_path}` and prefer `{}`",
+                    preferred_path.rendered_path
+                ),
+                OverqualifiedCallsiteAction::UseExistingBinding { binding_name } => format!(
+                    "`{rendered_path}` keeps too much module scaffolding at the call site; call through existing `{binding_name}` namespace and prefer `{}`",
+                    preferred_path.rendered_path
+                ),
+            };
+            let diagnostic = Diagnostic::advisory(
+                Some(file.to_path_buf()),
+                Some(path.span().start().line),
+                "namespace_overqualified_callsite_path",
+                message,
+            );
+            if !namespace_diagnostic_already_emitted(diagnostics, &diagnostic) {
+                diagnostics.push(diagnostic);
+            }
+        }
         return;
     };
 
@@ -592,6 +628,197 @@ fn analyze_qualified_generic_path(
     if !namespace_diagnostic_already_emitted(diagnostics, &diagnostic) {
         diagnostics.push(diagnostic);
     }
+}
+
+fn preferred_overqualified_callsite_candidate(
+    existing: Option<OverqualifiedCallsiteCandidate>,
+    imported: Option<OverqualifiedCallsiteCandidate>,
+) -> Option<OverqualifiedCallsiteCandidate> {
+    match (existing, imported) {
+        (Some(existing), Some(imported)) => {
+            let existing_score = overqualified_callsite_score(&existing);
+            let imported_score = overqualified_callsite_score(&imported);
+            if existing_score < imported_score {
+                Some(existing)
+            } else if imported_score < existing_score {
+                Some(imported)
+            } else if matches!(
+                existing.action,
+                OverqualifiedCallsiteAction::UseExistingBinding { .. }
+            ) {
+                Some(existing)
+            } else {
+                Some(imported)
+            }
+        }
+        (Some(existing), None) => Some(existing),
+        (None, Some(imported)) => Some(imported),
+        (None, None) => None,
+    }
+}
+
+fn overqualified_callsite_score(candidate: &OverqualifiedCallsiteCandidate) -> (usize, usize) {
+    (
+        candidate.rendered_path.matches("::").count(),
+        candidate.rendered_path.len(),
+    )
+}
+
+fn overqualified_callsite_candidate(
+    file: &Path,
+    _current_module_path: &[String],
+    full_path: &[String],
+    settings: &NamespaceSettings,
+) -> Option<OverqualifiedCallsiteCandidate> {
+    let analysis_path = trim_relative_prefix(full_path);
+    if analysis_path.len() < 4 {
+        return None;
+    }
+
+    let rendered_path = full_path.join("::");
+    if full_path.len() < 5 && rendered_path.len() < 32 {
+        return None;
+    }
+
+    if !qualified_path_is_owned_or_local(file, full_path, analysis_path, settings) {
+        return None;
+    }
+
+    let module_count = full_path.len().saturating_sub(1);
+    let leaf_name = full_path.last()?;
+    for visible_suffix_len in 1..module_count {
+        let import_path = &full_path[..full_path.len() - visible_suffix_len];
+        let visible_modules =
+            &full_path[full_path.len() - 1 - visible_suffix_len..full_path.len() - 1];
+        if !callsite_visible_suffix_is_meaningful(
+            visible_modules,
+            leaf_name,
+            module_count,
+            settings,
+        ) {
+            continue;
+        }
+
+        return Some(OverqualifiedCallsiteCandidate {
+            action: OverqualifiedCallsiteAction::ImportParent {
+                import_path: import_path.join("::"),
+            },
+            rendered_path: format!("{}::{leaf_name}", visible_modules.join("::")),
+        });
+    }
+
+    None
+}
+
+fn existing_namespace_callsite_candidate(
+    full_path: &[String],
+    settings: &NamespaceSettings,
+    scope_use_bindings: &[ScopeUseBinding],
+) -> Option<OverqualifiedCallsiteCandidate> {
+    let leaf_name = full_path.last()?;
+    let total_parent_modules = full_path.len().saturating_sub(1);
+
+    scope_use_bindings
+        .iter()
+        .filter(|binding| callsite_actionable_namespace_binding(binding))
+        .filter_map(|binding| {
+            let binding_path = &binding.binding.full_path;
+            if binding_path.len() < 2
+                || binding_path.len() >= full_path.len()
+                || !full_path.starts_with(binding_path)
+            {
+                return None;
+            }
+
+            let mut visible_modules = vec![binding.binding.binding_name.clone()];
+            visible_modules.extend(
+                full_path[binding_path.len()..full_path.len() - 1]
+                    .iter()
+                    .cloned(),
+            );
+            if !callsite_visible_suffix_is_meaningful(
+                &visible_modules,
+                leaf_name,
+                total_parent_modules,
+                settings,
+            ) {
+                return None;
+            }
+
+            Some(OverqualifiedCallsiteCandidate {
+                action: OverqualifiedCallsiteAction::UseExistingBinding {
+                    binding_name: binding.binding.binding_name.clone(),
+                },
+                rendered_path: format!("{}::{leaf_name}", visible_modules.join("::")),
+            })
+        })
+        .min_by_key(|candidate| {
+            (
+                candidate.rendered_path.matches("::").count(),
+                candidate.rendered_path.len(),
+            )
+        })
+}
+
+fn callsite_actionable_namespace_binding(binding: &ScopeUseBinding) -> bool {
+    if !callsite_parent_module_looks_like_namespace(&binding.binding.binding_name) {
+        return false;
+    }
+
+    binding.binding.full_path.len() >= 2
+}
+
+fn callsite_visible_suffix_is_meaningful(
+    visible_modules: &[String],
+    leaf_name: &str,
+    total_parent_modules: usize,
+    settings: &NamespaceSettings,
+) -> bool {
+    let Some(parent_module) = visible_modules.last() else {
+        return false;
+    };
+    if !callsite_parent_module_looks_like_namespace(parent_module) {
+        return false;
+    }
+    if !resolved_parent_surface_adds_net_context(visible_modules, leaf_name, Some(settings)) {
+        return false;
+    }
+    if visible_modules.len() == 1
+        && matches_generic_noun(leaf_name, settings)
+        && total_parent_modules > 2
+        && !settings
+            .namespace_preserving_modules
+            .contains(&parent_module.to_ascii_lowercase())
+    {
+        return false;
+    }
+
+    true
+}
+
+fn callsite_parent_module_looks_like_namespace(parent_module: &str) -> bool {
+    namespace_like_binding_name(parent_module)
+        || parent_module
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+}
+
+fn qualified_path_is_owned_or_local(
+    file: &Path,
+    full_path: &[String],
+    analysis_path: &[String],
+    settings: &NamespaceSettings,
+) -> bool {
+    full_path
+        .first()
+        .is_some_and(|segment| is_relative_keyword(segment))
+        || full_path
+            .first()
+            .is_some_and(|segment| settings.owned_crate_names.contains(segment))
+        || module_path_exists_in_current_crate(
+            file,
+            &analysis_path[..analysis_path.len().saturating_sub(1)],
+        )
 }
 
 fn preferred_qualified_path_surface(

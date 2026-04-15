@@ -131,11 +131,17 @@ These catch weak or redundant public module structure.
 
 - `api_catch_all_module`
 - `api_repeated_module_segment`
+- `api_path_shim_module`
+  Warning for surface-visible `#[path = ...] mod ...;` shims when the attribute is being used to keep an older filesystem layout under a nicer module path. If the public path wants `request_meta`, create a real `request_meta` module file or directory instead of mounting `request_meta_flow.rs` through `#[path]`.
+- `internal_path_shim_module`
+  Warning for internal `#[path = ...] mod ...;` shims when the attribute is being used to fake a semantic module layout, such as `flow::room::create` mounted from `../create_room_flow.rs`. If the structure wants that module, move or rename the files so the filesystem matches the namespace.
 
 Examples:
 
 - `helpers`
 - `error::error`
+- `#[path = "request_meta_flow.rs"] mod request_meta;`
+- `#[path = "../create_room_flow.rs"] mod create;`
 
 ## Structural Errors
 

@@ -137,6 +137,7 @@ Codex should default to these behaviors:
 - Treat lint suggestions as candidates, not commands; if qualification adds no net meaning, prefer the shorter call-site shape and fix the lint.
 - Only shorten a leaf to `Repository`, `Error`, `Id`, or similar when the parent path already supplies the missing context.
 - If a longer source name is still useful, keep it internally and re-export the shorter public name.
+- If a lint implies a module refactor, do the filesystem refactor for real. Don't mount old files under prettier module names with `#[path = ...]` shims.
 
 ## Machine-Enforced Lints
 
@@ -171,6 +172,10 @@ Codex should default to these behaviors:
   Warning. Flags paths such as `user::UserRepository` or `page::ErrorPage` where the leaf repeats the parent context, and also flags flat public leaves such as `UserRepository` when a sibling semantic module surface like `user::Repository` already exists.
 - `api_candidate_semantic_module`
   Advisory warning. Flags sibling public items such as `UserRepository`, `UserService`, and `UserId` when at least three shared-head items suggest a semantic module surface like `user::{Repository, Service, Id}`. It also flags select 2-member high-signal families such as `TransactionId` plus `TransactionFailure` or `HttpRequest` plus `HttpResponse` when both shortened leaves are single-segment boundary nouns. When those siblings also share a common tail, such as `CaseInboxLaunch`, `CaseDetailLaunch`, and `CaseAuditLaunch`, it can suggest a nested surface like `case::launch::{Inbox, Detail, Audit}`. It also flags families such as `CompletedOutcome`, `RejectedOutcome`, and `toxicity::Outcome` when their shared generic tail suggests a semantic module surface like `outcome::{Completed, Rejected, Toxicity}`. It skips weak promoted heads like `to`, `has`, `open`, and `rolled`, and it skips hidden or internal module scopes. This is a parsed-source heuristic, not a macro-expanded or cfg-pruned authority surface.
+- `internal_path_shim_module`
+  Warning. Flags internal `#[path = ...] mod ...;` shims when the attribute is being used to mount code under a different semantic module shape, such as `#[path = "../create_room_flow.rs"] mod create;` inside `flow::room`. If the structure wants `flow::room::create`, create the real module files or directories and move the code there.
+- `api_path_shim_module`
+  Warning. Flags surface-visible `#[path = ...] mod ...;` shims when they keep an older filesystem name under a nicer caller-facing module name. If the public path wants `request_meta`, make that a real module path instead of leaving the old file behind a shim.
 - `api_candidate_semantic_module_unsupported_construct`
   Advisory warning. Flags scopes where semantic-module family inference was skipped because the parsed source includes unsupported observation gaps such as `#[cfg]`, `macro_rules!`, other item macros, or `include!`. `modum` emits this instead of `api_candidate_semantic_module` when the raw source is too weak to justify that heuristic.
 - `api_manual_enum_string_helper`

@@ -852,6 +852,206 @@ fn analyze_workspace_does_not_flag_internal_flat_namespace_preserving_module_for
 }
 
 #[test]
+fn analyze_workspace_flags_internal_path_shim_module_for_parent_traversal() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod flow {
+    mod room {
+        #[path = "../create_room_flow.rs"]
+        mod create;
+    }
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_path_shim_module")
+            && diag.message.contains("flow::room::create")
+            && diag.message.contains("../create_room_flow.rs")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_internal_path_shim_module_for_renamed_file_stem() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod flow {
+    #[path = "request_meta_flow.rs"]
+    mod request_meta;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_path_shim_module")
+            && diag.message.contains("flow::request_meta")
+            && diag.message.contains("request_meta_flow.rs")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_natural_same_name_path_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[path = "request_meta.rs"]
+mod request_meta;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_path_shim_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_natural_same_name_path_module_with_dot_prefix() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/flow")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "mod flow;\n").expect("write lib");
+    fs::write(
+        root.join("src/flow.rs"),
+        r#"
+#[path = "./flow/request_meta.rs"]
+mod request_meta;
+"#,
+    )
+    .expect("write flow");
+    fs::write(root.join("src/flow/request_meta.rs"), "struct Marker;\n")
+        .expect("write request_meta");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_path_shim_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_same_name_sibling_path_module_under_nested_namespace() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "mod flow;\n").expect("write lib");
+    fs::write(
+        root.join("src/flow.rs"),
+        r#"
+#[path = "request_meta.rs"]
+mod request_meta;
+"#,
+    )
+    .expect("write flow");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_path_shim_module")
+            && diag.message.contains("flow::request_meta")
+            && diag.message.contains("request_meta.rs")
+    }));
+}
+
+#[test]
+fn analyze_workspace_skips_cfg_selected_path_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[cfg(unix)]
+#[path = "linux.rs"]
+mod platform;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("internal_path_shim_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_let_unrelated_cfg_attr_hide_path_shim_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[cfg_attr(test, allow(dead_code))]
+#[path = "request_meta_flow.rs"]
+mod request_meta;
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("internal_path_shim_module")
+            && diag.message.contains("request_meta_flow.rs")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_public_path_shim_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod flow {
+    #[path = "request_meta_flow.rs"]
+    pub mod request_meta;
+}
+"#,
+    )
+    .expect("write lib");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_path_shim_module")
+            && diag.message.contains("flow::request_meta")
+            && diag.message.contains("request_meta_flow.rs")
+    }));
+}
+
+#[test]
 fn analyze_workspace_flags_internal_weak_module_generic_leaf() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -2527,6 +2727,241 @@ pub fn keep(status: http::StatusCode, url: url::Url) -> (http::StatusCode, url::
             .diagnostics
             .iter()
             .any(|diag| { diag.code() == Some("namespace_redundant_qualified_generic") })
+    );
+}
+
+#[test]
+fn analyze_workspace_flags_overqualified_callsite_function_paths() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/trace_log/demo")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod trace_log;
+
+pub fn shorten(value: &str) -> String {
+    crate::trace_log::demo::chat::short_hyphenated_text(value)
+}
+"#,
+    )
+    .expect("write source");
+    fs::write(root.join("src/trace_log.rs"), "pub mod demo;\n").expect("write trace_log");
+    fs::write(root.join("src/trace_log/demo.rs"), "pub mod chat;\n").expect("write demo");
+    fs::write(
+        root.join("src/trace_log/demo/chat.rs"),
+        r#"
+pub fn short_hyphenated_text(value: &str) -> String {
+    value.split('-').next().unwrap_or(value).to_string()
+}
+"#,
+    )
+    .expect("write chat");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_overqualified_callsite_path")
+            && diag
+                .message
+                .contains("crate::trace_log::demo::chat::short_hyphenated_text")
+            && diag
+                .message
+                .contains("prefer `chat::short_hyphenated_text`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_overqualified_callsite_type_paths() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/views/partials/components/portfolio")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod views;
+
+pub fn keep(value: crate::views::partials::components::portfolio::content::CmsActionLink) -> crate::views::partials::components::portfolio::content::CmsActionLink {
+    value
+}
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/views.rs"), "pub mod partials;\n").expect("write views");
+    fs::write(root.join("src/views/partials.rs"), "pub mod components;\n").expect("write partials");
+    fs::write(
+        root.join("src/views/partials/components.rs"),
+        "pub mod portfolio;\n",
+    )
+    .expect("write components");
+    fs::write(
+        root.join("src/views/partials/components/portfolio.rs"),
+        "pub mod content;\n",
+    )
+    .expect("write portfolio");
+    fs::write(
+        root.join("src/views/partials/components/portfolio/content.rs"),
+        "pub struct CmsActionLink;\n",
+    )
+    .expect("write content");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_overqualified_callsite_path")
+            && diag
+                .message
+                .contains("crate::views::partials::components::portfolio::content::CmsActionLink")
+            && diag.message.contains("prefer `content::CmsActionLink`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_keeps_two_segment_visible_suffix_for_deep_generic_leaves() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/domain/chat/room")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod domain;
+
+pub fn keep(source: domain::chat::room::name::Error) -> domain::chat::room::name::Error {
+    source
+}
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/domain.rs"), "pub mod chat;\n").expect("write domain");
+    fs::write(root.join("src/domain/chat.rs"), "pub mod room;\n").expect("write chat");
+    fs::write(root.join("src/domain/chat/room.rs"), "pub mod name;\n").expect("write room");
+    fs::write(
+        root.join("src/domain/chat/room/name.rs"),
+        "pub struct Error;\n",
+    )
+    .expect("write name");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_overqualified_callsite_path")
+            && diag.message.contains("domain::chat::room::name::Error")
+            && diag.message.contains("prefer `room::name::Error`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_prefers_existing_namespace_binding_for_overqualified_callsites() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/app")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod app;
+
+use app::auth;
+
+pub fn keep(source: app::auth::Error) -> app::auth::Error {
+    source
+}
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/app.rs"), "pub mod auth;\n").expect("write app");
+    fs::write(root.join("src/app/auth.rs"), "pub struct Error;\n").expect("write auth");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_overqualified_callsite_path")
+            && diag
+                .message
+                .contains("call through existing `auth` namespace")
+            && diag.message.contains("prefer `auth::Error`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_prefers_shorter_import_over_long_existing_namespace_path() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/views/partials/components/portfolio")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod views;
+
+use crate::views::partials;
+
+pub fn keep(
+    value: crate::views::partials::components::portfolio::content::CmsActionLink,
+) -> crate::views::partials::components::portfolio::content::CmsActionLink {
+    value
+}
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/views.rs"), "pub mod partials;\n").expect("write views");
+    fs::write(root.join("src/views/partials.rs"), "pub mod components;\n").expect("write partials");
+    fs::write(
+        root.join("src/views/partials/components.rs"),
+        "pub mod portfolio;\n",
+    )
+    .expect("write components");
+    fs::write(
+        root.join("src/views/partials/components/portfolio.rs"),
+        "pub mod content;\n",
+    )
+    .expect("write portfolio");
+    fs::write(
+        root.join("src/views/partials/components/portfolio/content.rs"),
+        "pub struct CmsActionLink;\n",
+    )
+    .expect("write content");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_overqualified_callsite_path")
+            && diag.message.contains("prefer `content::CmsActionLink`")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_overqualified_callsite_paths_under_weak_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/http/helpers")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod http;
+
+pub fn keep(value: &str) -> String {
+    crate::http::helpers::trimmed(value)
+}
+"#,
+    )
+    .expect("write lib");
+    fs::write(root.join("src/http.rs"), "pub mod helpers;\n").expect("write http");
+    fs::write(
+        root.join("src/http/helpers.rs"),
+        r#"
+pub fn trimmed(value: &str) -> String {
+    value.trim().to_string()
+}
+"#,
+    )
+    .expect("write helpers");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("namespace_overqualified_callsite_path"))
     );
 }
 

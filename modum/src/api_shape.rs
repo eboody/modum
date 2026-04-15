@@ -328,6 +328,26 @@ fn analyze_module_item(
     let line = item_mod.span().start().line;
     let module_is_public = scope_flags.path_is_public && is_public(&item_mod.vis);
 
+    if let Some(module_path_shim) = module_path_shim(path, item_mod, &module_name)
+        && !module_path_shim_looks_cfg_selected(item_mod)
+    {
+        let rendered_module_path = render_public_path(module_path, &module_name);
+        diagnostics.push(Diagnostic::policy(
+            Some(path.to_path_buf()),
+            Some(line),
+            if module_is_public {
+                "api_path_shim_module"
+            } else {
+                "internal_path_shim_module"
+            },
+            format!(
+                "{} module `{rendered_module_path}` uses `#[path = \"{}\"]` to mount code under a different filesystem shape; prefer a real `{rendered_module_path}` module file or directory",
+                if module_is_public { "public" } else { "internal" },
+                module_path_shim.target,
+            ),
+        ));
+    }
+
     if module_is_public {
         if settings.catch_all_modules.contains(&normalized) {
             diagnostics.push(Diagnostic::policy(
@@ -481,6 +501,67 @@ fn analyze_module_item(
             diagnostics,
         );
     }
+}
+
+struct ModulePathShim {
+    target: String,
+}
+
+fn module_path_shim(path: &Path, item_mod: &ItemMod, module_name: &str) -> Option<ModulePathShim> {
+    let target = module_path_attr_target(item_mod)?;
+    if module_path_attr_is_natural(path, module_name, &target) {
+        return None;
+    }
+
+    Some(ModulePathShim { target })
+}
+
+fn module_path_attr_target(item_mod: &ItemMod) -> Option<String> {
+    item_mod.attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("path") {
+            return None;
+        }
+
+        let syn::Meta::NameValue(meta) = &attr.meta else {
+            return None;
+        };
+        let Expr::Lit(expr_lit) = &meta.value else {
+            return None;
+        };
+        let Lit::Str(lit_str) = &expr_lit.lit else {
+            return None;
+        };
+
+        Some(lit_str.value())
+    })
+}
+
+fn module_path_attr_is_natural(current_file: &Path, module_name: &str, target: &str) -> bool {
+    let mut normalized_target = target.replace('\\', "/");
+    while normalized_target.starts_with("./") {
+        normalized_target = normalized_target[2..].to_string();
+    }
+    if normalized_target.contains("../") || normalized_target == ".." {
+        return false;
+    }
+
+    let Some(current_stem) = current_file.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let natural_prefix = match current_stem {
+        "lib" | "main" | "mod" => String::new(),
+        other => format!("{other}/"),
+    };
+
+    normalized_target == format!("{natural_prefix}{module_name}.rs")
+        || normalized_target == format!("{natural_prefix}{module_name}/mod.rs")
+}
+
+fn module_path_shim_looks_cfg_selected(item_mod: &ItemMod) -> bool {
+    item_mod
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("cfg"))
 }
 
 fn organizational_flatten_candidate(

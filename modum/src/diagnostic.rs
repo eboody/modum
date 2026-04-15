@@ -267,6 +267,10 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
             "The qualifier repeats a generic category the leaf already names, so the written path is longer without adding meaning.",
             "Use the nearer parent surface if it already exists. For owned code, create that parent-surface re-export first, migrate callers to it, and then shorten the written path. Don't silence the lint with a local alias, a compensating leaf rename, or a duplicate shadow surface.",
         ),
+        "namespace_overqualified_callsite_path" => (
+            "The call site is spelling more of the module scaffolding than it needs, which makes the code heavier without adding comparable meaning.",
+            "Import the smallest semantic parent module and call through that instead of keeping the full absolute or deep path inline. Don't flatten all the way to the bare leaf, and don't keep the whole path just because it is technically correct. If the shortest meaningful module still reads badly, the canonical surface likely wants work.",
+        ),
         "namespace_aliased_qualified_path" => (
             "The local alias hides the real semantic module path and makes the call site read flatter and more technical than the source surface.",
             "Use the semantic module path directly, or for owned code promote the binding to the nearer parent surface the lint names and use that consistently. Don't keep the technical alias around as the de facto path.",
@@ -289,11 +293,15 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
         ),
         "internal_flat_namespace_preserving_module" => (
             "The flat compound module name is hiding a facet that should stay visible as part of the path.",
-            "Reshape the module into the semantic parent and preserved child facet named in the lint, and move the family consistently. Don't leave the flat compound module in place and patch over it with longer item names or one-off re-exports.",
+            "Reshape the module into the semantic parent and preserved child facet named in the lint, and move the family consistently. Do the filesystem refactor for real: create the actual module files or directories and move the code there instead of mounting the old files through `#[path = ...]`. Don't leave the flat compound module in place and patch over it with longer item names or one-off re-exports.",
         ),
         "internal_organizational_submodule_flatten" => (
             "A pure category module like `errors`, `request`, or `response` is making naming carry the burden instead of the path.",
-            "Flatten the family back to the stronger parent surface or rename the module to the actual semantic boundary it owns. Don't keep the category module and only rename items inside it, and don't swap it for another organizational bucket.",
+            "Flatten the family back to the stronger parent surface or rename the module to the actual semantic boundary it owns. If that means changing module layout, create the real files or directories and move the code there; don't keep the old layout behind `#[path = ...]` shims. Don't keep the category module and only rename items inside it, and don't swap it for another organizational bucket.",
+        ),
+        "internal_path_shim_module" | "api_path_shim_module" => (
+            "A `#[path = ...]` module shim makes the namespace say one thing while the filesystem still says another, so the structure only looks fixed.",
+            "Create the real module file or directory for the semantic path the code now wants, move or rename the source into it, and remove the `#[path]` attribute. Don't satisfy namespace or semantic-module lints by keeping the old files in place behind a prettier shim.",
         ),
         "internal_redundant_category_suffix" => (
             "The item suffix is repeating the parent category, so the name is noisier without adding meaning.",
@@ -341,11 +349,15 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
         ),
         "api_candidate_semantic_module" | "internal_candidate_semantic_module" => (
             "The sibling family looks like it wants one shared semantic module surface instead of repeating the family marker in every leaf or module name.",
-            "Treat this as a design prompt, not an automatic rewrite. Extract the semantic module only if it becomes the real canonical surface for the family and the inner leaves get clearer. Don't create a shadow module while keeping the old flat family equally canonical.",
+            "Treat this as a design prompt, not an automatic rewrite. Extract the semantic module only if it becomes the real canonical surface for the family and the inner leaves get clearer. If you do it, make it a real refactor: create the module files or directories and move the code instead of keeping the old layout behind `#[path = ...]` shims. Don't create a shadow module while keeping the old flat family equally canonical.",
         ),
         "api_candidate_semantic_module_unsupported_construct" => (
             "This scope contains constructs like macros, cfg gates, or includes that the current source-level pass can't interpret authoritatively.",
             "Treat this as an analysis boundary. Inspect the expanded or real surface manually, or upgrade the observation point, before making structural changes here. Don't rewrite macros, includes, or cfg-driven code just to satisfy the current pass.",
+        ),
+        "api_organizational_submodule_flatten" => (
+            "A pure category module like `error`, `request`, or `response` is leaking category structure into the caller-facing path instead of letting the stronger parent surface carry it.",
+            "Flatten the public surface back to the stronger parent path or rename the module to the actual semantic boundary it owns. If that means changing module layout, create the real files or directories and move the code there; don't keep the old layout behind `#[path = ...]` shims.",
         ),
         _ if code.starts_with("namespace_") => (
             "The current path shape is hiding meaning in the wrong place, so readers have to recover structure from longer leaves or flatter aliases.",
@@ -390,6 +402,13 @@ fn diagnostic_guidance_for_instance(
         "namespace_flat_use" | "namespace_flat_pub_use" | "namespace_flat_type_alias" => {
             if let Some((instance_why, instance_address)) =
                 namespace_flat_context_guidance(code, message, fix)
+            {
+                why = instance_why;
+                address = instance_address;
+            }
+        }
+        "namespace_overqualified_callsite_path" => {
+            if let Some((instance_why, instance_address)) = overqualified_callsite_guidance(message)
             {
                 why = instance_why;
                 address = instance_address;
@@ -535,6 +554,29 @@ fn namespace_flat_context_guidance(
         _ => format!(
             "Import `{preferred}` directly and keep `{parent}` visible at call sites. Don't flatten it and try to smuggle the missing structure back with an alias or a longer leaf."
         ),
+    };
+
+    Some((why, address))
+}
+
+fn overqualified_callsite_guidance(message: &str) -> Option<(String, String)> {
+    let chunks = backticked_chunks(message);
+    let full_path = chunks.first()?;
+    let qualifier = chunks.get(1)?;
+    let preferred = chunks.get(2)?;
+    let (parent, _) = preferred.rsplit_once("::")?;
+
+    let why = format!(
+        "The call site is carrying the full path `{full_path}` even though `{parent}` is enough visible context once that module is imported."
+    );
+    let address = if message.contains("call through existing") {
+        format!(
+            "Call through the existing `{qualifier}` namespace and prefer `{preferred}` so the call site keeps the semantic facet without paying the whole absolute path cost. Don't flatten all the way to the bare leaf, and don't keep the full path inline just because it compiles."
+        )
+    } else {
+        format!(
+            "Import `{qualifier}` and call through `{preferred}` so the call site keeps the semantic facet without paying the whole absolute path cost. Don't flatten all the way to the bare leaf, and don't keep the full path inline just because it compiles."
+        )
     };
 
     Some((why, address))
@@ -862,6 +904,48 @@ mod tests {
     }
 
     #[test]
+    fn instance_guidance_for_overqualified_callsite_names_import_and_preferred_path() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "namespace_overqualified_callsite_path".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "`crate::trace_log::demo::chat::short_hyphenated_text` keeps too much module scaffolding at the call site; import `crate::trace_log::demo::chat` and prefer `chat::short_hyphenated_text`".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.why.contains("`chat` is enough visible context"));
+        assert!(guidance.address.contains(
+            "Import `crate::trace_log::demo::chat` and call through `chat::short_hyphenated_text`"
+        ));
+    }
+
+    #[test]
+    fn instance_guidance_for_overqualified_callsite_reuses_existing_namespace_binding() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "namespace_overqualified_callsite_path".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "`domain::chat::room::name::Error` keeps too much module scaffolding at the call site; call through existing `chat` namespace and prefer `chat::room::name::Error`".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(
+            guidance
+                .why
+                .contains("`chat::room::name` is enough visible context")
+        );
+        assert!(guidance.address.contains(
+            "Call through the existing `chat` namespace and prefer `chat::room::name::Error`"
+        ));
+    }
+
+    #[test]
     fn instance_guidance_skips_generic_scope_prefixes_for_string_scalars() {
         let diag = Diagnostic {
             class: DiagnosticClass::AdvisoryWarning {
@@ -991,6 +1075,25 @@ mod tests {
             diagnostic_guidance_for_code("api_candidate_semantic_module", None).expect("guidance");
         assert!(guidance.address.contains("design prompt"));
         assert!(guidance.address.contains("shadow module"));
+        assert!(guidance.address.contains("#[path = ...]"));
+    }
+
+    #[test]
+    fn generic_guidance_for_flat_namespace_module_warns_against_path_shims() {
+        let guidance =
+            diagnostic_guidance_for_code("internal_flat_namespace_preserving_module", None)
+                .expect("guidance");
+        assert!(guidance.address.contains("#[path = ...]"));
+        assert!(guidance.address.contains("filesystem refactor"));
+    }
+
+    #[test]
+    fn generic_guidance_for_path_shim_module_demands_real_module_layout() {
+        let guidance =
+            diagnostic_guidance_for_code("internal_path_shim_module", None).expect("guidance");
+        assert!(guidance.why.contains("filesystem"));
+        assert!(guidance.address.contains("real module file or directory"));
+        assert!(guidance.address.contains("remove the `#[path]` attribute"));
     }
 }
 
@@ -1036,6 +1139,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         "namespace_redundant_qualified_generic" => (
             LintProfile::Core,
             "Qualified paths repeat a generic category that the leaf already names.",
+        ),
+        "namespace_overqualified_callsite_path" => (
+            LintProfile::Strict,
+            "A long qualified call-site path keeps more module scaffolding visible than the caller needs.",
         ),
         "namespace_aliased_qualified_path" => (
             LintProfile::Core,
@@ -1101,6 +1208,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
             LintProfile::Core,
             "An internal flat module name hides a namespace-preserving facet that should stay visible in the path.",
         ),
+        "internal_path_shim_module" => (
+            LintProfile::Core,
+            "An internal module is being mounted through `#[path = ...]` instead of living at a real module path.",
+        ),
         "internal_candidate_semantic_module" => (
             LintProfile::Strict,
             "A family of sibling internal items or modules suggests a stronger semantic module surface.",
@@ -1156,6 +1267,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         "api_organizational_submodule_flatten" => (
             LintProfile::Surface,
             "A surface-visible organizational module should usually be flattened out of the path.",
+        ),
+        "api_path_shim_module" => (
+            LintProfile::Core,
+            "A surface-visible module is being mounted through `#[path = ...]` instead of living at a real module path.",
         ),
         "api_candidate_semantic_module" => (
             LintProfile::Strict,
