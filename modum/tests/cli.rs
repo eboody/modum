@@ -362,39 +362,6 @@ ignored_namespace_preserving_modules = [1]
     temp
 }
 
-fn write_surface_and_strict_fixture() -> tempfile::TempDir {
-    let temp = tempdir().expect("create temp dir");
-    let root = temp.path();
-    fs::create_dir_all(root.join("src/components")).expect("create src");
-    fs::write(
-        root.join("Cargo.toml"),
-        r#"[package]
-name = "fixture"
-version = "0.1.0"
-edition = "2024"
-"#,
-    )
-    .expect("write manifest");
-    fs::write(
-        root.join("src/lib.rs"),
-        r#"
-pub struct UserRepository;
-pub struct UserService;
-pub struct UserId;
-
-pub mod components;
-"#,
-    )
-    .expect("write lib");
-    fs::write(root.join("src/components.rs"), "pub mod button;\n").expect("write components");
-    fs::write(
-        root.join("src/components/button.rs"),
-        "pub struct Button;\n",
-    )
-    .expect("write button");
-    temp
-}
-
 fn write_profile_metadata_fixture(profile: &str) -> tempfile::TempDir {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -472,14 +439,14 @@ fn cli_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("Usage:"));
     assert!(check_help_out.contains("MODUM=off|warn|deny"));
     assert!(check_help_out.contains("modum check"));
-    assert!(check_help_out.contains("--profile core|surface|strict"));
     assert!(check_help_out.contains("--ignore <code>"));
     assert!(check_help_out.contains("--baseline <path>"));
     assert!(check_help_out.contains("--write-baseline <path>"));
     assert!(check_help_out.contains("--write-markdown-report|-w"));
-    assert!(check_help_out.contains("--pretty|-p"));
     assert!(check_help_out.contains("check -w"));
-    assert!(check_help_out.contains("check -p"));
+    assert!(!check_help_out.contains("--profile"));
+    assert!(!check_help_out.contains("--show"));
+    assert!(!check_help_out.contains("--pretty"));
     assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_modum"))
@@ -505,14 +472,14 @@ fn cargo_subcommand_help_shows_lint_only_surface() {
     assert!(check_help_out.contains("Usage:"));
     assert!(check_help_out.contains("MODUM=off|warn|deny"));
     assert!(check_help_out.contains("cargo modum check"));
-    assert!(check_help_out.contains("--profile core|surface|strict"));
     assert!(check_help_out.contains("--ignore <code>"));
     assert!(check_help_out.contains("--baseline <path>"));
     assert!(check_help_out.contains("--write-baseline <path>"));
     assert!(check_help_out.contains("--write-markdown-report|-w"));
-    assert!(check_help_out.contains("--pretty|-p"));
     assert!(check_help_out.contains("check -w"));
-    assert!(check_help_out.contains("check -p"));
+    assert!(!check_help_out.contains("--profile"));
+    assert!(!check_help_out.contains("--show"));
+    assert!(!check_help_out.contains("--pretty"));
     assert!(check_help_out.contains("--explain <code>"));
 
     let top_help = Command::new(env!("CARGO_BIN_EXE_cargo-modum"))
@@ -624,7 +591,7 @@ fn cli_json_output_includes_fix_metadata_for_direct_path_rewrites() {
     assert!(
         diag["guidance"]["address"]
             .as_str()
-            .is_some_and(|text| text.contains("direct rewrite is `Response`"))
+            .is_some_and(|text| text.contains("site-level rewrite here is `Response`"))
     );
 }
 
@@ -652,7 +619,7 @@ fn cli_pretty_flag_requires_text_output() {
 }
 
 #[test]
-fn cli_text_output_can_filter_to_advisories() {
+fn cli_show_flag_reports_removed_error() {
     let temp = write_policy_and_advisory_fixture();
     let root = temp.path();
 
@@ -667,14 +634,11 @@ fn cli_text_output_can_filter_to_advisories() {
         ])
         .output()
         .expect("run modum check");
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(1));
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("showing: advisory diagnostics and errors only"));
-    assert!(stdout.contains("Advisory Diagnostics:"));
-    assert!(stdout.contains("api_candidate_semantic_module"));
-    assert!(!stdout.contains("Policy Diagnostics:"));
-    assert!(!stdout.contains("namespace_redundant_qualified_generic"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--show was removed"));
+    assert!(stderr.contains("prints the full report by default"));
 }
 
 #[test]
@@ -791,35 +755,6 @@ fn cli_pretty_output_syntax_highlights_semantic_surface_suggestion() {
 }
 
 #[test]
-fn cli_pretty_output_respects_advisory_filter() {
-    let temp = write_policy_and_advisory_fixture();
-    let root = temp.path();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
-        .current_dir(root)
-        .args([
-            "check",
-            "--root",
-            root.to_str().expect("utf8 root"),
-            "-p",
-            "--show",
-            "advisory",
-        ])
-        .output()
-        .expect("run modum check");
-    assert_eq!(output.status.code(), Some(2));
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stripped = strip_ansi_codes(&stdout);
-    assert!(stripped.contains("Showing"));
-    assert!(stripped.contains("advisory diagnostics and errors only"));
-    assert!(stripped.contains("(exit code still reflects the full report)"));
-    assert!(stripped.contains("Advisory Diagnostics"));
-    assert!(!stripped.contains("Policy Diagnostics"));
-    assert!(!stripped.contains("namespace_redundant_qualified_generic"));
-}
-
-#[test]
 fn cli_explain_prints_profile_and_summary() {
     let output = Command::new(env!("CARGO_BIN_EXE_modum"))
         .args(["--explain", "namespace_flat_use"])
@@ -829,7 +764,7 @@ fn cli_explain_prints_profile_and_summary() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("namespace_flat_use"));
-    assert!(stdout.contains("profile: core"));
+    assert!(stdout.contains("tier: core"));
     assert!(stdout.contains("Flattened imports hide useful namespace context"));
     assert!(stdout.contains("why:"));
     assert!(stdout.contains("address:"));
@@ -879,7 +814,7 @@ fn cli_explain_maybe_some_includes_fix_guidance() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("callsite_maybe_some"));
-    assert!(stdout.contains("profile: strict"));
+    assert!(stdout.contains("tier: strict"));
     assert!(stdout.contains("non-`maybe_` setter"));
     assert!(stdout.contains("ignored_diagnostic_codes"));
 }
@@ -1218,7 +1153,7 @@ fn cli_writes_distinct_timestamped_markdown_reports_across_runs() {
 }
 
 #[test]
-fn cli_profile_core_hides_strict_advisories() {
+fn cli_profile_flag_reports_removed_error() {
     let temp = write_policy_and_advisory_fixture();
     let root = temp.path();
 
@@ -1230,63 +1165,14 @@ fn cli_profile_core_hides_strict_advisories() {
             root.to_str().expect("utf8 root"),
             "--profile",
             "core",
-            "--format",
-            "json",
         ])
         .output()
         .expect("run modum check");
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(1));
 
-    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
-    let diagnostics = json["report"]["diagnostics"]
-        .as_array()
-        .expect("diagnostics");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diag| diag["code"].as_str() == Some("namespace_redundant_qualified_generic"))
-    );
-    assert!(
-        !diagnostics
-            .iter()
-            .any(|diag| diag["code"].as_str() == Some("api_candidate_semantic_module"))
-    );
-}
-
-#[test]
-fn cli_profile_surface_includes_surface_and_hides_strict_advisories() {
-    let temp = write_surface_and_strict_fixture();
-    let root = temp.path();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_modum"))
-        .current_dir(root)
-        .args([
-            "check",
-            "--root",
-            root.to_str().expect("utf8 root"),
-            "--profile",
-            "surface",
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("run modum check");
-    assert_eq!(output.status.code(), Some(2));
-
-    let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
-    let diagnostics = json["report"]["diagnostics"]
-        .as_array()
-        .expect("diagnostics");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diag| diag["code"].as_str() == Some("api_missing_parent_surface_export"))
-    );
-    assert!(
-        !diagnostics
-            .iter()
-            .any(|diag| diag["code"].as_str() == Some("api_candidate_semantic_module"))
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--profile was removed"));
+    assert!(stderr.contains("full lint set by default"));
 }
 
 #[test]
@@ -1308,7 +1194,7 @@ fn cli_invalid_profile_reports_error() {
     assert_eq!(output.status.code(), Some(1));
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--profile invalid profile `default`; expected core|surface|strict"));
+    assert!(stderr.contains("--profile was removed"));
 }
 
 #[test]
@@ -1466,7 +1352,7 @@ fn cli_invalid_scan_default_metadata_reports_error() {
 }
 
 #[test]
-fn cli_invalid_profile_metadata_reports_error() {
+fn cli_profile_metadata_is_ignored_with_warning() {
     let temp = write_invalid_profile_metadata_fixture();
     let root = temp.path();
 
@@ -1481,21 +1367,19 @@ fn cli_invalid_profile_metadata_reports_error() {
         ])
         .output()
         .expect("run modum check");
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(0));
 
     let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
-    assert_eq!(json["exit_code"].as_u64(), Some(1));
+    assert_eq!(json["exit_code"].as_u64(), Some(0));
     assert!(
         json["report"]["diagnostics"]
             .as_array()
             .expect("diagnostics")
             .iter()
             .any(|diag| {
-                diag["message"].as_str().is_some_and(|message| {
-                    message.contains(
-                        "`metadata.modum.profile` invalid profile `default`; expected core|surface|strict"
-                    )
-                })
+                diag["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("`metadata.modum.profile` is ignored"))
             })
     );
 }
@@ -1606,7 +1490,7 @@ fn cli_invalid_namespace_preserving_override_metadata_reports_error() {
 }
 
 #[test]
-fn cli_package_metadata_profile_sets_default_filter() {
+fn cli_package_metadata_profile_does_not_filter_and_emits_warning() {
     let temp = write_profile_metadata_fixture("core");
     let root = temp.path();
 
@@ -1621,11 +1505,20 @@ fn cli_package_metadata_profile_sets_default_filter() {
         ])
         .output()
         .expect("run modum check");
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(2));
 
     let json: Value = serde_json::from_slice(&output.stdout).expect("parse json");
     let diagnostics = json["report"]["diagnostics"]
         .as_array()
         .expect("diagnostics");
-    assert!(diagnostics.is_empty());
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diag| { diag["code"].as_str() == Some("api_candidate_semantic_module") })
+    );
+    assert!(diagnostics.iter().any(|diag| {
+        diag["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("`metadata.modum.profile` is ignored"))
+    }));
 }

@@ -49,13 +49,20 @@ pub(super) fn analyze_namespace_rules(
     settings: &NamespaceSettings,
 ) -> Analysis {
     let mut diagnostics = Vec::new();
-    analyze_scope(path, &parsed.items, settings, &mut diagnostics);
+    analyze_scope(
+        path,
+        &parsed.items,
+        &inferred_file_module_path(path),
+        settings,
+        &mut diagnostics,
+    );
     Analysis { diagnostics }
 }
 
 fn analyze_scope(
     path: &Path,
     items: &[Item],
+    current_module_path: &[String],
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -63,11 +70,25 @@ fn analyze_scope(
 
     for item in items {
         match item {
-            Item::Use(item_use) => analyze_use_item(path, items, item_use, settings, diagnostics),
+            Item::Use(item_use) => analyze_use_item(
+                path,
+                current_module_path,
+                items,
+                item_use,
+                settings,
+                diagnostics,
+            ),
             Item::Type(item_type) => {
-                analyze_type_alias_item(path, item_type, settings, diagnostics);
+                analyze_type_alias_item(
+                    path,
+                    current_module_path,
+                    item_type,
+                    settings,
+                    diagnostics,
+                );
                 analyze_qualified_callsite_paths(
                     path,
+                    current_module_path,
                     item,
                     settings,
                     diagnostics,
@@ -76,10 +97,16 @@ fn analyze_scope(
             }
             Item::Mod(ItemMod {
                 content: Some((_, nested)),
+                ident,
                 ..
-            }) => analyze_scope(path, nested, settings, diagnostics),
+            }) => {
+                let mut nested_module_path = current_module_path.to_vec();
+                nested_module_path.push(ident.to_string());
+                analyze_scope(path, nested, &nested_module_path, settings, diagnostics);
+            }
             _ => analyze_qualified_callsite_paths(
                 path,
+                current_module_path,
                 item,
                 settings,
                 diagnostics,
@@ -91,6 +118,7 @@ fn analyze_scope(
 
 fn analyze_qualified_callsite_paths(
     path: &Path,
+    current_module_path: &[String],
     item: &Item,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
@@ -98,6 +126,7 @@ fn analyze_qualified_callsite_paths(
 ) {
     let mut visitor = QualifiedCallsitePathVisitor {
         file: path,
+        current_module_path,
         settings,
         diagnostics,
         scope_use_bindings,
@@ -107,6 +136,7 @@ fn analyze_qualified_callsite_paths(
 
 struct QualifiedCallsitePathVisitor<'a> {
     file: &'a Path,
+    current_module_path: &'a [String],
     settings: &'a NamespaceSettings,
     diagnostics: &'a mut Vec<Diagnostic>,
     scope_use_bindings: &'a [ScopeUseBinding],
@@ -116,6 +146,7 @@ impl<'ast> Visit<'ast> for QualifiedCallsitePathVisitor<'_> {
     fn visit_expr_path(&mut self, node: &'ast ExprPath) {
         analyze_qualified_generic_path(
             self.file,
+            self.current_module_path,
             &node.path,
             self.settings,
             self.diagnostics,
@@ -128,6 +159,7 @@ impl<'ast> Visit<'ast> for QualifiedCallsitePathVisitor<'_> {
         if node.qself.is_none() {
             analyze_qualified_generic_path(
                 self.file,
+                self.current_module_path,
                 &node.path,
                 self.settings,
                 self.diagnostics,
@@ -141,6 +173,7 @@ impl<'ast> Visit<'ast> for QualifiedCallsitePathVisitor<'_> {
         if let TypeParamBound::Trait(trait_bound) = node {
             analyze_qualified_generic_path(
                 self.file,
+                self.current_module_path,
                 &trait_bound.path,
                 self.settings,
                 self.diagnostics,
@@ -153,6 +186,7 @@ impl<'ast> Visit<'ast> for QualifiedCallsitePathVisitor<'_> {
 
 fn analyze_use_item(
     path: &Path,
+    current_module_path: &[String],
     scope_items: &[Item],
     item_use: &ItemUse,
     settings: &NamespaceSettings,
@@ -162,8 +196,6 @@ fn analyze_use_item(
     flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
     let line = item_use.span().start().line;
     let is_reexport = !matches!(item_use.vis, Visibility::Inherited);
-    let current_module_path = inferred_file_module_path(path);
-
     for leaf in leaves {
         if let UseLeaf::Glob(full_path) = &leaf {
             analyze_glob_use_item(path, line, is_reexport, full_path, settings, diagnostics);
@@ -184,6 +216,9 @@ fn analyze_use_item(
         let Some(parent_module) = analysis_path.iter().rev().nth(1).cloned() else {
             continue;
         };
+        let Some(source_leaf_name) = analysis_path.last() else {
+            continue;
+        };
         let parent_normalized = parent_module.to_ascii_lowercase();
         let redundant_leaf = redundant_leaf_context_candidate(
             analysis_path,
@@ -195,21 +230,17 @@ fn analyze_use_item(
         let skip_reexport = is_reexport
             && ((redundant_leaf.is_some() && direct_child_module_is_private(path, analysis_path))
                 || canonical_parent_surface_reexport(
-                    &current_module_path,
+                    current_module_path,
                     analysis_path,
                     &binding.binding_name,
                     settings,
                 )
                 || parent_surface_reexports_current_binding(
                     path,
-                    &current_module_path,
+                    current_module_path,
                     &binding.binding_name,
                 )
-                || preserved_parent_surface_reexport(
-                    &current_module_path,
-                    analysis_path,
-                    settings,
-                ));
+                || preserved_parent_surface_reexport(current_module_path, analysis_path, settings));
 
         if skip_reexport {
             continue;
@@ -220,14 +251,14 @@ fn analyze_use_item(
         } else {
             canonical_parent_surface_candidate(
                 path,
-                &current_module_path,
+                current_module_path,
                 analysis_path,
                 &binding.binding_name,
                 settings,
             )
         };
         let visible_callsite_surface =
-            visible_callsite_surface_candidate(analysis_path, &binding.binding_name, settings);
+            visible_callsite_surface_candidate(analysis_path, source_leaf_name, settings);
         let binding_used_as_namespace =
             binding_is_used_as_namespace_in_scope(scope_items, &binding.binding_name);
 
@@ -246,14 +277,21 @@ fn analyze_use_item(
                     &binding.binding_name,
                     &shorter_leaf,
                 )
-            } else if settings.generic_nouns.contains(&binding.binding_name)
+            } else if (settings.generic_nouns.contains(source_leaf_name)
+                || binding_depends_on_visible_namespace(
+                    path,
+                    current_module_path,
+                    &binding.full_path,
+                    source_leaf_name,
+                    settings,
+                ))
                 && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
             {
                 generic_noun_message(is_reexport, &binding.source_name, visible_callsite_surface)
             } else if settings
                 .namespace_preserving_modules
                 .contains(&parent_normalized)
-                && !module_path_contains_namespace(&current_module_path, &parent_normalized)
+                && !module_path_contains_namespace(current_module_path, &parent_normalized)
                 && !binding_used_as_namespace
                 && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
             {
@@ -278,6 +316,7 @@ fn analyze_use_item(
 
 fn analyze_type_alias_item(
     path: &Path,
+    current_module_path: &[String],
     item_type: &ItemType,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
@@ -308,12 +347,14 @@ fn analyze_type_alias_item(
     let Some(parent_module) = analysis_path.iter().rev().nth(1).cloned() else {
         return;
     };
+    let Some(aliased_leaf_name) = analysis_path.last() else {
+        return;
+    };
     let parent_normalized = parent_module.to_ascii_lowercase();
-    let current_module_path = inferred_file_module_path(path);
     let redundant_leaf =
         redundant_leaf_context_candidate(analysis_path, &binding_name, true, false, settings);
     let visible_callsite_surface =
-        visible_callsite_surface_candidate(analysis_path, &binding_name, settings);
+        visible_callsite_surface_candidate(analysis_path, aliased_leaf_name, settings);
 
     let Some((code, message)) = (if let Some(shorter_leaf) = redundant_leaf {
         Some((
@@ -322,7 +363,14 @@ fn analyze_type_alias_item(
                 "type alias `{binding_name}` keeps redundant `{parent_module}` context; prefer `{parent_module}::{shorter_leaf}` directly"
             ),
         ))
-    } else if settings.generic_nouns.contains(&binding_name)
+    } else if (settings.generic_nouns.contains(aliased_leaf_name)
+        || binding_depends_on_visible_namespace(
+            path,
+            current_module_path,
+            &full_path,
+            aliased_leaf_name,
+            settings,
+        ))
         && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
     {
         Some((
@@ -335,7 +383,7 @@ fn analyze_type_alias_item(
     } else if settings
         .namespace_preserving_modules
         .contains(&parent_normalized)
-        && !module_path_contains_namespace(&current_module_path, &parent_normalized)
+        && !module_path_contains_namespace(current_module_path, &parent_normalized)
         && let Some(visible_callsite_surface) = visible_callsite_surface.as_deref()
     {
         Some((
@@ -414,6 +462,7 @@ fn analyze_glob_use_item(
 
 fn analyze_qualified_generic_path(
     file: &Path,
+    current_module_path: &[String],
     path: &SynPath,
     settings: &NamespaceSettings,
     diagnostics: &mut Vec<Diagnostic>,
@@ -424,14 +473,13 @@ fn analyze_qualified_generic_path(
         .iter()
         .map(|segment| segment.ident.to_string())
         .collect::<Vec<_>>();
-    let current_module_path = inferred_file_module_path(file);
     let rendered_path = full_path.join("::");
 
     if let Some(resolved_alias_path) = resolved_namespace_alias_path(&full_path, scope_use_bindings)
     {
         let preferred_path = preferred_qualified_path_surface(
             file,
-            &current_module_path,
+            current_module_path,
             &resolved_alias_path,
             settings,
         )
@@ -459,7 +507,7 @@ fn analyze_qualified_generic_path(
         .map(|binding| render_resolved_namespace_binding_path(&full_path, binding))
         .unwrap_or_else(|| full_path.clone());
     let Some(preferred_path) =
-        preferred_qualified_path_surface(file, &current_module_path, &analysis_path, settings)
+        preferred_qualified_path_surface(file, current_module_path, &analysis_path, settings)
     else {
         return;
     };
@@ -1095,6 +1143,73 @@ fn visible_callsite_surface_candidate(
     }
 
     Some(format!("{parent_module}::{binding_name}"))
+}
+
+fn binding_depends_on_visible_namespace(
+    path: &Path,
+    current_module_path: &[String],
+    import_path: &[String],
+    binding_name: &str,
+    settings: &NamespaceSettings,
+) -> bool {
+    let binding_segments = split_segments(binding_name);
+    if binding_segments.len() < 2 {
+        return false;
+    }
+
+    let Some(tail) = binding_segments.last() else {
+        return false;
+    };
+    if !namespace_visible_family_tail(tail, settings) {
+        return false;
+    }
+
+    let shared_prefix = binding_segments[..binding_segments.len() - 1]
+        .iter()
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let Some(path_prefix) = import_path.get(..import_path.len().saturating_sub(1)) else {
+        return false;
+    };
+    let Some(module_path) = resolve_qualified_parent_surface_path(current_module_path, path_prefix)
+    else {
+        return false;
+    };
+    if module_path.is_empty() {
+        return false;
+    }
+
+    let bindings = module_bindings_for_module(path, &module_path);
+    if bindings.is_empty() {
+        return false;
+    }
+
+    bindings.into_iter().any(|candidate| {
+        if candidate == binding_name {
+            return false;
+        }
+
+        let candidate_segments = split_segments(&candidate);
+        if candidate_segments.len() < 2 {
+            return false;
+        }
+        let Some(candidate_tail) = candidate_segments.last() else {
+            return false;
+        };
+        if !namespace_visible_family_tail(candidate_tail, settings) {
+            return false;
+        }
+
+        candidate_segments[..candidate_segments.len() - 1]
+            .iter()
+            .map(|segment| segment.to_ascii_lowercase())
+            .eq(shared_prefix.iter().cloned())
+    })
+}
+
+fn namespace_visible_family_tail(segment: &str, settings: &NamespaceSettings) -> bool {
+    matches_generic_noun(segment, settings)
+        || matches!(segment.to_ascii_lowercase().as_str(), "flow" | "state")
 }
 
 fn redundant_leaf_context_candidate(

@@ -244,15 +244,15 @@ impl Serialize for Diagnostic {
 fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'static str)> {
     let (why, address) = match code {
         "namespace_flat_use" | "namespace_flat_pub_use" | "namespace_flat_type_alias" => (
-            "The imported leaf is generic enough that the path is carrying useful meaning; flattening it makes call sites harder to scan.",
-            "Keep the meaningful qualifier visible at the use site or public surface named in the lint. If the qualified form would still be redundant, leave it flat instead of forcing noise.",
+            "The imported leaf still depends on the parent path to read clearly, so flattening it makes call sites harder to scan.",
+            "Keep the meaningful qualifier visible at the use site or public surface named in the lint. If you want a shorter path, promote a real parent surface first. Don't flatten it and then smuggle the missing meaning back with an alias or a longer leaf.",
         ),
         "namespace_flat_use_preserve_module"
         | "namespace_flat_pub_use_preserve_module"
         | "namespace_flat_type_alias_preserve_module"
         | "namespace_glob_preserve_module" => (
             "The child module is a real facet like `http`, `query`, or `components`, so hiding it erases role information that the path should keep visible.",
-            "Import or re-export through the preserved module named in the lint so the facet stays visible. Don't compensate by stuffing that missing context into a longer leaf name.",
+            "Import or re-export through the preserved module named in the lint so the facet stays visible. Don't keep the path flat and patch over the loss with a local alias, a glob, or a longer leaf name.",
         ),
         "namespace_flat_use_redundant_leaf_context"
         | "namespace_flat_pub_use_redundant_leaf_context"
@@ -261,99 +261,99 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
         | "internal_adapter_redundant_leaf_context"
         | "api_redundant_leaf_context" => (
             "The leaf is repeating context that the parent path already supplies, so the name is doing work the module path should already be doing.",
-            "Move the repeated context into the path and keep the shorter leaf only if the resulting path still reads clearly. If the short leaf would become vague, strengthen the module path instead of cargo-culting the shorter name.",
+            "Move the repeated context into the path and keep the shorter leaf only if the resulting path is still a complete, standalone name. Don't fake this with a local alias or by mechanically chopping tokens; if the short leaf becomes vague, strengthen the parent path or keep the longer leaf.",
         ),
         "namespace_redundant_qualified_generic" => (
             "The qualifier repeats a generic category the leaf already names, so the written path is longer without adding meaning.",
-            "Use the nearer parent surface if it already exists. For owned code, create that parent-surface re-export first and then use it. Don't silence the lint with a meaningless rename that preserves the same shape.",
+            "Use the nearer parent surface if it already exists. For owned code, create that parent-surface re-export first, migrate callers to it, and then shorten the written path. Don't silence the lint with a local alias, a compensating leaf rename, or a duplicate shadow surface.",
         ),
         "namespace_aliased_qualified_path" => (
             "The local alias hides the real semantic module path and makes the call site read flatter and more technical than the source surface.",
-            "Use the semantic module path directly, or for owned code promote the binding to the nearer parent surface the lint names. Avoid technical alias names that only hide the real structure.",
+            "Use the semantic module path directly, or for owned code promote the binding to the nearer parent surface the lint names and use that consistently. Don't keep the technical alias around as the de facto path.",
         ),
         "namespace_parent_surface" => (
             "The parent module already exposes the readable caller-facing surface, so reaching through a child module bypasses the intended entrypoint.",
-            "Import or re-export the binding from the parent surface named in the lint instead of reaching into the child module. Keep the child path for implementation organization, not for the main caller-facing path.",
+            "Import or re-export the binding from the parent surface named in the lint and make that the canonical caller-facing path. Keep the child path for implementation organization only; don't add the parent alias and then keep callers split across both surfaces.",
         ),
         "namespace_prelude_glob_import" => (
             "A prelude glob hides where names come from, which makes it harder to tell which module is carrying the meaning.",
-            "Import the concrete items you need or keep the meaningful module visible at the call site instead of relying on the glob.",
+            "Import the concrete items you need or keep the meaningful module visible at the call site instead of relying on the glob. Don't replace one hidden source with another flatter alias or umbrella prelude.",
         ),
         "internal_catch_all_module" | "api_catch_all_module" => (
             "A bucket module like `util` or `service` forces item names to carry all the meaning because the module itself says almost nothing.",
-            "Split the bucket by a real domain or facet, or rename the module to the semantic boundary it actually owns. Don't just move the same mixed contents under another weak bucket name.",
+            "Split the bucket by a real domain or facet, or rename the module to the semantic boundary it actually owns. Don't just move the same mixed contents under another weak bucket like `common`, `shared`, `helpers`, or `types`.",
         ),
         "internal_flat_namespace_preserving_module" => (
             "The flat compound module name is hiding a facet that should stay visible as part of the path.",
-            "Reshape the module into the semantic parent and preserved child facet named in the lint. Fix the structure rather than patching over it with longer item names inside the flat module.",
+            "Reshape the module into the semantic parent and preserved child facet named in the lint, and move the family consistently. Don't leave the flat compound module in place and patch over it with longer item names or one-off re-exports.",
         ),
         "internal_organizational_submodule_flatten" => (
             "A pure category module like `errors`, `request`, or `response` is making naming carry the burden instead of the path.",
-            "Flatten the family back to the stronger parent surface or rename the module to the actual semantic boundary it owns. Don't keep the category module and only rename the items inside it.",
+            "Flatten the family back to the stronger parent surface or rename the module to the actual semantic boundary it owns. Don't keep the category module and only rename items inside it, and don't swap it for another organizational bucket.",
         ),
         "internal_redundant_category_suffix" => (
             "The item suffix is repeating the parent category, so the name is noisier without adding meaning.",
-            "Drop the repeated category suffix if the parent path already carries it clearly. If that produces an unclear leaf, improve the parent path instead of keeping the redundant suffix.",
+            "Drop the repeated category suffix if the parent path already carries it clearly. Don't strip the token mechanically: if the shorter leaf becomes vague or collides, strengthen the parent path or keep the longer leaf.",
         ),
         "api_missing_parent_surface_export" => (
             "The child module has the main binding, but callers still have to reach into that child path instead of using the readable parent surface.",
-            "Add the parent-surface re-export the lint is asking for so callers can use the semantic parent path. Don't dodge this by renaming the child module or type with scaffolding words just to quiet the warning.",
+            "Add the parent-surface re-export the lint is asking for and treat that parent path as the readable caller-facing entrypoint. Don't dodge this by renaming the child module or type, and don't add a second surface while leaving callers on the child path.",
         ),
         "api_anyhow_error_surface" => (
             "A public boundary that leaks `anyhow` hides the crate's real error vocabulary and makes the surface harder to understand and match on.",
-            "Expose a crate-owned typed error at the boundary and convert internal `anyhow` failures into it. Keep `anyhow` inside the implementation boundary where it belongs.",
+            "Expose a crate-owned typed error at the boundary and convert internal `anyhow` failures into it. Keep `anyhow` inside the implementation boundary where it belongs, and don't wrap `anyhow::Error` in a thin alias or pass-through newtype and call that a typed boundary.",
         ),
         "api_string_error_surface" => (
             "A raw string error loses structure, variants, and machine-readable meaning at the API boundary.",
-            "Replace the string boundary with a typed error value. If the lint is on a parsing or protocol edge, model the actual failure cases instead of collapsing them into free-form text.",
+            "Replace the string boundary with a typed error value that names the real failure cases. Don't hide the same free-form text inside a wrapper with one `message` field or defer the modeling work deeper in the workflow.",
         ),
         "api_manual_error_surface" => (
             "The public error shape looks like an ad hoc wrapper instead of a focused typed boundary with named failure cases.",
-            "Give the boundary an explicit typed error design that matches what callers need to understand. If the wrapper is only carrying text, replace it with a real error type instead of polishing the wrapper.",
+            "Give the boundary an explicit typed error design that matches what callers need to understand. If the wrapper is only carrying text, replace it with real variants or focused fields instead of polishing the wrapper shell.",
         ),
         "api_semantic_string_scalar" => (
             "The boundary name suggests domain meaning like `url`, `email`, or `path`, but the type is still a raw string.",
-            "Parse or validate at the boundary into the focused type the repo wants to use there. If a reusable newtype or domain wrapper already exists, use that instead of renaming the string field or parameter.",
+            "Parse or validate at the boundary into the focused type the repo wants to use there. If a reusable newtype or domain wrapper already exists, use that instead of renaming the string field or parameter. Don't stop at a plain `type ... = String` alias, a pass-through wrapper, or a later parse step.",
         ),
         "api_semantic_numeric_scalar" => (
             "The boundary name suggests a unit or domain meaning like duration, timestamp, or port, but the type is still a bare number.",
-            "Use a typed duration, timestamp, port, or small domain wrapper at the boundary. Don't just rename the field while leaving the raw scalar contract unchanged.",
+            "Use a typed duration, timestamp, port, or small domain wrapper at the boundary. Don't just rename the field, switch integer widths, or hide the same raw number inside another config object.",
         ),
         "api_raw_id_surface" => (
             "An id at the boundary usually carries validation, formatting, or cross-system meaning that a bare string or integer can't express.",
-            "Introduce or reuse a focused id type at the boundary and validate or parse into it there. Avoid silencing the lint by only renaming the raw field.",
+            "Introduce or reuse a focused id type at the boundary and validate or parse into it there. Avoid silencing the lint by only renaming the raw field, using a plain `type ... = String` alias, or wrapping the same raw value without stronger semantics.",
         ),
         "api_boolean_flag_cluster" => (
             "Several booleans together usually mean the boundary is really describing a smaller mode or policy model.",
-            "Replace the cluster with a typed options object or enum that names the actual combinations callers are supposed to choose between.",
+            "Replace the cluster with a typed options object or enum that names the actual combinations callers are supposed to choose between. Don't just move the same booleans into another bag or builder and call the boundary modeled.",
         ),
         "api_manual_flag_set" => (
             "Parallel constants and raw bitmask handling usually mean the API is hand-rolling a flags boundary.",
-            "Replace the raw integer mask with a typed flags surface or wrapper so the boundary names the allowed flag combinations directly.",
+            "Replace the raw integer mask with a typed flags surface or wrapper so the boundary names the allowed combinations directly. Don't keep the same bitmask contract behind helper functions or renamed constants.",
         ),
         "callsite_maybe_some" => (
             "Wrapping a concrete value in `Some(...)` when calling a `maybe_*` API throws away the distinction that method is designed to preserve.",
-            "If you already have a concrete value, call the non-`maybe_` setter. Use the `maybe_` form when the caller really is forwarding an `Option<_>`.",
+            "If you already have a concrete value, call the non-`maybe_` setter. Use the `maybe_` form when the caller really is forwarding an `Option<_>`. Don't wrap a value in `Some(...)` just to satisfy the method name.",
         ),
         "api_candidate_semantic_module" | "internal_candidate_semantic_module" => (
             "The sibling family looks like it wants one shared semantic module surface instead of repeating the family marker in every leaf or module name.",
-            "Treat this as a design prompt, not a mandatory rewrite. Extract the semantic module only if it makes the resulting paths clearer and more stable for readers.",
+            "Treat this as a design prompt, not an automatic rewrite. Extract the semantic module only if it becomes the real canonical surface for the family and the inner leaves get clearer. Don't create a shadow module while keeping the old flat family equally canonical.",
         ),
         "api_candidate_semantic_module_unsupported_construct" => (
             "This scope contains constructs like macros, cfg gates, or includes that the current source-level pass can't interpret authoritatively.",
-            "Treat this as an analysis boundary, not a rewrite prompt. Inspect the expanded or real public surface manually, or upgrade the observation point, before making structural changes here.",
+            "Treat this as an analysis boundary. Inspect the expanded or real surface manually, or upgrade the observation point, before making structural changes here. Don't rewrite macros, includes, or cfg-driven code just to satisfy the current pass.",
         ),
         _ if code.starts_with("namespace_") => (
             "The current path shape is hiding meaning in the wrong place, so readers have to recover structure from longer leaves or flatter aliases.",
-            "Move the meaning back into the path the lint points at. Prefer a clearer module surface over a rename whose only job is to silence the lint.",
+            "Move the meaning back into the path the lint points at. Fix the owning surface instead of only renaming the local use site or alias.",
         ),
         _ if code.starts_with("internal_") => (
             "The internal module or item shape is making names carry meaning that the structure should carry instead.",
-            "Change the structure the lint points at: split the module, strengthen the parent path, or shorten the repeated leaf only when the resulting path still reads clearly.",
+            "Change the structure the lint points at: split the module, strengthen the parent path, or shorten the repeated leaf only when the resulting path stays clear. Avoid bucket renames and token-chop fixes whose only job is to silence the lint.",
         ),
         _ if code.starts_with("api_") => (
             "The caller-facing surface is exposing a shape that hides the real domain or protocol meaning from readers.",
-            "Change the public boundary itself instead of only renaming the current item. The better fix is usually a clearer parent path, a re-export, or a stronger boundary type.",
+            "Change the caller-facing boundary itself instead of only renaming the current item. Prefer one canonical surface or stronger boundary type over aliases, wrappers, or duplicate paths that preserve the same shape.",
         ),
         _ => return None,
     };
@@ -405,7 +405,7 @@ fn append_direct_rewrite(address: &str, fix: Option<&DiagnosticFix>) -> String {
         return address.to_string();
     };
     format!(
-        "{address} For this site, the direct rewrite is `{}`.",
+        "{address} Once the owning surface is right, the site-level rewrite here is `{}`.",
         fix.replacement
     )
 }
@@ -699,6 +699,42 @@ mod tests {
         assert!(guidance.why.contains("can't interpret authoritatively"));
         assert!(guidance.address.contains("analysis boundary"));
         assert!(!guidance.address.contains("Change the public boundary"));
+        assert!(guidance.address.contains("Don't rewrite macros"));
+    }
+
+    #[test]
+    fn generic_guidance_for_parent_surface_warns_against_split_canonical_paths() {
+        let guidance =
+            diagnostic_guidance_for_code("namespace_parent_surface", None).expect("guidance");
+        assert!(guidance.address.contains("canonical caller-facing path"));
+        assert!(
+            guidance
+                .address
+                .contains("callers split across both surfaces")
+        );
+    }
+
+    #[test]
+    fn generic_guidance_for_redundant_leaf_context_warns_against_alias_and_token_chop() {
+        let guidance = diagnostic_guidance_for_code("internal_redundant_leaf_context", None)
+            .expect("guidance");
+        assert!(guidance.address.contains("local alias"));
+        assert!(guidance.address.contains("mechanically chopping tokens"));
+    }
+
+    #[test]
+    fn generic_guidance_for_semantic_string_scalar_warns_against_type_alias_string() {
+        let guidance =
+            diagnostic_guidance_for_code("api_semantic_string_scalar", None).expect("guidance");
+        assert!(guidance.address.contains("type ... = String"));
+    }
+
+    #[test]
+    fn generic_guidance_for_candidate_semantic_module_warns_against_shadow_surface() {
+        let guidance =
+            diagnostic_guidance_for_code("api_candidate_semantic_module", None).expect("guidance");
+        assert!(guidance.address.contains("design prompt"));
+        assert!(guidance.address.contains("shadow module"));
     }
 }
 
@@ -731,7 +767,7 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
     let (profile, summary) = match code {
         "namespace_flat_use" => (
             LintProfile::Core,
-            "Flattened imports hide useful namespace context for generic leaves.",
+            "Flattened imports hide useful namespace context for leaves that still need the parent path.",
         ),
         "namespace_flat_use_preserve_module" => (
             LintProfile::Core,
@@ -755,7 +791,7 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         ),
         "namespace_flat_type_alias" => (
             LintProfile::Core,
-            "A type alias hides useful namespace context for a generic aliased leaf.",
+            "A type alias hides useful namespace context for an aliased leaf that still needs the parent path.",
         ),
         "namespace_flat_type_alias_preserve_module" => (
             LintProfile::Core,

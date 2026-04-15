@@ -19,7 +19,7 @@ It centers namespace shape first, and nudges caller-facing boundaries when APIs 
 - Want the idea fast? Read [Why It Exists](#why-it-exists).
 - Want to try it? Jump to [Quick Usage](#quick-usage).
 - Want the authority boundary? Read [Observation Model](#observation-model).
-- Want to tune it for a real repo? Start with [Configuration](#configuration) and the profile guide.
+- Want to tune it for a real repo? Start with [Configuration](#configuration).
 - Want the full lint catalog? See [docs/lint-reference.md](docs/lint-reference.md).
 
 ## Why It Exists
@@ -121,9 +121,7 @@ When semantic-module family inference would depend on those constructs, `modum` 
 cargo install modum
 cargo modum check --root .
 cargo modum check --root . --mode warn
-cargo modum check --root . --profile core
 cargo modum --explain namespace_flat_use
-cargo modum check --root . --show advisory
 cargo modum check --root . --ignore api_candidate_semantic_module
 cargo modum check --root . --write-baseline .modum-baseline.json
 cargo modum check --root . --baseline .modum-baseline.json
@@ -156,9 +154,7 @@ Default mode is `deny`.
 
 Text output groups diagnostics into `Errors`, `Policy Diagnostics`, and `Advisory Diagnostics`.
 
-Use `--show policy` or `--show advisory` when you want to focus one side of the report without changing exit behavior. The exit code still reflects the full report.
-
-Use `--profile core`, `--profile surface`, or `--profile strict` to choose how opinionated the lint set should be. `strict` is the default.
+`modum` runs the full lint set by default. The main runtime opt-outs are `--ignore <code>`, a baseline, explicit scan scoping with `--include` or `--exclude`, and `--mode warn` when you want diagnostics without a failing exit code.
 
 Use `--ignore <code>` for one-off opt-outs in local runs, and `--write-baseline <path>` plus `--baseline <path>` when you want to ratchet down an existing repo without fixing every warning at once.
 
@@ -213,7 +209,6 @@ Configure the lints in any workspace with Cargo metadata:
 
 ```toml
 [workspace.metadata.modum]
-profile = "strict"
 include = ["src", "crates/*/src"]
 exclude = ["examples/high-coverage"]
 generic_nouns = ["Id", "Repository", "Service", "Error", "Command", "Request", "Response", "Outcome"]
@@ -241,18 +236,7 @@ Use `[package.metadata.modum]` inside a member crate to override workspace defau
 
 `baseline` is a repo-root-relative JSON file of existing coded diagnostics. Matching baseline entries are filtered out after normal analysis. A metadata baseline is optional until the file exists; an explicit CLI `--baseline <path>` requires the file to exist.
 
-Profile guide:
-
-- `core`: internal namespace readability, including private type naming, type-alias hygiene, internal module-boundary rules, and glob/prelude pressure when imports flatten preserved namespaces
-- `surface`: `core` plus caller-facing path shaping and typed boundary nudges for public and shared crate-visible surfaces, including semantic scalar boundaries and `anyhow` leakage
-- `strict`: `surface` plus the heavier advisory heuristics, including semantic-module family suggestions, raw string error surfaces, raw ids, raw key-value bags, bool clusters, manual flag sets, and API-shape taste rules
-
-Profile precedence:
-
-- CLI `--profile` overrides package and workspace metadata
-- `[package.metadata.modum] profile = "..."` overrides workspace metadata for that crate
-- `[workspace.metadata.modum] profile = "..."` sets the workspace default
-- if no profile is set anywhere, `strict` is used
+There is no profile selector anymore. `modum` runs the full lint set by default and expects opt-out tuning through ignored codes, token-family tuning, or a baseline.
 
 Tuning guide:
 
@@ -270,7 +254,7 @@ These tuning keys work on lowercase name tokens, not full paths.
 
 Adoption workflow:
 
-- start with `--profile core` or `--mode warn`
+- start with `--mode warn`
 - use `ignored_diagnostic_codes` for durable repo-specific exceptions
 - use `ignored_namespace_preserving_modules = ["components", "page", "partials"]` when a UI aggregator repo intentionally flattens those modules and you don't want to replace the full preserve-module default set
 - generate a baseline with `modum check --write-baseline .modum-baseline.json`

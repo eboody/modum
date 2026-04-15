@@ -2,7 +2,7 @@ use std::{
     env,
     fmt::Write as _,
     fs::OpenOptions,
-    io::Write as _,
+    io::{IsTerminal as _, Write as _},
     path::{Path, PathBuf},
     process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
@@ -100,18 +100,16 @@ fn run_check_command(
     let mut root = run_dir.clone();
     let mut scan_settings = ScanSettings::default();
     let mut explain_code = None;
-    let mut profile = None;
     let mut ignored_diagnostic_codes = Vec::new();
     let mut mode = env::var("MODUM")
         .ok()
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(CheckMode::Deny);
     let mut format = OutputFormat::Text;
-    let mut selection = DiagnosticSelection::All;
     let mut baseline = None;
     let mut write_baseline = None;
     let mut should_write_markdown_report = false;
-    let mut pretty_text = false;
+    let mut force_pretty_text = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -132,16 +130,6 @@ fn run_check_command(
                     .next()
                     .ok_or_else(|| "--exclude requires a path or glob value".to_string())?;
                 scan_settings.exclude.push(value);
-            }
-            "--profile" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--profile requires one of: core|surface|strict".to_string())?;
-                profile = Some(
-                    value
-                        .parse()
-                        .map_err(|err: String| format!("--profile {err}"))?,
-                );
             }
             "--ignore" => {
                 let value = args
@@ -165,16 +153,28 @@ fn run_check_command(
                 mode = value.parse()?;
             }
             "--show" => {
-                let value = args
+                let _value = args
                     .next()
                     .ok_or_else(|| "--show requires one of: all|policy|advisory".to_string())?;
-                selection = value.parse()?;
+                return Err(
+                    "--show was removed; modum now prints the full report by default. Use `--format json` and your own filtering if you want a narrower view."
+                        .to_string(),
+                );
             }
             "--format" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--format requires one of: text|json".to_string())?;
                 format = value.parse()?;
+            }
+            "--profile" => {
+                let _value = args
+                    .next()
+                    .ok_or_else(|| "--profile requires one of: core|surface|strict".to_string())?;
+                return Err(
+                    "--profile was removed; modum now runs the full lint set by default. Use `--ignore` or a baseline to opt out."
+                        .to_string(),
+                );
             }
             "--baseline" => {
                 let value = args
@@ -192,7 +192,7 @@ fn run_check_command(
                 should_write_markdown_report = true;
             }
             "--pretty" | "-p" => {
-                pretty_text = true;
+                force_pretty_text = true;
             }
             "--help" | "-h" => {
                 println!("{}", check_usage(command_prefix));
@@ -224,14 +224,7 @@ fn run_check_command(
         );
     }
 
-    if format == OutputFormat::Json && selection != DiagnosticSelection::All {
-        return Err(
-            "--show is only available with text output; json already includes `policy` and `fix` metadata"
-                .to_string(),
-        );
-    }
-
-    if format == OutputFormat::Json && pretty_text {
+    if format == OutputFormat::Json && force_pretty_text {
         return Err("--pretty is only available with text output".to_string());
     }
 
@@ -239,7 +232,6 @@ fn run_check_command(
         &root,
         &AnalysisSettings {
             scan: scan_settings,
-            profile,
             ignored_diagnostic_codes,
             baseline,
         },
@@ -253,15 +245,16 @@ fn run_check_command(
             path.display()
         );
     }
-    let plain_text_report = render_pretty_report_with_selection(&outcome.report, selection);
+    let plain_text_report =
+        render_pretty_report_with_selection(&outcome.report, DiagnosticSelection::All);
     if should_write_markdown_report {
         let report_path = write_markdown_report(&run_dir, &plain_text_report)?;
         eprintln!("wrote markdown report {}", report_path.display());
     }
     match format {
         OutputFormat::Text => {
-            let text_report = if pretty_text {
-                render_pretty_cli_report(&outcome.report, selection)
+            let text_report = if force_pretty_text || std::io::stdout().is_terminal() {
+                render_pretty_cli_report(&outcome.report, DiagnosticSelection::All)
             } else {
                 plain_text_report
             };
@@ -823,22 +816,19 @@ fn check_usage(command_prefix: &'static str) -> String {
     [
         "Usage:",
         &format!(
-            "  {} check [--root <path>] [--include <path-or-glob>]... [--exclude <path-or-glob>]... [--profile core|surface|strict] [--ignore <code>]... [--baseline <path>] [--write-baseline <path>] [--write-markdown-report|-w] [--pretty|-p] [--show all|policy|advisory] [--mode off|warn|deny] [--format text|json] [--explain <code>]",
+            "  {} check [--root <path>] [--include <path-or-glob>]... [--exclude <path-or-glob>]... [--ignore <code>]... [--baseline <path>] [--write-baseline <path>] [--write-markdown-report|-w] [--mode off|warn|deny] [--format text|json] [--explain <code>]",
             command_prefix
         ),
         "",
         "Examples:",
         &format!("  {command_prefix} check"),
         &format!("  {command_prefix} check --mode warn"),
-        &format!("  {command_prefix} check --profile core"),
         &format!("  {command_prefix} check -w"),
-        &format!("  {command_prefix} check -p"),
         &format!("  {command_prefix} check --ignore api_candidate_semantic_module"),
         &format!("  {command_prefix} check --write-baseline .modum-baseline.json"),
         &format!("  {command_prefix} check --baseline .modum-baseline.json"),
         &format!("  {command_prefix} --explain namespace_flat_use"),
         &format!("  {command_prefix} check --exclude examples/high-coverage/**"),
-        &format!("  {command_prefix} check --show advisory"),
         &format!("  {command_prefix} check --format json"),
         "",
         "Environment:",

@@ -1,7 +1,7 @@
 use std::fs;
 
 use modum::{
-    AnalysisSettings, DiagnosticLevel, LintProfile, ScanSettings, analyze_workspace,
+    AnalysisSettings, DiagnosticLevel, ScanSettings, analyze_workspace,
     analyze_workspace_with_settings,
 };
 use tempfile::tempdir;
@@ -56,7 +56,7 @@ mod app {
 }
 
 #[test]
-fn analyze_workspace_uses_workspace_profile_defaults() {
+fn analyze_workspace_ignores_workspace_profile_and_runs_full_lint_set() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
     fs::create_dir_all(root.join("member/src/components")).expect("create src");
@@ -107,15 +107,21 @@ pub mod components;
             .any(|diag| diag.code() == Some("api_missing_parent_surface_export"))
     );
     assert!(
-        !report
+        report
             .diagnostics
             .iter()
             .any(|diag| diag.code() == Some("api_candidate_semantic_module"))
     );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.message.contains("`metadata.modum.profile` is ignored") })
+    );
 }
 
 #[test]
-fn analyze_workspace_package_profile_overrides_workspace_profile() {
+fn analyze_workspace_ignores_package_and_workspace_profiles_and_warns_for_both() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
     fs::create_dir_all(root.join("member/src/components")).expect("create src");
@@ -169,10 +175,18 @@ pub mod components;
             .any(|diag| diag.code() == Some("api_missing_parent_surface_export"))
     );
     assert!(
-        !report
+        report
             .diagnostics
             .iter()
             .any(|diag| diag.code() == Some("api_candidate_semantic_module"))
+    );
+    assert_eq!(
+        report
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.message.contains("`metadata.modum.profile` is ignored"))
+            .count(),
+        2
     );
 }
 
@@ -222,7 +236,7 @@ pub fn connect(mime: String, url: String) {}
 }
 
 #[test]
-fn analyze_workspace_cli_profile_overrides_metadata_profile() {
+fn analyze_workspace_analysis_settings_no_longer_filter_lints() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
     fs::create_dir_all(root.join("src/components")).expect("create src");
@@ -254,12 +268,22 @@ pub mod components;
         root,
         &AnalysisSettings {
             scan: ScanSettings::default(),
-            profile: Some(LintProfile::Core),
             ignored_diagnostic_codes: Vec::new(),
             baseline: None,
         },
     );
-    assert!(report.diagnostics.is_empty());
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diag| { diag.message.contains("`metadata.modum.profile` is ignored") })
+    );
 }
 
 #[test]
@@ -2644,6 +2668,161 @@ struct Demo(AuthStrategy, NoAuth);
 }
 
 #[test]
+fn analyze_workspace_flags_flattened_imports_for_compound_family_leaves() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod viewer {
+    pub struct ResolutionFlow;
+    pub enum ResolutionState {
+        Ready,
+    }
+    pub enum ResolutionOutcome {
+        Settled,
+    }
+}
+
+use viewer::ResolutionFlow;
+
+struct Demo(ResolutionFlow);
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use")
+            && diag.message.contains("ResolutionFlow")
+            && diag.message.contains("viewer::ResolutionFlow")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_flag_flattened_imports_for_single_compound_leaves() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod viewer {
+    pub struct ResolutionFlow;
+}
+
+use viewer::ResolutionFlow;
+
+struct Demo(ResolutionFlow);
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(!report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use") && diag.message.contains("viewer::ResolutionFlow")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_type_aliases_for_compound_family_leaves() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod viewer {
+    pub struct ResolutionFlow;
+    pub enum ResolutionState {
+        Ready,
+    }
+}
+
+type Flow = viewer::ResolutionFlow;
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_type_alias")
+            && diag.message.contains("viewer::ResolutionFlow")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_renamed_imports_for_compound_family_leaves() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod viewer {
+    pub struct ResolutionFlow;
+    pub enum ResolutionState {
+        Ready,
+    }
+}
+
+use viewer::ResolutionFlow as Flow;
+
+struct Demo(Flow);
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use")
+            && diag.message.contains("ResolutionFlow")
+            && diag.message.contains("viewer::ResolutionFlow")
+    }));
+}
+
+#[test]
+fn analyze_workspace_flags_flattened_imports_for_compound_family_leaves_in_nested_inline_modules() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod outer {
+    mod viewer {
+        pub struct ResolutionFlow;
+        pub enum ResolutionState {
+            Ready,
+        }
+        pub enum ResolutionOutcome {
+            Settled,
+        }
+    }
+
+    use self::viewer::ResolutionFlow;
+
+    struct Demo(ResolutionFlow);
+}
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_flat_use")
+            && diag.message.contains("ResolutionFlow")
+            && diag.message.contains("viewer::ResolutionFlow")
+    }));
+}
+
+#[test]
 fn analyze_workspace_flags_relative_imports_with_real_parent_modules() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -4488,7 +4667,7 @@ pub fn connect(url: String, email: String) {}
 }
 
 #[test]
-fn analyze_workspace_surface_profile_keeps_surface_scalar_lints_and_hides_strict_id_lints() {
+fn analyze_workspace_reports_surface_and_strict_boundary_lints_by_default() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
     fs::create_dir_all(root.join("src")).expect("create src");
@@ -4507,7 +4686,6 @@ pub fn connect(email: String) {}
         root,
         &AnalysisSettings {
             scan: ScanSettings::default(),
-            profile: Some(LintProfile::Surface),
             ignored_diagnostic_codes: Vec::new(),
             baseline: None,
         },
@@ -4519,7 +4697,7 @@ pub fn connect(email: String) {}
             .any(|diag| diag.code() == Some("api_semantic_string_scalar"))
     );
     assert!(
-        !report
+        report
             .diagnostics
             .iter()
             .any(|diag| diag.code() == Some("api_raw_id_surface"))

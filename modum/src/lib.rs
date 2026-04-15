@@ -246,7 +246,6 @@ pub struct ScanSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AnalysisSettings {
     pub scan: ScanSettings,
-    pub profile: Option<LintProfile>,
     pub ignored_diagnostic_codes: Vec<String>,
     pub baseline: Option<PathBuf>,
 }
@@ -267,14 +266,12 @@ struct NamespaceSettings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PackageSettings {
     namespace: NamespaceSettings,
-    profile: Option<LintProfile>,
     ignored_diagnostic_codes: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileSettings {
     namespace: NamespaceSettings,
-    profile: LintProfile,
     ignored_diagnostic_codes: BTreeSet<String>,
 }
 
@@ -282,8 +279,6 @@ struct FileSettings {
 struct FileResolutionContext<'a> {
     workspace_defaults: &'a NamespaceSettings,
     workspace_ignored_diagnostic_codes: &'a BTreeSet<String>,
-    repo_profile: Option<LintProfile>,
-    cli_profile: Option<LintProfile>,
     cli_ignored_diagnostic_codes: &'a BTreeSet<String>,
 }
 
@@ -352,7 +347,7 @@ pub fn parse_lint_profile(raw: &str) -> Result<LintProfile, String> {
 pub fn render_diagnostic_explanation(code: &str) -> Option<String> {
     let info = diagnostic_code_info(code)?;
     let mut rendered = format!(
-        "{code}\nprofile: {}\nsummary: {}",
+        "{code}\ntier: {}\nsummary: {}",
         info.profile.as_str(),
         info.summary,
     );
@@ -429,7 +424,6 @@ pub fn run_check_with_scan_settings(
         root,
         &AnalysisSettings {
             scan: scan_settings.clone(),
-            profile: None,
             ignored_diagnostic_codes: Vec::new(),
             baseline: None,
         },
@@ -521,7 +515,6 @@ pub fn analyze_workspace_with_scan_settings(
         root,
         &AnalysisSettings {
             scan: cli_scan_settings.clone(),
-            profile: None,
             ignored_diagnostic_codes: Vec::new(),
             baseline: None,
         },
@@ -535,7 +528,6 @@ pub fn analyze_workspace_with_settings(
     let mut diagnostics = Vec::new();
     let mut workspace_defaults = load_workspace_settings(root, &mut diagnostics);
     workspace_defaults.owned_crate_names = workspace_owned_library_crate_names(root);
-    let repo_profile = load_repo_profile(root, &mut diagnostics);
     let workspace_ignored_diagnostic_codes =
         load_repo_ignored_diagnostic_codes(root, &mut diagnostics);
     let repo_baseline = load_repo_baseline_path(root, &mut diagnostics);
@@ -592,8 +584,6 @@ pub fn analyze_workspace_with_settings(
             FileResolutionContext {
                 workspace_defaults: &workspace_defaults,
                 workspace_ignored_diagnostic_codes: &workspace_ignored_diagnostic_codes,
-                repo_profile,
-                cli_profile: cli_settings.profile,
                 cli_ignored_diagnostic_codes: &cli_ignored_diagnostic_codes,
             },
             &mut package_cache,
@@ -601,10 +591,9 @@ pub fn analyze_workspace_with_settings(
         );
         let mut analysis = analyze_file_with_settings(file, &src, &settings.namespace);
         analysis.diagnostics.retain(|diag| {
-            diag.included_in_profile(settings.profile)
-                && !diag
-                    .code()
-                    .is_some_and(|code| settings.ignored_diagnostic_codes.contains(code))
+            !diag
+                .code()
+                .is_some_and(|code| settings.ignored_diagnostic_codes.contains(code))
         });
         if !analysis.diagnostics.is_empty() {
             files_with_violations.insert(file.clone());
@@ -674,13 +663,17 @@ fn load_workspace_settings(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Na
         }
     };
 
+    let metadata = manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("metadata"))
+        .and_then(toml::Value::as_table)
+        .and_then(|metadata| metadata.get("modum"));
+
+    warn_ignored_profile_from_manifest(metadata, &manifest_path, diagnostics);
+
     parse_settings_from_manifest(
-        manifest
-            .get("workspace")
-            .and_then(toml::Value::as_table)
-            .and_then(|workspace| workspace.get("metadata"))
-            .and_then(toml::Value::as_table)
-            .and_then(|metadata| metadata.get("modum")),
+        metadata,
         &NamespaceSettings::default(),
         &manifest_path,
         diagnostics,
@@ -725,44 +718,6 @@ fn load_repo_scan_settings(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Sc
         diagnostics,
     )
     .unwrap_or_default()
-}
-
-fn load_repo_profile(root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Option<LintProfile> {
-    let manifest_path = root.join("Cargo.toml");
-    let Ok(manifest_src) = fs::read_to_string(&manifest_path) else {
-        return None;
-    };
-
-    let manifest: toml::Value = match toml::from_str(&manifest_src) {
-        Ok(manifest) => manifest,
-        Err(err) => {
-            diagnostics.push(Diagnostic::error(
-                Some(manifest_path),
-                None,
-                format!("failed to parse Cargo.toml for modum settings: {err}"),
-            ));
-            return None;
-        }
-    };
-
-    parse_profile_from_manifest(
-        manifest
-            .get("workspace")
-            .and_then(toml::Value::as_table)
-            .and_then(|workspace| workspace.get("metadata"))
-            .and_then(toml::Value::as_table)
-            .and_then(|metadata| metadata.get("modum"))
-            .or_else(|| {
-                manifest
-                    .get("package")
-                    .and_then(toml::Value::as_table)
-                    .and_then(|package| package.get("metadata"))
-                    .and_then(toml::Value::as_table)
-                    .and_then(|metadata| metadata.get("modum"))
-            }),
-        &manifest_path,
-        diagnostics,
-    )
 }
 
 fn load_repo_ignored_diagnostic_codes(
@@ -857,7 +812,6 @@ fn settings_for_file(
         ignored_diagnostic_codes.extend(context.cli_ignored_diagnostic_codes.iter().cloned());
         return FileSettings {
             namespace: context.workspace_defaults.clone(),
-            profile: resolve_profile(context.cli_profile, None, context.repo_profile),
             ignored_diagnostic_codes,
         };
     };
@@ -867,7 +821,6 @@ fn settings_for_file(
         ignored_diagnostic_codes.extend(context.cli_ignored_diagnostic_codes.iter().cloned());
         return FileSettings {
             namespace: settings.namespace.clone(),
-            profile: resolve_profile(context.cli_profile, settings.profile, context.repo_profile),
             ignored_diagnostic_codes,
         };
     }
@@ -883,7 +836,6 @@ fn settings_for_file(
     ignored_diagnostic_codes.extend(context.cli_ignored_diagnostic_codes.iter().cloned());
     FileSettings {
         namespace: settings.namespace,
-        profile: resolve_profile(context.cli_profile, settings.profile, context.repo_profile),
         ignored_diagnostic_codes,
     }
 }
@@ -898,7 +850,6 @@ fn load_package_settings(
     let Ok(manifest_src) = fs::read_to_string(&manifest_path) else {
         return PackageSettings {
             namespace: workspace_defaults.clone(),
-            profile: None,
             ignored_diagnostic_codes: workspace_ignored_diagnostic_codes.clone(),
         };
     };
@@ -913,7 +864,6 @@ fn load_package_settings(
             ));
             return PackageSettings {
                 namespace: workspace_defaults.clone(),
-                profile: None,
                 ignored_diagnostic_codes: workspace_ignored_diagnostic_codes.clone(),
             };
         }
@@ -929,7 +879,7 @@ fn load_package_settings(
     let namespace =
         parse_settings_from_manifest(metadata, workspace_defaults, &manifest_path, diagnostics)
             .unwrap_or_else(|| workspace_defaults.clone());
-    let profile = parse_profile_from_manifest(metadata, &manifest_path, diagnostics);
+    warn_ignored_profile_from_manifest(metadata, &manifest_path, diagnostics);
     let mut ignored_diagnostic_codes = workspace_ignored_diagnostic_codes.clone();
     if let Some(local_codes) =
         parse_ignored_diagnostic_codes_from_manifest(metadata, &manifest_path, diagnostics)
@@ -939,20 +889,8 @@ fn load_package_settings(
 
     PackageSettings {
         namespace,
-        profile,
         ignored_diagnostic_codes,
     }
-}
-
-fn resolve_profile(
-    cli_profile: Option<LintProfile>,
-    package_profile: Option<LintProfile>,
-    repo_profile: Option<LintProfile>,
-) -> LintProfile {
-    cli_profile
-        .or(package_profile)
-        .or(repo_profile)
-        .unwrap_or_default()
 }
 
 fn parse_settings_from_manifest(
@@ -1044,23 +982,20 @@ fn parse_scan_settings_from_manifest(
     Some(settings)
 }
 
-fn parse_profile_from_manifest(
+fn warn_ignored_profile_from_manifest(
     value: Option<&toml::Value>,
     manifest_path: &Path,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Option<LintProfile> {
-    let table = value?.as_table()?;
-    let raw = parse_string_field(table, "profile", manifest_path, diagnostics)?;
-    match raw.parse() {
-        Ok(profile) => Some(profile),
-        Err(err) => {
-            diagnostics.push(Diagnostic::error(
-                Some(manifest_path.to_path_buf()),
-                None,
-                format!("`metadata.modum.profile` {err}"),
-            ));
-            None
-        }
+) {
+    let Some(table) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+    if table.contains_key("profile") {
+        diagnostics.push(Diagnostic::warning(
+            Some(manifest_path.to_path_buf()),
+            None,
+            "`metadata.modum.profile` is ignored; modum now runs the full lint set by default. Use `ignored_diagnostic_codes` or a baseline to opt out.",
+        ));
     }
 }
 
