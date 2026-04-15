@@ -261,6 +261,7 @@ struct NamespaceSettings {
     semantic_numeric_scalars: BTreeSet<String>,
     key_value_bag_names: BTreeSet<String>,
     owned_crate_names: BTreeSet<String>,
+    owned_crate_source_roots: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +333,7 @@ impl Default for NamespaceSettings {
                 .map(|name| (*name).to_string())
                 .collect(),
             owned_crate_names: BTreeSet::new(),
+            owned_crate_source_roots: BTreeMap::new(),
         }
     }
 }
@@ -528,6 +530,7 @@ pub fn analyze_workspace_with_settings(
     let mut diagnostics = Vec::new();
     let mut workspace_defaults = load_workspace_settings(root, &mut diagnostics);
     workspace_defaults.owned_crate_names = workspace_owned_library_crate_names(root);
+    workspace_defaults.owned_crate_source_roots = workspace_owned_library_crate_source_roots(root);
     let workspace_ignored_diagnostic_codes =
         load_repo_ignored_diagnostic_codes(root, &mut diagnostics);
     let repo_baseline = load_repo_baseline_path(root, &mut diagnostics);
@@ -1581,6 +1584,21 @@ fn workspace_owned_library_crate_names(root: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+fn workspace_owned_library_crate_source_roots(root: &Path) -> BTreeMap<String, PathBuf> {
+    let Ok(package_roots) = collect_workspace_package_roots(root) else {
+        return BTreeMap::new();
+    };
+
+    package_roots
+        .into_iter()
+        .filter_map(|package_root| {
+            let crate_name = package_library_crate_name(&package_root)?;
+            let src_root = package_library_source_root(&package_root)?;
+            Some((crate_name, src_root))
+        })
+        .collect()
+}
+
 fn collect_workspace_package_roots(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
     let mut package_roots = BTreeSet::new();
     let manifest_path = root.join("Cargo.toml");
@@ -1645,6 +1663,25 @@ fn package_library_crate_name(package_root: &Path) -> Option<String> {
                 .and_then(toml::Value::as_str)
                 .map(|name| name.replace('-', "_"))
         })
+}
+
+fn package_library_source_root(package_root: &Path) -> Option<PathBuf> {
+    let manifest_path = package_root.join("Cargo.toml");
+    let manifest_src = fs::read_to_string(&manifest_path).ok()?;
+    let manifest = toml::from_str::<toml::Value>(&manifest_src).ok()?;
+    let lib = manifest.get("lib").and_then(toml::Value::as_table);
+
+    if let Some(path) = lib
+        .and_then(|lib| lib.get("path"))
+        .and_then(toml::Value::as_str)
+        .map(|path| package_root.join(path))
+        && path.is_file()
+    {
+        return path.parent().map(Path::to_path_buf);
+    }
+
+    let default = package_root.join("src/lib.rs");
+    default.is_file().then(|| package_root.join("src"))
 }
 
 fn parse_workspace_patterns(value: Option<&toml::Value>) -> Vec<String> {

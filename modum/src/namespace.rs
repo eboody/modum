@@ -9,8 +9,9 @@ use syn::{
 };
 
 use super::{
-    Diagnostic, NamespaceSettings, detect_name_style, inferred_file_module_path,
-    parent_module_files, render_segments, replace_path_fix, source_root, split_segments,
+    Diagnostic, NamespaceSettings, detect_name_style, inferred_file_module_path, is_public,
+    normalize_segment, parent_module_files, render_segments, replace_path_fix, source_root,
+    split_segments,
 };
 
 pub(super) struct Analysis {
@@ -71,6 +72,12 @@ enum OverqualifiedCallsiteAction {
 struct NamespaceFamilyBindingInfo {
     bindings: BTreeSet<String>,
     unsupported_constructs: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct ErrorSurfaceFollowThroughCandidate {
+    preferred_path: String,
+    target_exists: bool,
 }
 
 enum NamespaceVisibilityDependency {
@@ -304,9 +311,23 @@ fn analyze_use_item(
         );
         let binding_used_as_namespace =
             binding_is_used_as_namespace_in_scope(scope_items, &binding.binding_name);
+        let error_surface_follow_through = error_surface_follow_through_candidate(
+            path,
+            current_module_path,
+            &binding.full_path,
+            settings,
+            &[],
+        );
 
         let (code, message) =
-            if let Some(canonical_parent_surface) = canonical_parent_surface.as_deref() {
+            if let Some(error_surface_follow_through) = error_surface_follow_through.as_ref() {
+                error_surface_follow_through_use_message(
+                    is_reexport,
+                    &binding.full_path.join("::"),
+                    &error_surface_follow_through.preferred_path,
+                    error_surface_follow_through.target_exists,
+                )
+            } else if let Some(canonical_parent_surface) = canonical_parent_surface.as_deref() {
                 canonical_parent_surface_message(
                     &binding.binding_name,
                     &binding.source_name,
@@ -353,7 +374,13 @@ fn analyze_use_item(
                 continue;
             };
 
-        let diagnostic = if code == "namespace_family_unsupported_construct" {
+        let diagnostic = if code == "namespace_family_unsupported_construct"
+            || (code.starts_with("namespace_")
+                && code.contains("error_surface_follow_through")
+                && error_surface_follow_through
+                    .as_ref()
+                    .is_some_and(|candidate| !candidate.target_exists))
+        {
             Diagnostic::advisory(Some(path.to_path_buf()), Some(line), code, message)
         } else {
             Diagnostic::policy(Some(path.to_path_buf()), Some(line), code, message)
@@ -421,6 +448,13 @@ fn analyze_type_alias_item(
         redundant_leaf_context_candidate(analysis_path, &binding_name, true, false, settings);
     let visible_callsite_surface =
         visible_callsite_surface_candidate(analysis_path, aliased_leaf_name, settings);
+    let error_surface_follow_through = error_surface_follow_through_candidate(
+        path,
+        current_module_path,
+        &full_path,
+        settings,
+        &[],
+    );
     let namespace_visibility_dependency = namespace_visibility_dependency(
         path,
         current_module_path,
@@ -429,7 +463,16 @@ fn analyze_type_alias_item(
         settings,
     );
 
-    let Some((code, message)) = (if let Some(shorter_leaf) = redundant_leaf {
+    let Some((code, message)) = (if let Some(error_surface_follow_through) =
+        error_surface_follow_through.as_ref()
+    {
+        Some(error_surface_follow_through_alias_message(
+            &binding_name,
+            &full_path.join("::"),
+            &error_surface_follow_through.preferred_path,
+            error_surface_follow_through.target_exists,
+        ))
+    } else if let Some(shorter_leaf) = redundant_leaf {
         Some((
             "namespace_flat_type_alias_redundant_leaf_context",
             format!(
@@ -478,7 +521,12 @@ fn analyze_type_alias_item(
         return;
     };
 
-    let diagnostic = if code == "namespace_family_unsupported_construct" {
+    let diagnostic = if code == "namespace_family_unsupported_construct"
+        || (code == "namespace_flat_type_alias_error_surface_follow_through"
+            && error_surface_follow_through
+                .as_ref()
+                .is_some_and(|candidate| !candidate.target_exists))
+    {
         Diagnostic::advisory(
             Some(path.to_path_buf()),
             Some(item_type.span().start().line),
@@ -595,6 +643,39 @@ fn analyze_qualified_generic_path(
         .as_ref()
         .map(|binding| render_resolved_namespace_binding_path(&full_path, binding))
         .unwrap_or_else(|| full_path.clone());
+    if let Some(error_surface_follow_through) = error_surface_follow_through_candidate(
+        file,
+        current_module_path,
+        &analysis_path,
+        settings,
+        scope_use_bindings,
+    ) {
+        let diagnostic = if error_surface_follow_through.target_exists {
+            Diagnostic::policy(
+                Some(file.to_path_buf()),
+                Some(path.span().start().line),
+                "namespace_qualified_error_surface_follow_through",
+                format!(
+                    "`{rendered_path}` keeps a flatter error surface than the owning path; prefer `{}`",
+                    error_surface_follow_through.preferred_path
+                ),
+            )
+        } else {
+            Diagnostic::advisory(
+                Some(file.to_path_buf()),
+                Some(path.span().start().line),
+                "namespace_qualified_error_surface_follow_through",
+                format!(
+                    "`{rendered_path}` keeps a flat leaf error surface; prefer `{}` once that facet exists",
+                    error_surface_follow_through.preferred_path
+                ),
+            )
+        };
+        if !namespace_diagnostic_already_emitted(diagnostics, &diagnostic) {
+            diagnostics.push(diagnostic);
+        }
+        return;
+    }
     let Some(preferred_path) =
         preferred_qualified_path_surface(file, current_module_path, &analysis_path, settings)
     else {
@@ -657,6 +738,54 @@ fn analyze_qualified_generic_path(
     if !namespace_diagnostic_already_emitted(diagnostics, &diagnostic) {
         diagnostics.push(diagnostic);
     }
+}
+
+fn error_surface_follow_through_use_message(
+    is_reexport: bool,
+    source_path: &str,
+    preferred_path: &str,
+    target_exists: bool,
+) -> (&'static str, String) {
+    let code = if is_reexport {
+        "namespace_flat_pub_use_error_surface_follow_through"
+    } else {
+        "namespace_flat_use_error_surface_follow_through"
+    };
+    let subject = if is_reexport {
+        "flattened re-export"
+    } else {
+        "flattened import"
+    };
+    let timing = if target_exists {
+        String::new()
+    } else {
+        " once that facet exists".to_string()
+    };
+    (
+        code,
+        format!(
+            "{subject} keeps flat error surface `{source_path}`; prefer `{preferred_path}`{timing}"
+        ),
+    )
+}
+
+fn error_surface_follow_through_alias_message(
+    binding_name: &str,
+    source_path: &str,
+    preferred_path: &str,
+    target_exists: bool,
+) -> (&'static str, String) {
+    let timing = if target_exists {
+        String::new()
+    } else {
+        " once that facet exists".to_string()
+    };
+    (
+        "namespace_flat_type_alias_error_surface_follow_through",
+        format!(
+            "type alias `{binding_name}` keeps flat error surface `{source_path}`; prefer `{preferred_path}`{timing}"
+        ),
+    )
 }
 
 fn preferred_overqualified_callsite_candidate(
@@ -1477,6 +1606,622 @@ fn namespace_visibility_dependency(
     (!binding_info.unsupported_constructs.is_empty()).then_some(
         NamespaceVisibilityDependency::Unsupported(binding_info.unsupported_constructs),
     )
+}
+
+fn error_surface_follow_through_candidate(
+    path: &Path,
+    current_module_path: &[String],
+    full_path: &[String],
+    settings: &NamespaceSettings,
+    scope_use_bindings: &[ScopeUseBinding],
+) -> Option<ErrorSurfaceFollowThroughCandidate> {
+    let analysis_path = trim_relative_prefix(full_path);
+    if analysis_path.len() < 2 {
+        return None;
+    }
+
+    let leaf_name = analysis_path.last()?;
+    let import_prefix = full_path.get(..full_path.len().saturating_sub(1))?;
+    let module_path = resolve_qualified_parent_surface_path(current_module_path, import_prefix)?;
+    if module_path.is_empty() {
+        return None;
+    }
+
+    let (preferred_absolute_path, target_exists) =
+        error_surface_follow_through_target(path, &module_path, leaf_name, settings)?;
+    let preferred_path = preferred_error_surface_visible_path(
+        path,
+        current_module_path,
+        &preferred_absolute_path,
+        settings,
+        scope_use_bindings,
+    );
+
+    Some(ErrorSurfaceFollowThroughCandidate {
+        preferred_path,
+        target_exists,
+    })
+}
+
+fn preferred_error_surface_visible_path(
+    file: &Path,
+    current_module_path: &[String],
+    absolute_target_path: &[String],
+    settings: &NamespaceSettings,
+    scope_use_bindings: &[ScopeUseBinding],
+) -> String {
+    preferred_overqualified_callsite_candidate(
+        existing_namespace_callsite_candidate(absolute_target_path, settings, scope_use_bindings),
+        overqualified_callsite_candidate(file, current_module_path, absolute_target_path, settings),
+    )
+    .map(|candidate| candidate.rendered_path)
+    .unwrap_or_else(|| absolute_target_path.join("::"))
+}
+
+fn error_surface_follow_through_target(
+    path: &Path,
+    module_path: &[String],
+    flat_error_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<(Vec<String>, bool)> {
+    if flat_error_name == "Error" || !flat_error_name.ends_with("Error") {
+        return None;
+    }
+
+    let items = module_items_for_module(path, module_path, settings)?;
+    if let Some(target_path) =
+        owned_facet_error_surface_target(&items, module_path, flat_error_name)
+    {
+        return Some((target_path, true));
+    }
+
+    if let Some((child_module_name, leaf_name)) =
+        candidate_child_facet_module_target(&items, module_path, settings)
+        && flat_error_name
+            .strip_suffix("Error")
+            .is_some_and(|companion_leaf| companion_leaf == leaf_name)
+    {
+        let mut child_module_path = module_path.to_vec();
+        child_module_path.push(child_module_name);
+        let mut preferred_path = child_module_path.clone();
+        preferred_path.push("Error".to_string());
+        let target_exists =
+            public_bindings_for_owned_module(path, &child_module_path, settings).contains("Error");
+        return Some((preferred_path, target_exists));
+    }
+
+    let root_module_path = boundary_owner_module_path(module_path);
+    if root_module_path != module_path {
+        return None;
+    }
+
+    let facet_module_name =
+        candidate_root_facet_module_target(path, &items, module_path, flat_error_name, settings)?;
+    let mut facet_module_path = module_path.to_vec();
+    facet_module_path.push(facet_module_name);
+    let mut preferred_path = facet_module_path.clone();
+    preferred_path.push("Error".to_string());
+    let target_exists =
+        public_bindings_for_owned_module(path, &facet_module_path, settings).contains("Error");
+    Some((preferred_path, target_exists))
+}
+
+fn module_items_for_module(
+    path: &Path,
+    module_path: &[String],
+    settings: &NamespaceSettings,
+) -> Option<Vec<Item>> {
+    if !module_path_starts_with_owned_crate(module_path, settings)
+        && let Some(items) = inline_module_items_for_module(path, module_path)
+    {
+        return Some(items);
+    }
+
+    let (src_root, relative_module_path) =
+        source_root_and_relative_module_path(path, module_path, settings)?;
+
+    for candidate in parent_module_files(&src_root, &relative_module_path) {
+        let Ok(src) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = syn::parse_file(&src) else {
+            continue;
+        };
+        return Some(parsed.items);
+    }
+
+    None
+}
+
+fn public_bindings_for_owned_module(
+    path: &Path,
+    module_path: &[String],
+    settings: &NamespaceSettings,
+) -> BTreeSet<String> {
+    if !module_path_starts_with_owned_crate(module_path, settings) {
+        return public_bindings_for_module(path, module_path);
+    }
+
+    let Some((src_root, relative_module_path)) =
+        source_root_and_relative_module_path(path, module_path, settings)
+    else {
+        return BTreeSet::new();
+    };
+
+    for candidate in parent_module_files(&src_root, &relative_module_path) {
+        let Ok(src) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = syn::parse_file(&src) else {
+            continue;
+        };
+        return collect_bindings(&parsed.items, true);
+    }
+
+    BTreeSet::new()
+}
+
+fn module_path_starts_with_owned_crate(
+    module_path: &[String],
+    settings: &NamespaceSettings,
+) -> bool {
+    module_path
+        .first()
+        .is_some_and(|segment| settings.owned_crate_source_roots.contains_key(segment))
+}
+
+fn source_root_and_relative_module_path(
+    path: &Path,
+    module_path: &[String],
+    settings: &NamespaceSettings,
+) -> Option<(std::path::PathBuf, Vec<String>)> {
+    if let Some(crate_name) = module_path.first()
+        && let Some(src_root) = settings.owned_crate_source_roots.get(crate_name)
+    {
+        return Some((src_root.clone(), module_path[1..].to_vec()));
+    }
+
+    Some((source_root(path)?, module_path.to_vec()))
+}
+
+fn owned_facet_error_surface_target(
+    items: &[Item],
+    module_path: &[String],
+    flat_error_name: &str,
+) -> Option<Vec<String>> {
+    if module_path.len() <= 1 {
+        return None;
+    }
+
+    let companion_leaf = flat_error_name.strip_suffix("Error")?;
+    if companion_leaf.is_empty()
+        || namespace_scope_imports_binding_name(items, flat_error_name)
+        || !namespace_scope_has_public_error_enum(items)
+    {
+        return None;
+    }
+
+    let local_leaf_candidates = namespace_local_public_companion_leaf_candidates(items);
+    if !local_leaf_candidates.contains(companion_leaf) {
+        return None;
+    }
+    if !namespace_public_error_variants_reference_flat_error(items, flat_error_name) {
+        return None;
+    }
+
+    let mut preferred_path = module_path.to_vec();
+    preferred_path.push("Error".to_string());
+    Some(preferred_path)
+}
+
+fn candidate_child_facet_module_target(
+    items: &[Item],
+    module_path: &[String],
+    settings: &NamespaceSettings,
+) -> Option<(String, String)> {
+    let parent_normalized = normalize_segment(module_path.last()?);
+    if settings.weak_modules.contains(&parent_normalized)
+        || settings.catch_all_modules.contains(&parent_normalized)
+        || settings.organizational_modules.contains(&parent_normalized)
+        || namespace_scope_has_public_error_enum(items)
+    {
+        return None;
+    }
+
+    let mut leaves = namespace_validated_leaf_wrapper_candidates(items);
+    if leaves.len() != 1 {
+        return None;
+    }
+    let (leaf_name, child_module_name) = leaves.pop()?;
+    if normalize_segment(&child_module_name) == parent_normalized
+        || namespace_scope_has_child_module_named(items, &child_module_name)
+    {
+        return None;
+    }
+
+    let broader_items = namespace_public_items_using_leaf(items, &leaf_name);
+    if broader_items.is_empty() {
+        return None;
+    }
+
+    Some((child_module_name, leaf_name))
+}
+
+fn candidate_root_facet_module_target(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+    flat_error_name: &str,
+    settings: &NamespaceSettings,
+) -> Option<String> {
+    let boundary_items = namespace_root_boundary_items(path, items, module_path, settings)?;
+    let members = namespace_root_facet_members(&boundary_items);
+    if members.len() < 2 || namespace_candidate_facet_members_look_like_scalar_bundle(&members) {
+        return None;
+    }
+
+    let required_bindings = members
+        .iter()
+        .map(|(leaf_name, _)| leaf_name.clone())
+        .chain(std::iter::once("Error".to_string()))
+        .collect::<BTreeSet<_>>();
+    let public_bindings = public_bindings_for_module(path, module_path);
+    if !required_bindings.is_subset(&public_bindings) {
+        return None;
+    }
+
+    members
+        .into_iter()
+        .find_map(|(leaf_name, member_error_name)| {
+            (member_error_name == flat_error_name)
+                .then(|| render_segments(&split_segments(&leaf_name), super::NameStyle::Snake))
+        })
+}
+
+fn namespace_root_boundary_items(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+    settings: &NamespaceSettings,
+) -> Option<Vec<Item>> {
+    if !namespace_root_facet_members(items).is_empty() {
+        return Some(items.to_vec());
+    }
+
+    let boundary_module_name = namespace_reexported_error_child_module(items)?;
+    let mut boundary_module_path = module_path.to_vec();
+    boundary_module_path.push(boundary_module_name);
+    module_items_for_module(path, &boundary_module_path, settings)
+}
+
+fn namespace_reexported_error_child_module(items: &[Item]) -> Option<String> {
+    let mut matches = BTreeSet::new();
+
+    for item in items {
+        let Item::Use(item_use) = item else {
+            continue;
+        };
+        if matches!(item_use.vis, Visibility::Inherited)
+            || namespace_attrs_have_cfg_like(&item_use.attrs)
+        {
+            continue;
+        }
+
+        let mut leaves = Vec::new();
+        flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+        for leaf in leaves {
+            let binding = match leaf {
+                UseLeaf::Direct(binding) | UseLeaf::Rename(binding) => binding,
+                UseLeaf::Glob(_) => continue,
+            };
+            if binding.binding_name != "Error"
+                || binding.source_name != "Error"
+                || binding.full_path.len() < 2
+            {
+                continue;
+            }
+            let Some(parent_module) = binding.full_path.iter().rev().nth(1) else {
+                continue;
+            };
+            matches.insert(parent_module.clone());
+        }
+    }
+
+    (matches.len() == 1).then(|| matches.into_iter().next().expect("one boundary child"))
+}
+
+fn namespace_root_facet_members(items: &[Item]) -> Vec<(String, String)> {
+    let mut members = Vec::new();
+
+    for item in items {
+        let Item::Enum(item_enum) = item else {
+            continue;
+        };
+        if item_enum.ident != "Error"
+            || !is_public(&item_enum.vis)
+            || namespace_attrs_have_cfg_like(&item_enum.attrs)
+        {
+            continue;
+        }
+
+        for variant in &item_enum.variants {
+            if namespace_attrs_have_cfg_like(&variant.attrs) {
+                continue;
+            }
+            let leaf_name = variant.ident.to_string();
+            let Some(flat_error_name) = namespace_variant_source_error_name(variant) else {
+                continue;
+            };
+            let Some(companion_leaf) = flat_error_name.strip_suffix("Error") else {
+                continue;
+            };
+            if !companion_leaf.is_empty() && companion_leaf == leaf_name {
+                members.push((leaf_name, flat_error_name));
+            }
+        }
+    }
+
+    members.sort();
+    members.dedup_by(|left, right| left.0 == right.0);
+    members
+}
+
+fn namespace_candidate_facet_members_look_like_scalar_bundle(members: &[(String, String)]) -> bool {
+    if members.len() < 2 {
+        return false;
+    }
+
+    let scalar_tokens = [
+        "code", "count", "id", "key", "label", "last4", "name", "number", "text", "title", "value",
+    ];
+
+    members.iter().all(|(leaf_name, _)| {
+        split_segments(leaf_name)
+            .into_iter()
+            .map(|segment| segment.to_ascii_lowercase())
+            .any(|segment| scalar_tokens.contains(&segment.as_str()))
+    })
+}
+
+fn namespace_scope_has_public_error_enum(items: &[Item]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            Item::Enum(ItemEnum {
+                ident,
+                vis,
+                attrs,
+                ..
+            }) if ident == "Error" && is_public(vis) && !namespace_attrs_have_cfg_like(attrs)
+        )
+    })
+}
+
+fn namespace_scope_has_child_module_named(items: &[Item], module_name: &str) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            Item::Mod(ItemMod { ident, attrs, .. })
+                if !namespace_attrs_have_cfg_like(attrs)
+                    && normalize_segment(&ident.to_string()) == normalize_segment(module_name)
+        )
+    })
+}
+
+fn namespace_local_public_companion_leaf_candidates(items: &[Item]) -> BTreeSet<String> {
+    let mut leaves = BTreeSet::new();
+
+    for item in items {
+        let Item::Struct(item_struct) = item else {
+            continue;
+        };
+        if !is_public(&item_struct.vis)
+            || namespace_attrs_have_cfg_like(&item_struct.attrs)
+            || item_struct.ident == "Error"
+            || !namespace_item_is_single_field_tuple_struct(item)
+        {
+            continue;
+        }
+        leaves.insert(item_struct.ident.to_string());
+    }
+
+    leaves
+}
+
+fn namespace_validated_leaf_wrapper_candidates(items: &[Item]) -> Vec<(String, String)> {
+    let mut leaves = Vec::new();
+
+    for item in items {
+        let Item::Struct(item_struct) = item else {
+            continue;
+        };
+        if !is_public(&item_struct.vis)
+            || namespace_attrs_have_cfg_like(&item_struct.attrs)
+            || !namespace_item_is_single_field_tuple_struct(item)
+            || !namespace_attrs_have_nutype_validate(&item_struct.attrs)
+        {
+            continue;
+        }
+
+        let leaf_name = item_struct.ident.to_string();
+        let child_module_name =
+            render_segments(&split_segments(&leaf_name), super::NameStyle::Snake);
+        leaves.push((leaf_name, child_module_name));
+    }
+
+    leaves
+}
+
+fn namespace_public_items_using_leaf(items: &[Item], leaf_name: &str) -> Vec<String> {
+    let mut broader_items = Vec::new();
+
+    for item in items {
+        let Some((binding_name, is_public)) = public_item_binding(item) else {
+            continue;
+        };
+        if !is_public
+            || binding_name == leaf_name
+            || binding_name == "Error"
+            || !namespace_item_is_child_facet_owner_candidate(item)
+            || namespace_attrs_have_cfg_like(namespace_item_attrs(item))
+        {
+            continue;
+        }
+        if namespace_public_item_mentions_leaf(item, leaf_name) {
+            broader_items.push(binding_name);
+        }
+    }
+
+    broader_items.sort();
+    broader_items.dedup();
+    broader_items
+}
+
+fn namespace_scope_imports_binding_name(items: &[Item], binding_name: &str) -> bool {
+    items.iter().any(|item| {
+        let Item::Use(item_use) = item else {
+            return false;
+        };
+        let mut leaves = Vec::new();
+        flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+        leaves.into_iter().any(|leaf| match leaf {
+            UseLeaf::Direct(binding) | UseLeaf::Rename(binding) => {
+                binding.binding_name == binding_name
+            }
+            UseLeaf::Glob(_) => false,
+        })
+    })
+}
+
+fn namespace_public_error_variants_reference_flat_error(
+    items: &[Item],
+    flat_error_name: &str,
+) -> bool {
+    items.iter().any(|item| {
+        let Item::Enum(item_enum) = item else {
+            return false;
+        };
+        if item_enum.ident != "Error"
+            || !is_public(&item_enum.vis)
+            || namespace_attrs_have_cfg_like(&item_enum.attrs)
+        {
+            return false;
+        }
+
+        item_enum.variants.iter().any(|variant| {
+            !namespace_attrs_have_cfg_like(&variant.attrs)
+                && namespace_variant_source_error_name(variant)
+                    .is_some_and(|candidate| candidate == flat_error_name)
+        })
+    })
+}
+
+fn namespace_variant_source_error_name(variant: &syn::Variant) -> Option<String> {
+    let type_path = match &variant.fields {
+        syn::Fields::Named(fields) => fields
+            .named
+            .iter()
+            .find(|field| field.ident.as_ref().is_some_and(|ident| ident == "source"))
+            .and_then(namespace_type_path_from_field),
+        syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+            namespace_type_path_from_field(fields.unnamed.first()?)
+        }
+        _ => None,
+    }?;
+    type_path
+        .path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+}
+
+fn namespace_type_path_from_field(field: &syn::Field) -> Option<&syn::TypePath> {
+    let syn::Type::Path(type_path) = &field.ty else {
+        return None;
+    };
+    type_path.qself.is_none().then_some(type_path)
+}
+
+fn namespace_boundary_owner_module_path(module_path: &[String]) -> Vec<String> {
+    match module_path.split_last() {
+        Some((last, rest)) if matches!(normalize_segment(last).as_str(), "error" | "errors") => {
+            rest.to_vec()
+        }
+        _ => module_path.to_vec(),
+    }
+}
+
+fn boundary_owner_module_path(module_path: &[String]) -> Vec<String> {
+    namespace_boundary_owner_module_path(module_path)
+}
+
+fn namespace_item_is_single_field_tuple_struct(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Struct(ItemStruct {
+            fields: syn::Fields::Unnamed(fields),
+            ..
+        }) if fields.unnamed.len() == 1
+    )
+}
+
+fn namespace_attrs_have_nutype_validate(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("nutype"))
+        .any(|attr| match &attr.meta {
+            syn::Meta::List(list) => list.tokens.clone().into_iter().any(|token| {
+                matches!(
+                    token,
+                    proc_macro2::TokenTree::Ident(ident) if ident == "validate"
+                )
+            }),
+            _ => false,
+        })
+}
+
+fn namespace_attrs_have_cfg_like(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+}
+
+fn namespace_item_is_child_facet_owner_candidate(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Struct(_)
+            | Item::Enum(_)
+            | Item::Trait(_)
+            | Item::TraitAlias(_)
+            | Item::Type(_)
+            | Item::Union(_)
+    )
+}
+
+fn namespace_public_item_mentions_leaf(item: &Item, leaf_name: &str) -> bool {
+    struct LeafMentionVisitor<'a> {
+        leaf_name: &'a str,
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for LeafMentionVisitor<'_> {
+        fn visit_type_path(&mut self, type_path: &'ast syn::TypePath) {
+            if let Some(ident) = type_path.path.segments.last()
+                && ident.ident == self.leaf_name
+            {
+                self.found = true;
+                return;
+            }
+            visit::visit_type_path(self, type_path);
+        }
+    }
+
+    let mut visitor = LeafMentionVisitor {
+        leaf_name,
+        found: false,
+    };
+    visitor.visit_item(item);
+    visitor.found
 }
 
 fn namespace_family_shared_prefix(
