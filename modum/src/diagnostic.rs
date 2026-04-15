@@ -1448,7 +1448,11 @@ mod tests {
             diagnostic_guidance_for_code("namespace_flat_use_child_facet_follow_through", None)
                 .expect("guidance");
         assert!(guidance.why.contains("deeper child facet"));
-        assert!(guidance.address.contains("Move the leaf value and failure surface together"));
+        assert!(
+            guidance
+                .address
+                .contains("Move the leaf value and failure surface together")
+        );
         assert!(guidance.address.contains("#[path = ...]"));
     }
 

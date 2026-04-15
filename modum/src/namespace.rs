@@ -505,8 +505,7 @@ fn analyze_type_alias_item(
             &error_surface_follow_through.preferred_path,
             error_surface_follow_through.target_exists,
         ))
-    } else if let Some(child_facet_value_follow_through) =
-        child_facet_value_follow_through.as_ref()
+    } else if let Some(child_facet_value_follow_through) = child_facet_value_follow_through.as_ref()
     {
         Some(child_facet_value_follow_through_alias_message(
             &binding_name,
@@ -838,9 +837,7 @@ fn child_facet_value_follow_through_use_message(
     if target_exists {
         (
             code,
-            format!(
-                "{subject} keeps broader leaf path `{source_path}`; prefer `{preferred_path}`"
-            ),
+            format!("{subject} keeps broader leaf path `{source_path}`; prefer `{preferred_path}`"),
         )
     } else {
         (

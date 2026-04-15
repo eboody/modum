@@ -1304,11 +1304,8 @@ fn candidate_facet_module_members(
     items: &[Item],
     module_path: &[String],
 ) -> Option<(Vec<String>, usize, Vec<CandidateFacetFamilyMember>)> {
-    let Some((root_module_path, boundary_line, raw_members)) =
-        flat_leaf_failure_boundary_members(items, module_path)
-    else {
-        return None;
-    };
+    let (root_module_path, boundary_line, raw_members) =
+        flat_leaf_failure_boundary_members(items, module_path)?;
     if !root_module_path.is_empty() && !inferred_module_is_public(path, &root_module_path) {
         return None;
     }
@@ -1317,11 +1314,8 @@ fn candidate_facet_module_members(
         .map(|member| member.leaf_name.clone())
         .collect::<BTreeSet<_>>();
     required_bindings.insert("Error".to_string());
-    let Some(root_public_bindings) =
-        supported_public_bindings_for_module_path(path, &root_module_path, &required_bindings)
-    else {
-        return None;
-    };
+    let root_public_bindings =
+        supported_public_bindings_for_module_path(path, &root_module_path, &required_bindings)?;
 
     let mut members = raw_members
         .into_iter()
