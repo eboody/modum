@@ -4856,6 +4856,234 @@ pub enum Error {
 }
 
 #[test]
+fn analyze_workspace_reports_boundary_wraps_child_facet_error_for_public_boundary_error() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(
+        root.join("src/chat/mod.rs"),
+        "pub mod error;\npub mod message;\npub use error::Error;\n",
+    )
+    .expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+    fs::write(
+        root.join("src/chat/error.rs"),
+        r#"
+use crate::chat::message;
+
+pub enum Error {
+    MessageBody { source: message::BodyError },
+}
+"#,
+    )
+    .expect("write error module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_boundary_wraps_child_facet_error")
+            && diag.message.contains("chat::Error")
+            && diag.message.contains("MessageBody")
+            && diag.message.contains("chat::message::BodyError")
+            && diag.message.contains("chat::message::body::Error")
+    }));
+}
+
+#[test]
+fn analyze_workspace_reports_boundary_wraps_child_facet_error_for_imported_flat_error_leaf() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(
+        root.join("src/chat/mod.rs"),
+        "pub mod error;\npub mod message;\npub use error::Error;\n",
+    )
+    .expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+    fs::write(
+        root.join("src/chat/error.rs"),
+        r#"
+use crate::chat::message::BodyError;
+
+pub enum Error {
+    MessageBody { source: BodyError },
+}
+"#,
+    )
+    .expect("write error module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_boundary_wraps_child_facet_error")
+            && diag.message.contains("chat::Error")
+            && diag.message.contains("MessageBody")
+            && diag.message.contains("chat::message::BodyError")
+            && diag.message.contains("chat::message::body::Error")
+    }));
+}
+
+#[test]
+fn analyze_workspace_reports_boundary_wraps_child_facet_error_for_aliased_imported_flat_error_leaf()
+{
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(
+        root.join("src/chat/mod.rs"),
+        "pub mod error;\npub mod message;\npub use error::Error;\n",
+    )
+    .expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+    fs::write(
+        root.join("src/chat/error.rs"),
+        r#"
+use crate::chat::message::BodyError as ChatBodyError;
+
+pub enum Error {
+    MessageBody { source: ChatBodyError },
+}
+"#,
+    )
+    .expect("write error module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_boundary_wraps_child_facet_error")
+            && diag.message.contains("chat::Error")
+            && diag.message.contains("MessageBody")
+            && diag.message.contains("chat::message::BodyError")
+            && diag.message.contains("chat::message::body::Error")
+    }));
+}
+
+#[test]
+fn analyze_workspace_reports_boundary_wraps_child_facet_error_for_super_child_path() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(
+        root.join("src/chat/mod.rs"),
+        "pub mod error;\npub mod moderation;\npub use error::Error;\n",
+    )
+    .expect("write chat mod");
+    fs::write(
+        root.join("src/chat/moderation.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Reason(String);
+
+pub struct Item {
+    pub reason: Reason,
+}
+"#,
+    )
+    .expect("write moderation module");
+    fs::write(
+        root.join("src/chat/error.rs"),
+        r#"
+pub enum Error {
+    InvalidModerationReason {
+        source: super::moderation::ReasonError,
+    },
+}
+"#,
+    )
+    .expect("write error module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_boundary_wraps_child_facet_error")
+            && diag.message.contains("chat::Error")
+            && diag.message.contains("InvalidModerationReason")
+            && diag.message.contains("chat::moderation::ReasonError")
+            && diag.message.contains("chat::moderation::reason::Error")
+    }));
+}
+
+#[test]
+fn analyze_workspace_does_not_report_boundary_wraps_child_facet_error_for_private_decode_enum() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/chat")).expect("create chat module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod chat;\n").expect("write lib");
+    fs::write(
+        root.join("src/chat/mod.rs"),
+        "pub mod error;\npub mod message;\npub use error::Error;\n",
+    )
+    .expect("write chat mod");
+    fs::write(
+        root.join("src/chat/message.rs"),
+        r#"
+#[nutype(validate(not_empty))]
+pub struct Body(String);
+
+pub struct Message {
+    pub body: Body,
+}
+"#,
+    )
+    .expect("write message module");
+    fs::write(
+        root.join("src/chat/error.rs"),
+        r#"
+enum Decode {
+    MessageBody { source: super::message::BodyError },
+}
+"#,
+    )
+    .expect("write error module");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_boundary_wraps_child_facet_error"))
+    );
+}
+
+#[test]
 fn analyze_workspace_reports_owned_facet_companion_error_for_nested_leaf_owner() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();

@@ -359,6 +359,10 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
             "The module is mixing broader aggregate surface with one validated leaf that likely wants its own owned facet and failure surface.",
             "Create the child facet the lint names only if it becomes the canonical owner for that leaf, move the leaf value and failure surface into it, and let the broader parent keep the aggregate items that depend on it. Do the filesystem refactor for real instead of using `#[path = ...]` shims, and don't keep both the flat module and the new child facet as equal canonical homes for the same leaf family.",
         ),
+        "api_boundary_wraps_child_facet_error" => (
+            "The broader boundary is still wrapping a flat child companion error even though the child module now looks like it wants a deeper owning facet.",
+            "Once the child facet is the real owner, let the broader boundary wrap that child-facet `Error` instead of the flat companion error. Create the child facet for real, move the leaf value and failure surface into it together, and don't keep the flat child error as a parallel public answer from the broader owner. Do the filesystem refactor for real instead of using `#[path = ...]` shims.",
+        ),
         "api_owned_facet_companion_error" => (
             "This owner already has its own `Error`, so a parallel leaf-specific companion like `TextError` creates two failure surfaces for the same facet.",
             "Keep the owner's `Error` as the caller-visible failure surface. Leave the companion error as construction detail or generated internals, or split the leaf into a deeper facet only if callers truly need a separate error boundary. Don't export both `TextError`-style companions and `Error` as parallel public answers from the same owner.",
@@ -449,6 +453,14 @@ fn diagnostic_guidance_for_instance(
         "api_candidate_child_facet_module" => {
             if let Some((instance_why, instance_address)) =
                 candidate_child_facet_module_guidance(message)
+            {
+                why = instance_why;
+                address = instance_address;
+            }
+        }
+        "api_boundary_wraps_child_facet_error" => {
+            if let Some((instance_why, instance_address)) =
+                boundary_wraps_child_facet_error_guidance(message)
             {
                 why = instance_why;
                 address = instance_address;
@@ -636,6 +648,28 @@ fn candidate_child_facet_module_guidance(message: &str) -> Option<(String, Strin
     );
     let address = format!(
         "If `{child}` becomes the real owner for this leaf family, move `{leaf_name}` and its failure surface there and let `{owner}` keep the broader aggregate surface like `{broader_items}`. Do the filesystem refactor for real instead of using `#[path = ...]` shims, and don't keep both `{leaf}` and `{child}::{leaf_name}` as equal canonical homes."
+    );
+
+    Some((why, address))
+}
+
+fn boundary_wraps_child_facet_error_guidance(message: &str) -> Option<(String, String)> {
+    let chunks = backticked_chunks(message);
+    if chunks.len() < 5 {
+        return None;
+    }
+
+    let boundary = chunks.first()?;
+    let variant = chunks.get(1)?;
+    let flat_error = chunks.get(2)?;
+    let child_owner = chunks.get(3)?;
+    let child_error = chunks.get(4)?;
+
+    let why = format!(
+        "`{boundary}` is still keeping variant `{variant}` on the flat child error surface `{flat_error}` even though `{child_owner}` looks like the real owner for that leaf family."
+    );
+    let address = format!(
+        "If `{child_owner}` becomes the canonical child owner, move the leaf value and failure surface there together and let `{boundary}` wrap `{child_error}` instead. Don't keep `{flat_error}` as the parallel public child error once the deeper facet exists, and don't fake the move with `#[path = ...]` shims."
     );
 
     Some((why, address))
@@ -1168,6 +1202,35 @@ mod tests {
     }
 
     #[test]
+    fn generic_guidance_for_boundary_wraps_child_facet_error_keeps_child_owner_single() {
+        let guidance = diagnostic_guidance_for_code("api_boundary_wraps_child_facet_error", None)
+            .expect("guidance");
+        assert!(guidance.why.contains("flat child companion error"));
+        assert!(guidance.address.contains("child-facet `Error`"));
+        assert!(guidance.address.contains("parallel public answer"));
+        assert!(guidance.address.contains("#[path = ...]"));
+    }
+
+    #[test]
+    fn instance_guidance_for_boundary_wraps_child_facet_error_names_boundary_and_child_owner() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "api_boundary_wraps_child_facet_error".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "public boundary `chat::Error` variant `MessageBody` wraps flat child error `chat::message::BodyError` even though `chat::message::body` looks like the owning child facet; prefer `chat::message::body::Error` once that facet exists".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.why.contains("`chat::Error`"));
+        assert!(guidance.why.contains("`MessageBody`"));
+        assert!(guidance.address.contains("`chat::message::body::Error`"));
+        assert!(guidance.address.contains("`chat::message::BodyError`"));
+    }
+
+    #[test]
     fn generic_guidance_for_owned_facet_companion_error_keeps_one_canonical_error_surface() {
         let guidance = diagnostic_guidance_for_code("api_owned_facet_companion_error", None)
             .expect("guidance");
@@ -1181,6 +1244,21 @@ mod tests {
         let diag = Diagnostic {
             class: DiagnosticClass::AdvisoryWarning {
                 code: "api_owned_facet_companion_error".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: String::new(),
+        };
+
+        assert_eq!(diag.profile(), Some(super::LintProfile::Strict));
+    }
+
+    #[test]
+    fn boundary_wraps_child_facet_error_has_strict_profile_metadata() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "api_boundary_wraps_child_facet_error".to_string(),
             },
             file: None,
             line: None,
@@ -1429,6 +1507,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         "api_candidate_child_facet_module" => (
             LintProfile::Strict,
             "A broader public module likely wants a child facet for one validated leaf and its failure surface.",
+        ),
+        "api_boundary_wraps_child_facet_error" => (
+            LintProfile::Strict,
+            "A broader public `Error` boundary still wraps a flat child companion error even though a deeper child facet now looks like the owner.",
         ),
         "api_owned_facet_companion_error" => (
             LintProfile::Strict,

@@ -59,6 +59,8 @@ For these surface-shape rules, shared crate-visible surfaces such as `pub(crate)
   Advisory warning for root modules that flatten several leaf value-plus-error families next to a broader root `Error`, such as `user::{Email, EmailError, Username, UsernameError, Error}`. It points toward owned facets like `user::email` and `user::username`, with the root keeping the cross-facet boundary.
 - `api_candidate_child_facet_module`
   Advisory warning for broader public modules that appear to want one deeper child facet for a validated leaf and its failure surface, such as `chat::message` wanting `chat::message::body` or `chat::moderation` wanting `chat::moderation::reason`. It is meant for modules that already expose aggregate items like `Message`, `Item`, or `Queue`, but still keep the validated leaf flat at the same level.
+- `api_boundary_wraps_child_facet_error`
+  Advisory warning for broader public `Error` boundaries that still wrap a flat child companion error like `message::BodyError` or `moderation::ReasonError` even though the corresponding child module already looks like it wants a deeper owner such as `message::body` or `moderation::reason`. It points toward letting the broader boundary wrap `message::body::Error` or `moderation::reason::Error` once that child facet exists.
 - `api_owned_facet_companion_error`
   Advisory warning for already-owned public facets that define a local `Error` and also rely on a same-leaf companion failure like `TextError` for a local tuple-wrapper leaf such as `Text`. It points toward one canonical facet-local failure surface like `room::name::Error` instead of exporting both `TextError` and `Error` from the same owner.
 - `api_candidate_semantic_module_unsupported_construct`
@@ -98,6 +100,7 @@ Examples:
 - `UserRepository`, `UserService`, `UserId`
 - `user::{Email, EmailError, Username, UsernameError, Error}`
 - `chat::message::{Body, Message}` when the error surface really wants `chat::message::body::{Body, Error}`
+- `chat::Error::MessageBody { source: message::BodyError }` when the child owner really wants `chat::message::body::Error`
 - `room::name::{Text, Error}` with a companion `TextError`
 - `CompletedOutcome`, `RejectedOutcome`, `toxicity::Outcome`
 - `UserRepository` when `user::Repository` already exists

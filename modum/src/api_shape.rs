@@ -174,6 +174,21 @@ struct OwnedFacetCompanionErrorMember {
 }
 
 #[derive(Clone)]
+struct BoundaryChildFacetErrorMember {
+    line: usize,
+    variant_name: String,
+    flat_error_name: String,
+    child_module_path: Vec<String>,
+    child_facet_module_name: String,
+}
+
+#[derive(Clone)]
+struct ImportedSourceErrorBinding {
+    module_segments: Vec<String>,
+    flat_error_name: String,
+}
+
+#[derive(Clone)]
 struct CandidateChildFacetModule {
     line: usize,
     leaf_name: String,
@@ -259,6 +274,14 @@ fn analyze_scope(
         diagnostics,
     );
     analyze_owned_facet_companion_errors(
+        path,
+        items,
+        module_path,
+        scope_flags,
+        settings,
+        diagnostics,
+    );
+    analyze_boundary_wraps_child_facet_errors(
         path,
         items,
         module_path,
@@ -474,6 +497,44 @@ fn analyze_owned_facet_companion_errors(
             "owned facet `{facet_path}` keeps local leaf companion failure families {rendered_members} beside facet boundary `{error_path}`; keep `{error_path}` as the canonical failure surface"
         ),
     ));
+}
+
+fn analyze_boundary_wraps_child_facet_errors(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+    _scope_flags: ScopeFlags,
+    settings: &NamespaceSettings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let root_module_path = boundary_owner_module_path(module_path);
+    if !inferred_module_is_public(path, &root_module_path) {
+        return;
+    }
+    let boundary_path = render_public_path(&root_module_path, "Error");
+
+    for member in
+        boundary_child_facet_error_members(path, items, module_path, &root_module_path, settings)
+    {
+        let flat_error_path =
+            render_public_path(&member.child_module_path, &member.flat_error_name);
+        let child_facet_path = render_public_path_with_module(
+            &member.child_module_path,
+            &member.child_facet_module_name,
+            "Error",
+        );
+        let child_owner_path =
+            render_public_path(&member.child_module_path, &member.child_facet_module_name);
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(member.line),
+            "api_boundary_wraps_child_facet_error",
+            format!(
+                "public boundary `{boundary_path}` variant `{}` wraps flat child error `{flat_error_path}` even though `{child_owner_path}` looks like the owning child facet; prefer `{child_facet_path}` once that facet exists",
+                member.variant_name,
+            ),
+        ));
+    }
 }
 
 fn analyze_maybe_some_callsite_item(path: &Path, item: &Item, diagnostics: &mut Vec<Diagnostic>) {
@@ -1312,6 +1373,129 @@ fn owned_facet_companion_error_members(
     None
 }
 
+fn boundary_child_facet_error_members(
+    current_file: &Path,
+    items: &[Item],
+    module_path: &[String],
+    root_module_path: &[String],
+    settings: &NamespaceSettings,
+) -> Vec<BoundaryChildFacetErrorMember> {
+    let root_items = load_module_items(current_file, root_module_path);
+    let mut members = Vec::new();
+
+    for item in items {
+        let Item::Enum(item_enum) = item else {
+            continue;
+        };
+        if !is_public(&item_enum.vis)
+            || item_enum.ident != "Error"
+            || attrs_have_cfg_like(&item_enum.attrs)
+        {
+            continue;
+        }
+
+        for variant in &item_enum.variants {
+            if attrs_have_cfg_like(&variant.attrs) {
+                continue;
+            }
+            let Some((mut source_module_segments, mut flat_error_name)) =
+                variant_source_error_path_segments(variant)
+            else {
+                continue;
+            };
+            if source_module_segments.is_empty() {
+                let Some(imported_source_binding) =
+                    imported_source_error_binding(items, &flat_error_name)
+                else {
+                    continue;
+                };
+                source_module_segments = imported_source_binding.module_segments;
+                flat_error_name = imported_source_binding.flat_error_name;
+            }
+            let Some(companion_leaf) = flat_error_name.strip_suffix("Error") else {
+                continue;
+            };
+            if companion_leaf.is_empty() {
+                continue;
+            }
+            let Some(child_module_path) = resolve_boundary_child_module_path(
+                module_path,
+                root_module_path,
+                &source_module_segments,
+                root_items.as_deref(),
+            ) else {
+                continue;
+            };
+            if !path_has_prefix(&child_module_path, root_module_path)
+                || child_module_path.len() != root_module_path.len().saturating_add(1)
+            {
+                continue;
+            }
+            let Some(child_items) = load_module_items(current_file, &child_module_path) else {
+                continue;
+            };
+            let Some(candidate) =
+                candidate_child_facet_module(&child_items, &child_module_path, settings)
+            else {
+                continue;
+            };
+            if candidate.leaf_name != companion_leaf {
+                continue;
+            }
+
+            members.push(BoundaryChildFacetErrorMember {
+                line: variant.span().start().line,
+                variant_name: variant.ident.to_string(),
+                flat_error_name,
+                child_module_path,
+                child_facet_module_name: candidate.child_module_name,
+            });
+        }
+    }
+
+    members
+}
+
+fn imported_source_error_binding(
+    items: &[Item],
+    binding_name: &str,
+) -> Option<ImportedSourceErrorBinding> {
+    let mut matches = BTreeSet::new();
+
+    for item in items {
+        let Item::Use(item_use) = item else {
+            continue;
+        };
+        if attrs_have_cfg_like(&item_use.attrs) {
+            continue;
+        }
+
+        let mut leaves = Vec::new();
+        flatten_public_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+        for leaf in leaves {
+            if leaf.binding_name != binding_name || leaf.full_path.len() < 2 {
+                continue;
+            }
+            let Some(original_error_name) = leaf.full_path.last() else {
+                continue;
+            };
+            matches.insert((
+                leaf.full_path[..leaf.full_path.len() - 1].to_vec(),
+                original_error_name.clone(),
+            ));
+        }
+    }
+
+    (matches.len() == 1).then(|| {
+        let (module_segments, flat_error_name) =
+            matches.into_iter().next().expect("one import match");
+        ImportedSourceErrorBinding {
+            module_segments,
+            flat_error_name,
+        }
+    })
+}
+
 fn candidate_child_facet_module(
     items: &[Item],
     module_path: &[String],
@@ -1354,12 +1538,7 @@ fn flat_leaf_failure_boundary_members(
     items: &[Item],
     module_path: &[String],
 ) -> Option<(Vec<String>, usize, Vec<CandidateFacetFamilyMember>)> {
-    let root_module_path = match module_path.split_last() {
-        Some((last, rest)) if matches!(normalize_segment(last).as_str(), "error" | "errors") => {
-            rest.to_vec()
-        }
-        _ => module_path.to_vec(),
-    };
+    let root_module_path = boundary_owner_module_path(module_path);
 
     for item in items {
         let Item::Enum(item_enum) = item else {
@@ -1383,6 +1562,15 @@ fn flat_leaf_failure_boundary_members(
     }
 
     None
+}
+
+fn boundary_owner_module_path(module_path: &[String]) -> Vec<String> {
+    match module_path.split_last() {
+        Some((last, rest)) if matches!(normalize_segment(last).as_str(), "error" | "errors") => {
+            rest.to_vec()
+        }
+        _ => module_path.to_vec(),
+    }
 }
 
 fn local_public_companion_leaf_candidates(items: &[Item]) -> BTreeSet<String> {
@@ -1544,17 +1732,78 @@ fn flat_leaf_failure_family_member(variant: &syn::Variant) -> Option<CandidateFa
 }
 
 fn variant_source_error_name(variant: &syn::Variant) -> Option<String> {
-    match &variant.fields {
+    let (_, flat_error_name) = variant_source_error_path_segments(variant)?;
+    Some(flat_error_name)
+}
+
+fn variant_source_error_path_segments(variant: &syn::Variant) -> Option<(Vec<String>, String)> {
+    let type_path = match &variant.fields {
         syn::Fields::Named(fields) => fields
             .named
             .iter()
             .find(|field| field.ident.as_ref().is_some_and(|ident| ident == "source"))
-            .and_then(|field| type_leaf_ident(&field.ty)),
+            .and_then(type_path_from_field),
         syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-            type_leaf_ident(&fields.unnamed.first()?.ty)
+            type_path_from_field(fields.unnamed.first()?)
         }
         _ => None,
+    }?;
+    let mut segments = type_path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let flat_error_name = segments.pop()?;
+    Some((segments, flat_error_name))
+}
+
+fn type_path_from_field(field: &syn::Field) -> Option<&syn::TypePath> {
+    let Type::Path(type_path) = &field.ty else {
+        return None;
+    };
+    type_path.qself.is_none().then_some(type_path)
+}
+
+fn resolve_boundary_child_module_path(
+    current_module_path: &[String],
+    root_module_path: &[String],
+    source_module_segments: &[String],
+    root_items: Option<&[Item]>,
+) -> Option<Vec<String>> {
+    if source_module_segments.is_empty() {
+        return None;
     }
+
+    if matches!(
+        source_module_segments.first().map(String::as_str),
+        Some("crate" | "self" | "super")
+    ) {
+        return resolve_local_module_path(current_module_path, source_module_segments)
+            .filter(|resolved| path_has_prefix(resolved, root_module_path));
+    }
+
+    if path_has_prefix(source_module_segments, root_module_path) {
+        return Some(source_module_segments.to_vec());
+    }
+
+    if let Some(child_name) = source_module_segments.first()
+        && root_items.is_some_and(|items| scope_has_child_module_named(items, child_name))
+    {
+        let mut resolved = root_module_path.to_vec();
+        resolved.extend(source_module_segments.iter().cloned());
+        return Some(resolved);
+    }
+
+    None
+}
+
+fn path_has_prefix(path: &[String], prefix: &[String]) -> bool {
+    path.len() >= prefix.len()
+        && path
+            .iter()
+            .zip(prefix.iter())
+            .all(|(left, right)| left == right)
 }
 
 fn candidate_facet_members_look_like_scalar_bundle(members: &[CandidateFacetFamilyMember]) -> bool {
