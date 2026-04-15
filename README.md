@@ -12,28 +12,28 @@
 
 `modum` reports diagnostics. It doesn't rewrite code.
 It analyzes parsed Rust source with `syn`, not compiler-resolved semantics.
-It centers namespace shape first, and nudges caller-facing boundaries when APIs drift into raw or misleading forms.
+It focuses first on whether module paths keep call sites readable, and it also nudges caller-facing APIs away from raw or misleading forms.
 
 ## Start Here
 
 - Want the idea fast? Read [Why It Exists](#why-it-exists).
 - Want to try it? Jump to [Quick Usage](#quick-usage).
-- Want the authority boundary? Read [Observation Model](#observation-model).
+- Want to know what it can and can't see? Read [Observation Model](#observation-model).
 - Want to tune it for a real repo? Start with [Configuration](#configuration).
 - Want the full lint catalog? See [docs/lint-reference.md](docs/lint-reference.md).
 
 ## Why It Exists
 
-`modum` optimizes for APIs and call sites that read through their module paths instead of compensating in leaf names.
+`modum` optimizes for APIs and call sites that read through their module paths instead of making the last name in the path carry all the context.
 
-`modum` spends most of its time on surfaces that callers see. The same pressure can still matter internally when the internal structure is drifting too.
+`modum` spends most of its time on APIs that callers actually use. The same issue can still matter internally when the structure is drifting there too.
 
 It mostly catches two things:
 
 - flattened imports or re-exports that hide useful context at call sites
-- leaf names that repeat context the path should already be carrying
+- final item names that repeat context the path should already be carrying
 
-The payoff is usually not one isolated rename. It is a whole family collapsing into one semantic module.
+The payoff is usually not one isolated rename. It is several related items collapsing into one domain module.
 
 Codebases often drift into this over time:
 
@@ -84,40 +84,40 @@ pub fn handle(repo: user::Repository) -> Result<user::Response, error::Error> {
 }
 ```
 
-That is the real move `modum` is trying to protect. The domain belongs in the path. Once the path is carrying it, leaves like `Repository`, `Service`, `Id`, `Request`, and `Response` can stay short and composable instead of each one compensating with `User...`.
+That is the real move `modum` is trying to protect. The domain belongs in the path. Once the path carries that context, names like `Repository`, `Service`, `Id`, `Request`, and `Response` can stay short and composable instead of each one compensating with `User...`.
 
-The call-site lints are strongest when the shorter leaf is generic or when parsed source shows a clear local family witness. `modum` doesn't assume every short single-segment leaf should stay qualified.
+The call-site lints are strongest when the shorter name is generic or when parsed source shows a clear local group of related items. `modum` doesn't assume every short single-segment name should stay qualified.
 
-This only works when the parent path is actually doing real semantic work. If the parent is weak or technical, the longer leaf can still be better:
+This only works when the parent path is actually carrying real meaning. If the parent is weak or technical, the longer name can still be better:
 
 ```rust
 storage::Repository
 UserRepository
 ```
 
-Here `UserRepository` is often clearer, because `storage` is technical and `user` is semantic.
+Here `UserRepository` is often clearer, because `storage` is technical and `user` names the domain.
 
 So the rule is:
 
-- strong semantic parent: prefer `user::Repository`
-- weak or technical parent: keep the more descriptive leaf
+- strong parent path: prefer `user::Repository`
+- weak or technical parent: keep the more descriptive name
 - fix the actual structure instead of rewarding cosmetic renames that only silence a lint
 
-Owned code and external crates are treated differently for the same reason. For code you own, `modum` can suggest a better parent surface that you could create, such as re-exporting `domain::user::User` as `domain::User`. For external crates, it stays conservative and only relies on surfaces that already exist.
+Owned code and external crates are treated differently for the same reason. For code you own, `modum` can suggest a better parent path that you could create, such as re-exporting `domain::user::User` as `domain::User`. For external crates, it stays conservative and only relies on paths that already exist.
 
 ## Observation Model
 
-`modum` reads Rust source files with `syn` and reports source-level heuristics from the parsed AST.
+`modum` reads Rust source files with `syn` and reports best-effort checks from the parsed syntax tree.
 
 It doesn't observe:
 
-- cfg-pruned items
+- items removed by `#[cfg]`
 - macro-expanded items
 - `include!`-generated items
 
-When semantic-module family inference would depend on those constructs, `modum` skips `api_candidate_semantic_module` and emits `api_candidate_semantic_module_unsupported_construct` instead.
+When that decision would depend on those constructs, `modum` skips `api_candidate_semantic_module` and emits `api_candidate_semantic_module_unsupported_construct` instead.
 
-Namespace-family call-site inference is also source-level only. If keeping a path visible would depend on macro-generated or cfg-driven sibling bindings, `modum` fails closed and emits `namespace_family_unsupported_construct` instead of pretending the family is complete.
+The call-site namespace checks are also source-level only. If keeping a path visible would depend on macro-generated or cfg-driven sibling bindings, `modum` fails closed and emits `namespace_family_unsupported_construct` instead of pretending the local group is complete.
 
 ## Quick Usage
 
@@ -240,17 +240,17 @@ Use `[package.metadata.modum]` inside a member crate to override workspace defau
 
 `baseline` is a repo-root-relative JSON file of existing coded diagnostics. Matching baseline entries are filtered out after normal analysis. A metadata baseline is optional until the file exists; an explicit CLI `--baseline <path>` requires the file to exist.
 
-There is no profile selector anymore. `modum` runs the full lint set by default and expects opt-out tuning through ignored codes, token-family tuning, or a baseline.
+There is no profile selector anymore. `modum` runs the full lint set by default and expects opt-out tuning through ignored codes, tuned name-token lists, or a baseline.
 
 Tuning guide:
 
-- `generic_nouns`: generic leaves like `Repository`, `Error`, or `Request`
+- `generic_nouns`: generic final names like `Repository`, `Error`, or `Request`
 - `namespace_preserving_modules`: modules that should stay visible at call sites, such as `http`, `email`, `partials`, or `components`
-- `extra_namespace_preserving_modules` / `ignored_namespace_preserving_modules`: additive tuning for preserve-module pressure when defaults are close but UI or domain modules like `widgets`, `components`, `page`, or `partials` need adjustment
-- `organizational_modules`: modules that should not leak into the public API surface, such as `error`, `request`, or `response`
-- `extra_semantic_string_scalars` / `ignored_semantic_string_scalars`: token families for string-like boundary names such as `email`, `url`, `path`, or your own repo-specific additions like `mime`
-- `extra_semantic_numeric_scalars` / `ignored_semantic_numeric_scalars`: token families for numeric boundary names such as `duration`, `timestamp`, `ttl`, or repo-specific numeric concepts
-- `extra_key_value_bag_names` / `ignored_key_value_bag_names`: token families for string bag names such as `metadata`, `headers`, `params`, or repo-specific names like `labels`
+- `extra_namespace_preserving_modules` / `ignored_namespace_preserving_modules`: additive tuning for whether those modules should stay visible at call sites when defaults are close but UI or domain modules like `widgets`, `components`, `page`, or `partials` need adjustment
+- `organizational_modules`: modules that should not leak into the public API, such as `error`, `request`, or `response`
+- `extra_semantic_string_scalars` / `ignored_semantic_string_scalars`: token families for string-like names at API boundaries such as `email`, `url`, `path`, or your own repo-specific additions like `mime`
+- `extra_semantic_numeric_scalars` / `ignored_semantic_numeric_scalars`: token families for numeric names at API boundaries such as `duration`, `timestamp`, `ttl`, or repo-specific numeric concepts
+- `extra_key_value_bag_names` / `ignored_key_value_bag_names`: token families for map-like names such as `metadata`, `headers`, `params`, or repo-specific names like `labels`
 - `ignored_diagnostic_codes`: exact diagnostic codes to suppress, such as `api_candidate_semantic_module`
 - `baseline`: repo-root-relative path for a generated baseline file such as `.modum-baseline.json`
 
@@ -260,7 +260,7 @@ Adoption workflow:
 
 - start with `--mode warn`
 - use `ignored_diagnostic_codes` for durable repo-specific exceptions
-- use `ignored_namespace_preserving_modules = ["components", "page", "partials"]` when a UI aggregator repo intentionally flattens those modules and you don't want to replace the full preserve-module default set
+- use `ignored_namespace_preserving_modules = ["components", "page", "partials"]` when a UI aggregator repo intentionally flattens those modules and you don't want to replace the full default set of modules that stay visible at call sites
 - generate a baseline with `modum check --write-baseline .modum-baseline.json`
 - apply it in CI with `modum check --baseline .modum-baseline.json` or `metadata.modum.baseline = ".modum-baseline.json"`
 
@@ -269,16 +269,16 @@ Adoption workflow:
 The full catalog lives in [docs/lint-reference.md](docs/lint-reference.md). In the README, the important split is what each category is trying to protect:
 
 - Import Style: keep namespace context visible at call sites and stop flattened imports or re-exports from erasing meaning that belongs in the path.
-- Public API Paths: keep public surfaces honest by preferring strong semantic parents, avoiding repeated leaf context, and surfacing obvious parent aliases when a child module is doing too much naming work.
-- Boundary Modeling: push caller-facing APIs away from raw strings, raw integers, raw id aliases, weak error surfaces, and other boundary shapes that leak semantics into primitives.
+- Public API Paths: keep public paths readable by preferring parent modules that carry real meaning, avoiding repeated context in the final item name, and surfacing obvious parent aliases when a child module is doing too much naming work.
+- Boundary Modeling: push caller-facing APIs away from raw strings, raw integers, raw id aliases, weak error types, and other API shapes that hide meaning inside primitives.
 - Module Boundaries: catch weak catch-all modules and repeated path segments that usually signal structure drift.
-- Structural Errors: block public paths like `partials::error::Error` when an organizational child module should be flattened back to the parent surface.
+- Structural Errors: block public paths like `partials::error::Error` when an organizational helper module should be flattened back to the parent path.
 
 Use `modum --explain <code>` for one lint at a time, or open [docs/lint-reference.md](docs/lint-reference.md) when you want the full category-by-category catalog.
 
 ## What It Doesn't Check
 
-Some naming-guide rules stay advisory because they are too semantic to lint reliably without compiler-grade context. `api_candidate_semantic_module` is also source-level only; if a scope relies on `#[cfg]`, item macros, or `include!`, `modum` emits `api_candidate_semantic_module_unsupported_construct` instead of pretending the inferred family is complete.
+Some naming-guide rules stay advisory because they depend too much on meaning to lint reliably from parsed source alone. `api_candidate_semantic_module` is also source-level only; if a scope relies on `#[cfg]`, item macros, or `include!`, `modum` emits `api_candidate_semantic_module_unsupported_construct` instead of pretending the inferred group is complete.
 
 Examples:
 
@@ -306,12 +306,12 @@ The broader import-style lints only inspect module-scope `use` items. They don't
 To reduce false negatives:
 
 - extend `namespace_preserving_modules` for domain modules like `user`, `billing`, or `tenant`
-- use `extra_namespace_preserving_modules` or `ignored_namespace_preserving_modules` when the default preserve-module set is close but not quite right for your repo
-- keep `generic_nouns` aligned with the generic leaves your API actually uses
+- use `extra_namespace_preserving_modules` or `ignored_namespace_preserving_modules` when the default list of modules that stay visible at call sites is close but not quite right for your repo
+- keep `generic_nouns` aligned with the generic final names your API actually uses
 - keep `organizational_modules` configured so `partials::error::Error`-style paths stay blocked
 
 ## Read Next
 
 - [docs/lint-reference.md](docs/lint-reference.md): full lint catalog and category detail
 - [docs/editor-integration.md](docs/editor-integration.md): Neovim setup and editor-facing JSON usage
-- [docs/naming-guide.md](docs/naming-guide.md): naming rules that shape the tool's heuristics
+- [docs/naming-guide.md](docs/naming-guide.md): naming rules that the tool follows

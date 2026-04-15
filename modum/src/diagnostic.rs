@@ -382,10 +382,30 @@ fn diagnostic_guidance_for_instance(
     message: &str,
     fix: Option<&DiagnosticFix>,
 ) -> Option<DiagnosticGuidance> {
-    let (why, base_address) = diagnostic_guidance_parts_for_code(code)?;
+    let (base_why, base_address) = diagnostic_guidance_parts_for_code(code)?;
+    let mut why = base_why.to_string();
     let mut address = base_address.to_string();
 
     match code {
+        "namespace_flat_use" | "namespace_flat_pub_use" | "namespace_flat_type_alias" => {
+            if let Some((instance_why, instance_address)) =
+                namespace_flat_context_guidance(code, message, fix)
+            {
+                why = instance_why;
+                address = instance_address;
+            }
+        }
+        "namespace_flat_use_redundant_leaf_context"
+        | "namespace_flat_pub_use_redundant_leaf_context"
+        | "namespace_flat_type_alias_redundant_leaf_context"
+        | "internal_redundant_leaf_context"
+        | "internal_adapter_redundant_leaf_context"
+        | "api_redundant_leaf_context" => {
+            append_instance_address(
+                &mut address,
+                "If this item is also re-exported or caller-visible elsewhere, reconcile that outer surface too so the family ends up with one intentional path shape instead of an internal-only rename.",
+            );
+        }
         "api_semantic_string_scalar" => {
             append_instance_address(&mut address, &semantic_string_scalar_address_hint(message));
         }
@@ -399,7 +419,7 @@ fn diagnostic_guidance_for_instance(
     }
 
     Some(DiagnosticGuidance {
-        why: why.to_string(),
+        why,
         address: append_direct_rewrite(&address, fix),
     })
 }
@@ -464,12 +484,60 @@ fn semantic_numeric_scalar_address_hint(message: &str) -> String {
             ));
         } else if lower.contains("port") {
             hints.push(format!(
-                "For `{field}`, use a focused port wrapper or move it into a typed address or config surface instead of leaving it as a bare integer."
+                "For `{field}`, use a focused port newtype, `core::num::NonZeroU16` when zero is invalid, or move it into a typed socket, endpoint, or address config surface instead of leaving it as a bare integer."
             ));
         }
     }
 
     hints.join(" ")
+}
+
+fn namespace_flat_context_guidance(
+    code: &str,
+    message: &str,
+    fix: Option<&DiagnosticFix>,
+) -> Option<(String, String)> {
+    let chunks = backticked_chunks(message);
+    let leaf = chunks.first()?.as_str();
+    let preferred = fix
+        .map(|fix| fix.replacement.as_str())
+        .or_else(|| chunks.get(1).map(|chunk| chunk.as_str()))?;
+    let (parent, _) = preferred.rsplit_once("::")?;
+
+    let why = match (code, leaf_looks_context_dependent(leaf)) {
+        ("namespace_flat_pub_use", true) => format!(
+            "The leaf still needs `{parent}::` to read clearly here, so flattening it makes the caller-facing surface harder to scan."
+        ),
+        ("namespace_flat_pub_use", false) => format!(
+            "`{parent}` is a meaningful facet or family home for this item, so flattening it hides structure the caller-facing surface should keep visible."
+        ),
+        ("namespace_flat_type_alias", true) => format!(
+            "The leaf still needs `{parent}::` to read clearly here, so flattening it makes the aliased type path harder to scan."
+        ),
+        ("namespace_flat_type_alias", false) => format!(
+            "`{parent}` is a meaningful facet or family home for this item, so flattening it hides structure the aliased type path should keep visible."
+        ),
+        (_, true) => format!(
+            "The leaf still needs `{parent}::` to read clearly here, so flattening it makes the path harder to scan at the use site."
+        ),
+        _ => format!(
+            "`{parent}` is a meaningful facet or family home for this item, so flattening it hides structure the path should keep visible."
+        ),
+    };
+
+    let address = match code {
+        "namespace_flat_pub_use" => format!(
+            "Re-export through `{preferred}` and make `{parent}` the visible public facet here. Don't keep the flat re-export and try to compensate with an alias, a longer leaf, or a second competing surface."
+        ),
+        "namespace_flat_type_alias" => format!(
+            "Keep `{preferred}` visible in the alias so the type path still shows its owning facet. Don't hide the module inside the alias name or flatten it away and compensate elsewhere."
+        ),
+        _ => format!(
+            "Import `{preferred}` directly and keep `{parent}` visible at call sites. Don't flatten it and try to smuggle the missing structure back with an alias or a longer leaf."
+        ),
+    };
+
+    Some((why, address))
 }
 
 fn raw_id_surface_address_hint(message: &str) -> String {
@@ -612,6 +680,65 @@ fn looks_like_duration_field(field: &str) -> bool {
         || field.ends_with("_nanos")
 }
 
+fn leaf_looks_context_dependent(leaf: &str) -> bool {
+    if leaf
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch == '_' || ch.is_ascii_digit())
+    {
+        return true;
+    }
+
+    let words = ident_words(leaf);
+    if words.len() <= 1 {
+        return true;
+    }
+
+    let generic_count = words
+        .iter()
+        .filter(|word| namespace_context_word_is_generic(word))
+        .count();
+
+    generic_count.saturating_mul(2) >= words.len().saturating_add(1)
+}
+
+fn namespace_context_word_is_generic(word: &str) -> bool {
+    let generic_words = [
+        "body",
+        "config",
+        "content",
+        "context",
+        "cookie",
+        "copy",
+        "entry",
+        "error",
+        "field",
+        "flow",
+        "id",
+        "key",
+        "kind",
+        "layer",
+        "level",
+        "log",
+        "message",
+        "name",
+        "pipeline",
+        "record",
+        "repository",
+        "request",
+        "response",
+        "result",
+        "service",
+        "session",
+        "state",
+        "store",
+        "target",
+        "text",
+        "type",
+        "value",
+    ];
+    generic_words.contains(&word.to_ascii_lowercase().as_str())
+}
+
 fn scope_word_is_generic(scope: &str) -> bool {
     let generic_scope_words = [
         "adapter", "auth", "client", "config", "entry", "event", "hit", "id", "mock", "param",
@@ -624,7 +751,10 @@ fn scope_word_is_generic(scope: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Diagnostic, DiagnosticClass, diagnostic_guidance_for_code};
+    use super::{
+        Diagnostic, DiagnosticClass, DiagnosticFix, DiagnosticFixKind,
+        diagnostic_guidance_for_code,
+    };
 
     #[test]
     fn instance_guidance_for_semantic_string_scalar_mentions_repo_shaped_url_type() {
@@ -657,6 +787,67 @@ mod tests {
 
         let guidance = diag.guidance().expect("guidance");
         assert!(guidance.address.contains("SandboxClientId"));
+    }
+
+    #[test]
+    fn instance_guidance_for_flat_use_generic_leaf_mentions_needed_parent_context() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::PolicyWarning {
+                code: "namespace_flat_use".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: Some(DiagnosticFix {
+                kind: DiagnosticFixKind::ReplacePath,
+                replacement: "types::LogFieldKey".to_string(),
+            }),
+            message: "flattened import hides namespace context for `LogFieldKey`; prefer `types::LogFieldKey`".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.why.contains("still needs `types::`"));
+        assert!(guidance.address.contains("Import `types::LogFieldKey` directly"));
+    }
+
+    #[test]
+    fn instance_guidance_for_flat_use_family_leaf_mentions_facet_visibility() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::PolicyWarning {
+                code: "namespace_flat_use".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: Some(DiagnosticFix {
+                kind: DiagnosticFixKind::ReplacePath,
+                replacement: "viewer::ViewerResolutionFlow".to_string(),
+            }),
+            message: "flattened import hides namespace context for `ViewerResolutionFlow`; prefer `viewer::ViewerResolutionFlow`".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.why.contains("meaningful facet or family home"));
+        assert!(guidance.address.contains("Import `viewer::ViewerResolutionFlow` directly"));
+    }
+
+    #[test]
+    fn instance_guidance_for_flat_pub_use_names_reexport_move_directly() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::PolicyWarning {
+                code: "namespace_flat_pub_use".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: Some(DiagnosticFix {
+                kind: DiagnosticFixKind::ReplacePath,
+                replacement: "layers::RequestLayerFlow".to_string(),
+            }),
+            message: "flattened re-export hides namespace context for `RequestLayerFlow`; prefer `layers::RequestLayerFlow`".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.why.contains("caller-facing surface"));
+        assert!(guidance.address.contains("Re-export through `layers::RequestLayerFlow`"));
+        assert!(guidance.address.contains("visible public facet"));
     }
 
     #[test]
@@ -741,10 +932,46 @@ mod tests {
     }
 
     #[test]
+    fn instance_guidance_for_redundant_leaf_context_mentions_outer_surface_reconciliation() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "internal_redundant_leaf_context".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: Some(DiagnosticFix {
+                kind: DiagnosticFixKind::ReplacePath,
+                replacement: "sensitive_boundary::config::SandboxHttp".to_string(),
+            }),
+            message: "internal item `sensitive_boundary::config::SandboxHttpConfig` repeats the `config` context; prefer `sensitive_boundary::config::SandboxHttp`".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.address.contains("caller-visible elsewhere"));
+    }
+
+    #[test]
     fn generic_guidance_for_semantic_string_scalar_warns_against_type_alias_string() {
         let guidance =
             diagnostic_guidance_for_code("api_semantic_string_scalar", None).expect("guidance");
         assert!(guidance.address.contains("type ... = String"));
+    }
+
+    #[test]
+    fn instance_guidance_for_numeric_port_scalar_mentions_concrete_port_shapes() {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "api_semantic_numeric_scalar".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "public struct `Sensitive` carries semantic scalar field(s) `provider_stub_port` as raw integers; prefer typed duration, timestamp, port, or domain-specific scalar types".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.address.contains("NonZeroU16"));
+        assert!(guidance.address.contains("typed socket"));
     }
 
     #[test]
