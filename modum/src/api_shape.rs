@@ -160,6 +160,13 @@ struct SharedHeadSemanticFamilyChoice {
     suggestion: SharedHeadSemanticModuleSuggestion,
 }
 
+#[derive(Clone)]
+struct CandidateFacetFamilyMember {
+    leaf_name: String,
+    flat_error_name: String,
+    facet_module_name: String,
+}
+
 pub(super) fn analyze_api_shape_rules(
     path: &Path,
     parsed: &File,
@@ -221,6 +228,7 @@ fn analyze_scope(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let public_bindings = collect_scope_public_bindings(items);
+    analyze_candidate_facet_modules(path, items, module_path, diagnostics);
     let suppressed_child_module_exports = analyze_candidate_semantic_modules(
         path,
         items,
@@ -307,6 +315,51 @@ fn analyze_scope(
             ),
         }
     }
+}
+
+fn analyze_candidate_facet_modules(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some((root_module_path, line, members)) =
+        candidate_facet_module_members(path, items, module_path)
+    else {
+        return;
+    };
+
+    let root_error_path = render_public_path(&root_module_path, "Error");
+    let rendered_families = members
+        .iter()
+        .map(|member| {
+            format!(
+                "`{}`/`{}`",
+                render_public_path(&root_module_path, &member.leaf_name),
+                render_public_path(&root_module_path, &member.flat_error_name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rendered_facets = members
+        .iter()
+        .map(|member| {
+            format!(
+                "`{}`",
+                render_public_path(&root_module_path, &member.facet_module_name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    diagnostics.push(Diagnostic::advisory(
+        Some(path.to_path_buf()),
+        Some(line),
+        "api_candidate_facet_module",
+        format!(
+            "root boundary `{root_error_path}` sits beside flat leaf value-plus-error families {rendered_families}; consider owned facets like {rendered_facets} and keep `{root_error_path}` as the cross-facet boundary"
+        ),
+    ));
 }
 
 fn analyze_maybe_some_callsite_item(path: &Path, item: &Item, diagnostics: &mut Vec<Diagnostic>) {
@@ -1069,6 +1122,127 @@ fn analyze_modeling_api_surfaces(
             _ => {}
         }
     }
+}
+
+fn candidate_facet_module_members(
+    path: &Path,
+    items: &[Item],
+    module_path: &[String],
+) -> Option<(Vec<String>, usize, Vec<CandidateFacetFamilyMember>)> {
+    let Some((root_module_path, boundary_line, raw_members)) =
+        flat_leaf_failure_boundary_members(items, module_path)
+    else {
+        return None;
+    };
+    if !root_module_path.is_empty() && !inferred_module_is_public(path, &root_module_path) {
+        return None;
+    }
+    let mut required_bindings = raw_members
+        .iter()
+        .map(|member| member.leaf_name.clone())
+        .collect::<BTreeSet<_>>();
+    required_bindings.insert("Error".to_string());
+    let Some(root_public_bindings) =
+        supported_public_bindings_for_module_path(path, &root_module_path, &required_bindings)
+    else {
+        return None;
+    };
+
+    let mut members = raw_members
+        .into_iter()
+        .filter(|member| root_public_bindings.contains(&member.leaf_name))
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| left.leaf_name.cmp(&right.leaf_name));
+    members.dedup_by(|left, right| left.leaf_name == right.leaf_name);
+    if candidate_facet_members_look_like_scalar_bundle(&members) {
+        return None;
+    }
+
+    (members.len() >= 2).then_some((root_module_path, boundary_line, members))
+}
+
+fn flat_leaf_failure_boundary_members(
+    items: &[Item],
+    module_path: &[String],
+) -> Option<(Vec<String>, usize, Vec<CandidateFacetFamilyMember>)> {
+    let root_module_path = match module_path.split_last() {
+        Some((last, rest)) if matches!(normalize_segment(last).as_str(), "error" | "errors") => {
+            rest.to_vec()
+        }
+        _ => module_path.to_vec(),
+    };
+
+    for item in items {
+        let Item::Enum(item_enum) = item else {
+            continue;
+        };
+        if !is_public(&item_enum.vis)
+            || item_enum.ident != "Error"
+            || attrs_have_cfg_like(&item_enum.attrs)
+        {
+            continue;
+        }
+
+        let members = item_enum
+            .variants
+            .iter()
+            .filter_map(flat_leaf_failure_family_member)
+            .collect::<Vec<_>>();
+        if members.len() >= 2 {
+            return Some((root_module_path, item_enum.span().start().line, members));
+        }
+    }
+
+    None
+}
+
+fn flat_leaf_failure_family_member(variant: &syn::Variant) -> Option<CandidateFacetFamilyMember> {
+    if attrs_have_cfg_like(&variant.attrs) {
+        return None;
+    }
+    let leaf_name = variant.ident.to_string();
+    let flat_error_name = variant_source_error_name(variant)?;
+    let companion_leaf = flat_error_name.strip_suffix("Error")?;
+    if companion_leaf.is_empty() || companion_leaf != leaf_name {
+        return None;
+    }
+
+    Some(CandidateFacetFamilyMember {
+        leaf_name: leaf_name.clone(),
+        flat_error_name,
+        facet_module_name: render_segments(&split_segments(&leaf_name), NameStyle::Snake),
+    })
+}
+
+fn variant_source_error_name(variant: &syn::Variant) -> Option<String> {
+    match &variant.fields {
+        syn::Fields::Named(fields) => fields
+            .named
+            .iter()
+            .find(|field| field.ident.as_ref().is_some_and(|ident| ident == "source"))
+            .and_then(|field| type_leaf_ident(&field.ty)),
+        syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+            type_leaf_ident(&fields.unnamed.first()?.ty)
+        }
+        _ => None,
+    }
+}
+
+fn candidate_facet_members_look_like_scalar_bundle(members: &[CandidateFacetFamilyMember]) -> bool {
+    if members.len() < 2 {
+        return false;
+    }
+
+    let scalar_tokens = [
+        "code", "count", "id", "key", "label", "last4", "name", "number", "text", "title", "value",
+    ];
+
+    members.iter().all(|member| {
+        split_segments(&member.leaf_name)
+            .into_iter()
+            .map(|segment| segment.to_ascii_lowercase())
+            .any(|segment| scalar_tokens.contains(&segment.as_str()))
+    })
 }
 
 fn analyze_repeated_parameter_clusters(
@@ -6662,6 +6836,13 @@ fn attribute_is_doc_hidden(attr: &syn::Attribute) -> bool {
     hidden
 }
 
+fn attrs_have_cfg_like(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let path = attr.path();
+        path.is_ident("cfg") || path.is_ident("cfg_attr")
+    })
+}
+
 fn has_builder_attribute(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("builder"))
 }
@@ -6708,6 +6889,64 @@ fn public_bindings_for_child_module(
         bindings: BTreeSet::new(),
         observation_gap_constructs: BTreeSet::new(),
     }
+}
+
+fn supported_public_bindings_for_module_path(
+    current_file: &Path,
+    module_path: &[String],
+    required_bindings: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    let src_root = source_root(current_file)?;
+    for candidate in parent_module_files(&src_root, module_path) {
+        let Ok(src) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = syn::parse_file(&src) else {
+            continue;
+        };
+        return supported_public_bindings_in_items(&parsed.items, required_bindings);
+    }
+    None
+}
+
+fn supported_public_bindings_in_items(
+    items: &[Item],
+    required_bindings: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    let mut supported = BTreeSet::new();
+
+    for item in items {
+        if let Item::Use(item_use) = item
+            && is_public(&item_use.vis)
+        {
+            let mut leaves = Vec::new();
+            flatten_public_use_tree(Vec::new(), &item_use.tree, &mut leaves);
+            let cfg_like = attrs_have_cfg_like(&item_use.attrs);
+            for leaf in leaves {
+                if !required_bindings.contains(&leaf.binding_name) {
+                    continue;
+                }
+                if cfg_like {
+                    return None;
+                }
+                supported.insert(leaf.binding_name);
+            }
+            continue;
+        }
+
+        let Some((_, binding_name, is_item_public)) = public_item_leaf(item) else {
+            continue;
+        };
+        if !is_item_public || !required_bindings.contains(&binding_name) {
+            continue;
+        }
+        if attrs_have_cfg_like(item_attrs(item)) {
+            return None;
+        }
+        supported.insert(binding_name);
+    }
+
+    required_bindings.is_subset(&supported).then_some(supported)
 }
 
 fn semantic_module_inference_gap_for_scope_items(

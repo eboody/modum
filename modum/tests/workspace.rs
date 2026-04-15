@@ -3333,6 +3333,102 @@ struct Demo(ResolutionFlow);
 }
 
 #[test]
+fn analyze_workspace_reports_namespace_family_unsupported_construct_for_type_aliases_with_alias_wording()
+ {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("create src");
+    write_manifest(root, "");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod viewer {
+    macro_rules! family {
+        () => {
+            pub struct ResolutionState;
+            pub struct ResolutionOutcome;
+        };
+    }
+
+    pub struct ResolutionFlow;
+
+    family!();
+}
+
+type Flow = viewer::ResolutionFlow;
+"#,
+    )
+    .expect("write source");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("namespace_family_unsupported_construct")
+            && diag.message.contains("type alias")
+            && diag.message.contains("viewer::ResolutionFlow")
+    }));
+}
+
+#[test]
+fn analyze_workspace_groups_macro_leaf_error_namespace_boundary_and_reports_facet_candidate() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/user")).expect("create user module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod user;\n").expect("write lib");
+    fs::write(
+        root.join("src/user/mod.rs"),
+        r#"
+macro_rules! declare_supporting_items {
+    () => {
+        const _: () = ();
+    };
+}
+
+declare_supporting_items!();
+
+pub mod error;
+pub use error::Error;
+
+pub struct Username(String);
+pub struct Email(String);
+"#,
+    )
+    .expect("write user mod");
+    fs::write(
+        root.join("src/user/error.rs"),
+        r#"
+use crate::user::{EmailError, UsernameError};
+
+pub enum Error {
+    Username { source: UsernameError },
+    Email { source: EmailError },
+}
+"#,
+    )
+    .expect("write user error");
+
+    let report = analyze_workspace(root, &[]);
+    let namespace_diags = report
+        .diagnostics
+        .iter()
+        .filter(|diag| diag.code() == Some("namespace_family_unsupported_construct"))
+        .collect::<Vec<_>>();
+    assert_eq!(namespace_diags.len(), 1);
+    assert!(
+        namespace_diags[0]
+            .message
+            .contains("`EmailError`, `UsernameError`")
+    );
+    assert!(namespace_diags[0].message.contains("owning facet"));
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code() == Some("api_candidate_facet_module")
+            && diag.message.contains("user::Error")
+            && diag.message.contains("user::email")
+            && diag.message.contains("user::username")
+    }));
+}
+
+#[test]
 fn analyze_workspace_flags_relative_imports_with_real_parent_modules() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
@@ -4397,6 +4493,169 @@ declare_user_family!();
             .diagnostics
             .iter()
             .any(|diag| { diag.code() == Some("api_candidate_semantic_module") })
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_report_candidate_facet_module_for_decode_wrapper_error_family() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/user")).expect("create user module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod user;\n").expect("write lib");
+    fs::write(
+        root.join("src/user/mod.rs"),
+        r#"
+pub mod error;
+pub use error::Error;
+
+pub struct Username(String);
+pub struct Email(String);
+"#,
+    )
+    .expect("write user mod");
+    fs::write(
+        root.join("src/user/error.rs"),
+        r#"
+use crate::user::{EmailError, UsernameError};
+
+pub enum Error {
+    DecodeUsername { source: UsernameError },
+    DecodeEmail { source: EmailError },
+}
+"#,
+    )
+    .expect("write user error");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_facet_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_report_candidate_facet_module_for_private_root_module() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/user")).expect("create user module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "mod user;\n").expect("write lib");
+    fs::write(
+        root.join("src/user/mod.rs"),
+        r#"
+pub mod error;
+pub use error::Error;
+
+pub struct Username(String);
+pub struct Email(String);
+"#,
+    )
+    .expect("write user mod");
+    fs::write(
+        root.join("src/user/error.rs"),
+        r#"
+use crate::user::{EmailError, UsernameError};
+
+pub enum Error {
+    Username { source: UsernameError },
+    Email { source: EmailError },
+}
+"#,
+    )
+    .expect("write user error");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_facet_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_report_candidate_facet_module_for_scalar_wrapper_bundle() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/value")).expect("create value module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod value;\n").expect("write lib");
+    fs::write(
+        root.join("src/value/mod.rs"),
+        r#"
+pub mod error;
+pub use error::Error;
+
+pub struct ExternalId(String);
+pub struct Label(String);
+pub struct DetailText(String);
+"#,
+    )
+    .expect("write value mod");
+    fs::write(
+        root.join("src/value/error.rs"),
+        r#"
+use crate::value::{DetailTextError, ExternalIdError, LabelError};
+
+pub enum Error {
+    ExternalId { source: ExternalIdError },
+    Label { source: LabelError },
+    DetailText { source: DetailTextError },
+}
+"#,
+    )
+    .expect("write value error");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_facet_module"))
+    );
+}
+
+#[test]
+fn analyze_workspace_does_not_report_candidate_facet_module_for_cfg_guarded_root_family_members() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/user")).expect("create user module");
+    write_manifest(root, "");
+    fs::write(root.join("src/lib.rs"), "pub mod user;\n").expect("write lib");
+    fs::write(
+        root.join("src/user/mod.rs"),
+        r#"
+pub mod error;
+pub use error::Error;
+
+#[cfg(any())]
+pub struct Username(String);
+pub struct Email(String);
+"#,
+    )
+    .expect("write user mod");
+    fs::write(
+        root.join("src/user/error.rs"),
+        r#"
+use crate::user::{EmailError, UsernameError};
+
+pub enum Error {
+    Username { source: UsernameError },
+    Email { source: EmailError },
+}
+"#,
+    )
+    .expect("write user error");
+
+    let report = analyze_workspace(root, &[]);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code() == Some("api_candidate_facet_module"))
     );
 }
 

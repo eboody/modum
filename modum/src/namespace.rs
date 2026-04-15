@@ -37,6 +37,19 @@ struct ScopeUseBinding {
     renamed: bool,
 }
 
+#[derive(Clone)]
+struct PendingUnsupportedUse {
+    source_name: String,
+    constructs: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum UnsupportedNamespaceFamilyAction {
+    Import,
+    ReExport,
+    Alias,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct QualifiedPathSurfaceCandidate {
     rendered_path: String,
@@ -215,6 +228,7 @@ fn analyze_use_item(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut leaves = Vec::new();
+    let mut pending_unsupported = Vec::<PendingUnsupportedUse>::new();
     flatten_use_tree(Vec::new(), &item_use.tree, &mut leaves);
     let line = item_use.span().start().line;
     let is_reexport = !matches!(item_use.vis, Visibility::Inherited);
@@ -330,12 +344,11 @@ fn analyze_use_item(
             } else if let Some(NamespaceVisibilityDependency::Unsupported(constructs)) =
                 namespace_visibility_dependency.as_ref()
             {
-                namespace_family_unsupported_construct_message(
-                    is_reexport,
-                    &binding.source_name,
-                    visible_callsite_surface.as_deref(),
-                    constructs,
-                )
+                pending_unsupported.push(PendingUnsupportedUse {
+                    source_name: binding.source_name.clone(),
+                    constructs: constructs.clone(),
+                });
+                continue;
             } else {
                 continue;
             };
@@ -346,6 +359,24 @@ fn analyze_use_item(
             Diagnostic::policy(Some(path.to_path_buf()), Some(line), code, message)
         };
         diagnostics.push(diagnostic);
+    }
+
+    for grouped in group_pending_unsupported_uses(&pending_unsupported) {
+        diagnostics.push(Diagnostic::advisory(
+            Some(path.to_path_buf()),
+            Some(line),
+            "namespace_family_unsupported_construct",
+            namespace_family_unsupported_construct_message(
+                if is_reexport {
+                    UnsupportedNamespaceFamilyAction::ReExport
+                } else {
+                    UnsupportedNamespaceFamilyAction::Import
+                },
+                &grouped.source_names,
+                &grouped.constructs,
+            )
+            .1,
+        ));
     }
 }
 
@@ -436,12 +467,10 @@ fn analyze_type_alias_item(
         namespace_visibility_dependency.as_ref()
     {
         let rendered_path = full_path.join("::");
-        Some((
-            "namespace_family_unsupported_construct",
-            format!(
-                "skipped namespace-family inference for `{rendered_path}` because source-level analysis saw {}; keep the real module path visible unless you verify the family manually",
-                render_unsupported_constructs(constructs),
-            ),
+        Some(namespace_family_unsupported_construct_message(
+            UnsupportedNamespaceFamilyAction::Alias,
+            &[rendered_path],
+            constructs,
         ))
     } else {
         None
@@ -1762,20 +1791,71 @@ fn canonical_parent_surface_message(
 }
 
 fn namespace_family_unsupported_construct_message(
-    is_reexport: bool,
-    source_name: &str,
-    visible_callsite_surface: Option<&str>,
+    action: UnsupportedNamespaceFamilyAction,
+    source_names: &[String],
     constructs: &BTreeSet<String>,
 ) -> (&'static str, String) {
-    let rendered_target = visible_callsite_surface.unwrap_or(source_name);
-    let action = if is_reexport { "re-export" } else { "import" };
-    (
-        "namespace_family_unsupported_construct",
+    let action = match action {
+        UnsupportedNamespaceFamilyAction::Import => "import",
+        UnsupportedNamespaceFamilyAction::ReExport => "re-export",
+        UnsupportedNamespaceFamilyAction::Alias => "type alias",
+    };
+    let rendered_names = source_names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = if source_names
+        .iter()
+        .all(|name| name != "Error" && name.ends_with("Error"))
+    {
+        let family_label = if source_names.len() > 1 {
+            "flat leaf failure family"
+        } else {
+            "flat leaf failure"
+        };
         format!(
-            "skipped namespace-family inference for `{source_name}` in this {action} because source-level analysis saw {}; keep `{rendered_target}` visible unless you verify the family manually",
+            "skipped namespace-family inference for {rendered_names} in this {action} because source-level analysis saw {}; verify manually whether this {family_label} belongs under an owning facet before changing the path",
             render_unsupported_constructs(constructs),
-        ),
-    )
+        )
+    } else {
+        format!(
+            "skipped namespace-family inference for {rendered_names} in this {action} because source-level analysis saw {}; verify the owning family manually before changing the visible path",
+            render_unsupported_constructs(constructs),
+        )
+    };
+    ("namespace_family_unsupported_construct", message)
+}
+
+struct GroupedUnsupportedUse {
+    source_names: Vec<String>,
+    constructs: BTreeSet<String>,
+}
+
+fn group_pending_unsupported_uses(pending: &[PendingUnsupportedUse]) -> Vec<GroupedUnsupportedUse> {
+    let mut grouped = Vec::<GroupedUnsupportedUse>::new();
+
+    for entry in pending {
+        if let Some(existing) = grouped
+            .iter_mut()
+            .find(|existing| existing.constructs == entry.constructs)
+        {
+            existing.source_names.push(entry.source_name.clone());
+            continue;
+        }
+
+        grouped.push(GroupedUnsupportedUse {
+            source_names: vec![entry.source_name.clone()],
+            constructs: entry.constructs.clone(),
+        });
+    }
+
+    for group in &mut grouped {
+        group.source_names.sort();
+        group.source_names.dedup();
+    }
+
+    grouped
 }
 
 fn render_unsupported_constructs(constructs: &BTreeSet<String>) -> String {

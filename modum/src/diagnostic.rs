@@ -277,7 +277,7 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
         ),
         "namespace_family_unsupported_construct" => (
             "This namespace family depends on constructs like macros, cfg gates, or includes that the current source-level pass can't interpret authoritatively.",
-            "Treat this as an analysis boundary. Keep the real module path visible until you've verified the family from the expanded or real surface. Don't flatten the path just because the current pass couldn't prove the family, and don't rewrite macros, includes, or cfg-driven code only to satisfy this lint.",
+            "Treat this as an analysis boundary. Verify the owning family or facet from the expanded or real surface before flattening the path or enshrining the current one. Don't rewrite macros, includes, or cfg-driven code only to satisfy this lint.",
         ),
         "namespace_parent_surface" => (
             "The parent module already exposes the readable caller-facing surface, so reaching through a child module bypasses the intended entrypoint.",
@@ -350,6 +350,10 @@ fn diagnostic_guidance_parts_for_code(code: &str) -> Option<(&'static str, &'sta
         "api_candidate_semantic_module" | "internal_candidate_semantic_module" => (
             "The sibling family looks like it wants one shared semantic module surface instead of repeating the family marker in every leaf or module name.",
             "Treat this as a design prompt, not an automatic rewrite. Extract the semantic module only if it becomes the real canonical surface for the family and the inner leaves get clearer. If you do it, make it a real refactor: create the module files or directories and move the code instead of keeping the old layout behind `#[path = ...]` shims. Don't create a shadow module while keeping the old flat family equally canonical.",
+        ),
+        "api_candidate_facet_module" => (
+            "The root module is carrying both leaf-specific value-plus-error families and the broader boundary error, so facet ownership is being flattened together.",
+            "Move each leaf value-plus-error family under its owning facet and let the root keep the cross-facet boundary. Re-export the good leaf value back out only if it improves ergonomics, but don't flatten the leaf error back next to the root `Error`.",
         ),
         "api_candidate_semantic_module_unsupported_construct" => (
             "This scope contains constructs like macros, cfg gates, or includes that the current source-level pass can't interpret authoritatively.",
@@ -434,6 +438,12 @@ fn diagnostic_guidance_for_instance(
         "api_raw_id_surface" => {
             append_instance_address(&mut address, &raw_id_surface_address_hint(message));
         }
+        "namespace_family_unsupported_construct" => {
+            append_instance_address(
+                &mut address,
+                &namespace_family_unsupported_address_hint(message),
+            );
+        }
         _ => {}
     }
 
@@ -509,6 +519,17 @@ fn semantic_numeric_scalar_address_hint(message: &str) -> String {
     }
 
     hints.join(" ")
+}
+
+fn namespace_family_unsupported_address_hint(message: &str) -> String {
+    let Some(first_chunk) = backticked_chunks(message).first().cloned() else {
+        return String::new();
+    };
+    if first_chunk == "Error" || !first_chunk.ends_with("Error") {
+        return String::new();
+    }
+
+    "If this is a flat leaf failure under a broader root boundary, verify whether the family really wants an owning facet like `email::Error` rather than a root-level `EmailError`-style surface.".to_string()
 }
 
 fn namespace_flat_context_guidance(
@@ -1001,9 +1022,30 @@ mod tests {
         assert!(
             guidance
                 .address
+                .contains("Verify the owning family or facet")
+        );
+        assert!(
+            !guidance
+                .address
                 .contains("Keep the real module path visible")
         );
-        assert!(guidance.address.contains("Don't flatten the path"));
+    }
+
+    #[test]
+    fn instance_guidance_for_namespace_family_unsupported_construct_mentions_owned_facet_for_leaf_error()
+     {
+        let diag = Diagnostic {
+            class: DiagnosticClass::AdvisoryWarning {
+                code: "namespace_family_unsupported_construct".to_string(),
+            },
+            file: None,
+            line: None,
+            fix: None,
+            message: "skipped namespace-family inference for `EmailError` in this import because source-level analysis saw `item macro`; verify manually whether this flat leaf failure belongs under an owning facet before changing the path".to_string(),
+        };
+
+        let guidance = diag.guidance().expect("guidance");
+        assert!(guidance.address.contains("email::Error"));
     }
 
     #[test]
@@ -1043,6 +1085,15 @@ mod tests {
 
         let guidance = diag.guidance().expect("guidance");
         assert!(guidance.address.contains("caller-visible elsewhere"));
+    }
+
+    #[test]
+    fn generic_guidance_for_candidate_facet_module_keeps_root_boundary_and_leaf_errors_separate() {
+        let guidance =
+            diagnostic_guidance_for_code("api_candidate_facet_module", None).expect("guidance");
+        assert!(guidance.why.contains("value-plus-error families"));
+        assert!(guidance.address.contains("cross-facet boundary"));
+        assert!(guidance.address.contains("don't flatten the leaf error"));
     }
 
     #[test]
@@ -1275,6 +1326,10 @@ pub fn diagnostic_code_info(code: &str) -> Option<DiagnosticCodeInfo> {
         "api_candidate_semantic_module" => (
             LintProfile::Strict,
             "A family of sibling items suggests a stronger semantic module surface.",
+        ),
+        "api_candidate_facet_module" => (
+            LintProfile::Strict,
+            "A root boundary is sitting beside flat leaf value-plus-error families that likely want owned facets.",
         ),
         "api_candidate_semantic_module_unsupported_construct" => (
             LintProfile::Strict,
